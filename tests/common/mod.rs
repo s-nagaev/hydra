@@ -83,6 +83,9 @@ pub fn test_app_logging(db: SqlitePool) -> AppState {
 
 /// Spawns the mock upstream on an ephemeral port and returns its base URL
 /// (no trailing slash).
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub async fn spawn_upstream(router: Router) -> String {
     let listener = within(TcpListener::bind("127.0.0.1:0")).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -236,6 +239,9 @@ impl Recorder {
 }
 
 /// What the mock upstream replies with.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 enum Reply {
     Fixed {
         status: StatusCode,
@@ -303,6 +309,9 @@ async fn capture_and_reply(
 
 /// Builds a mock upstream that records every request and answers with a
 /// fixed status/body.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub fn fixed_response_router(
     recorder: Recorder,
     status: StatusCode,

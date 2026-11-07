@@ -7,6 +7,7 @@
 mod admin_auth;
 mod admin_channels;
 mod admin_keys;
+mod admin_logs;
 mod openai_error;
 mod proxy;
 mod proxy_auth;
@@ -74,6 +75,7 @@ pub fn router(state: AppState) -> Router {
             "/admin/keys/{id}",
             patch(admin_keys::patch).delete(admin_keys::delete),
         )
+        .route("/admin/logs", get(admin_logs::list))
         .route(
             "/v1/chat/completions",
             post(proxy::chat_completions)
