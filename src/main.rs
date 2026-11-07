@@ -14,6 +14,7 @@ use hydra::logging::LogTracker;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    load_dotenv();
     let cfg = hydra::config::Config::from_env()?;
     init_tracing();
 
@@ -39,6 +40,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // window is a lost log row, never a lost request.
     hydra::logging::drain(&state.log_tracker, Duration::from_secs(5)).await;
     Ok(())
+}
+
+fn load_dotenv() {
+    if let Err(err) = dotenvy::dotenv() {
+        // A missing .env is the normal case (environment-only config); a
+        // present but unreadable one deserves a warning before validation.
+        if !err.not_found() {
+            eprintln!("warning: failed to load .env file: {err}");
+        }
+    }
 }
 
 fn init_tracing() {
@@ -68,4 +79,63 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     tracing::info!("shutdown signal received, draining");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // dotenv and chdir touch process-global state; this binary target has
+    // one test and it runs under this lock.
+    static STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn real_environment_overrides_dotenv_values() {
+        let _guard = STATE_LOCK.lock().unwrap();
+
+        let dir = std::env::temp_dir().join(format!("hydra-dotenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            "HYDRA_BIND_ADDR=127.0.0.1:9099\n\
+             HYDRA_DB_PATH=./from-file.db\n\
+             HYDRA_ADMIN_LOGIN=file-login\n\
+             HYDRA_ADMIN_PASSWORD=file-secret\n\
+             HYDRA_LOG_BODIES=true\n",
+        )
+        .unwrap();
+
+        // One variable set in the real environment must win over the file;
+        // the rest come from .env.
+        std::env::set_var("HYDRA_DB_PATH", "./from-env.db");
+        std::env::remove_var("HYDRA_BIND_ADDR");
+        std::env::remove_var("HYDRA_ADMIN_LOGIN");
+        std::env::remove_var("HYDRA_ADMIN_PASSWORD");
+        std::env::remove_var("HYDRA_LOG_BODIES");
+
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        load_dotenv();
+        std::env::set_current_dir(previous).unwrap();
+
+        let cfg = hydra::config::Config::from_env().unwrap();
+
+        // dotenv sets variables for the whole process; undo them so later
+        // runs of this binary's test target start clean.
+        std::env::remove_var("HYDRA_DB_PATH");
+        std::env::remove_var("HYDRA_BIND_ADDR");
+        std::env::remove_var("HYDRA_ADMIN_LOGIN");
+        std::env::remove_var("HYDRA_ADMIN_PASSWORD");
+        std::env::remove_var("HYDRA_LOG_BODIES");
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert_eq!(
+            cfg.bind_addr,
+            "127.0.0.1:9099".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(cfg.db_path, "./from-env.db");
+        assert_eq!(cfg.admin_login, "file-login");
+        assert_eq!(cfg.admin_password, "file-secret");
+        assert!(cfg.log_bodies);
+    }
 }

@@ -145,6 +145,13 @@ with bound keys refuses deletion with 409; disable it instead.
 
 ## Configuration
 
+Configuration comes from environment variables. At startup the binary also
+loads a `.env` file from the working directory if one is present, which is
+what the quickstart above relies on; variables already set in the process
+environment always take precedence over the file. The lookup is relative to
+the working directory, `/data` in the Docker image, though containers
+normally get their configuration through `docker run -e` or compose instead.
+
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HYDRA_BIND_ADDR` | `127.0.0.1:8080` | HTTP listener address |
