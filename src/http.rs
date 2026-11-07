@@ -5,8 +5,9 @@
 
 mod admin_auth;
 mod admin_channels;
+mod admin_keys;
 
-use axum::routing::{get, post};
+use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
@@ -36,6 +37,14 @@ pub fn router(state: AppState) -> Router {
             get(admin_channels::get_one)
                 .patch(admin_channels::patch)
                 .delete(admin_channels::delete),
+        )
+        .route(
+            "/admin/keys",
+            post(admin_keys::create).get(admin_keys::list),
+        )
+        .route(
+            "/admin/keys/{id}",
+            patch(admin_keys::patch).delete(admin_keys::delete),
         )
         .with_state(state)
 }
