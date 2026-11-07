@@ -97,9 +97,7 @@ pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ApiKey>> {
 }
 
 /// Auth lookup for the proxy path: matches by hash and excludes soft-deleted
-/// rows. Wired into the proxy endpoint by the proxy task; exercised by the
-/// admin key tests until then.
-#[allow(dead_code)]
+/// rows.
 pub async fn find_alive_by_hash(pool: &SqlitePool, key_hash: &str) -> sqlx::Result<Option<ApiKey>> {
     let row = sqlx::query(&format!(
         "SELECT {SELECT_COLUMNS} FROM api_keys \
