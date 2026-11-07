@@ -1,0 +1,21 @@
+# Copy .env.example to .env and set HYDRA_ADMIN_LOGIN and
+# HYDRA_ADMIN_PASSWORD before bringing this up. The bind address and DB path
+# are set here (not in .env) because the container must listen on all
+# interfaces and keep its database on the volume.
+services:
+  hydra:
+    build: .
+    image: hydra:local
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      HYDRA_BIND_ADDR: 0.0.0.0:8080
+      HYDRA_DB_PATH: /data/hydra.db
+    volumes:
+      - hydra-data:/data
+
+volumes:
+  hydra-data:
