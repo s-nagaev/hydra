@@ -6,6 +6,7 @@
 mod config;
 mod db;
 mod http;
+mod keys;
 
 use std::error::Error;
 
