@@ -11,11 +11,14 @@
 //! never axum's plain-text rejection, so client libraries always see a
 //! parseable error. Responses pass through untouched; streaming ones use
 //! `bytes_stream()` straight into `Body::from_stream` so SSE chunk semantics
-//! survive. The upstream-to-client response conversion lives in one place so
-//! the background logging task can tee into it later without touching the
-//! forwarding paths.
+//! survive. The upstream-to-client response conversion lives in one place
+//! ([`upstream_to_response`]), which is also where the background request
+//! logging tee hooks in: every chat completion produces exactly one
+//! `request_logs` row written by a detached task that can never block or
+//! fail the client flow. `/v1/models` is a lightweight discovery endpoint
+//! and is not logged.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{FromRequest, Request, State};
@@ -28,6 +31,7 @@ use crate::db::channels::{self, Channel};
 use crate::http::openai_error::openai_error;
 use crate::http::proxy_auth::ProxyAuth;
 use crate::http::AppState;
+use crate::logging::{self, ChatLogContext, ChatLogInit};
 
 /// Maximum accepted chat request body, in bytes (32 MiB). Vision requests
 /// embed base64-encoded images and long-context conversations run well past
@@ -143,16 +147,37 @@ where
 
 /// `POST /v1/chat/completions`: peek `model`/`stream`, check the whitelist,
 /// forward the original bytes with the upstream key, pass the response
-/// through byte-for-byte.
+/// through byte-for-byte, and leave exactly one background log row behind
+/// whatever the outcome.
 pub async fn chat_completions(
     State(state): State<AppState>,
     auth: ProxyAuth,
     headers: HeaderMap,
     ChatBody(body): ChatBody,
 ) -> Result<Response, ProxyError> {
-    let (model, stream_requested) = peek_request(&body)?;
-    let channel = resolve_channel(&state, &auth).await?;
-    ensure_model_allowed(&channel, &model)?;
+    let start = Instant::now();
+    let (model, stream_requested) = match peek_request(&body) {
+        Ok(peeked) => peeked,
+        Err(e) => {
+            log_rejection(&state, &auth, None, start, &body, &e);
+            return Err(e);
+        }
+    };
+    let channel = match resolve_channel(&state, &auth).await {
+        Ok(channel) => channel,
+        // When the database itself is failing there is no point attempting a
+        // log write; ChannelGone is a client-visible routing failure that
+        // still gets its audit row.
+        Err(e @ ProxyError::ChannelGone) => {
+            log_rejection(&state, &auth, Some(model), start, &body, &e);
+            return Err(e);
+        }
+        Err(e) => return Err(e),
+    };
+    if let Err(e) = ensure_model_allowed(&channel, &model) {
+        log_rejection(&state, &auth, Some(model), start, &body, &e);
+        return Err(e);
+    }
 
     let url = join_url(&channel.base_url, "/v1/chat/completions");
     let mut request = state
@@ -171,11 +196,24 @@ pub async fn chat_completions(
         request = request.timeout(NON_STREAM_TIMEOUT);
     }
 
-    let upstream = request.body(body).send().await.map_err(|e| {
-        tracing::warn!(error = %e, "upstream chat request failed");
-        ProxyError::UpstreamUnavailable
-    })?;
-    upstream_to_response(upstream, stream_requested).await
+    // Built before the body is handed to the forwarder: it already holds
+    // whatever request bytes body logging will ever capture.
+    let ctx = chat_log_context(&state, &auth, Some(model), start, &body);
+    let upstream = match request.body(body).send().await {
+        Ok(upstream) => upstream,
+        Err(e) => {
+            tracing::warn!(error = %e, "upstream chat request failed");
+            ctx.finish(
+                None,
+                None,
+                None,
+                None,
+                Some(format!("upstream request failed: {e}")),
+            );
+            return Err(ProxyError::UpstreamUnavailable);
+        }
+    };
+    upstream_to_response(upstream, stream_requested, Some(ctx)).await
 }
 
 /// `GET /v1/models`: a set whitelist is returned as a locally built OpenAI
@@ -203,7 +241,7 @@ pub async fn models(
                 tracing::warn!(error = %e, "upstream models request failed");
                 ProxyError::UpstreamUnavailable
             })?;
-            upstream_to_response(upstream, false).await
+            upstream_to_response(upstream, false, None).await
         }
     }
 }
@@ -296,13 +334,18 @@ fn join_url(base_url: &str, path: &str) -> String {
 
 /// Converts an upstream response into the client response: status and
 /// Content-Type pass through verbatim, the body either streams chunk by
-/// chunk (no buffering) or is forwarded as-is. This is the single point
-/// where the future background logging tee will hook in.
+/// chunk (no buffering) or is forwarded as-is. With a log context this is
+/// also the single point that finishes the request's log row: streaming
+/// bodies are teed into the bounded capture buffer, buffered bodies are
+/// captured directly after usage parsing. `None` (the `/v1/models` path)
+/// skips logging entirely.
 async fn upstream_to_response(
     upstream: reqwest::Response,
     stream_requested: bool,
+    log: Option<ChatLogContext>,
 ) -> Result<Response, ProxyError> {
     let status = upstream.status();
+    let status_code = i64::from(status.as_u16());
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     // Even when the client did not ask for SSE, an event-stream upstream
     // must not be buffered.
@@ -317,20 +360,89 @@ async fn upstream_to_response(
         response = response.header(header::CONTENT_TYPE, content_type);
     }
     if streaming {
+        let body = match log {
+            Some(ctx) => Body::from_stream(logging::tee_stream(
+                upstream.bytes_stream(),
+                status_code,
+                ctx,
+            )),
+            None => Body::from_stream(upstream.bytes_stream()),
+        };
         Ok(response
-            .body(Body::from_stream(upstream.bytes_stream()))
+            .body(body)
             // The status and header values all come from the already
             // parsed upstream response, so construction cannot fail.
             .expect("upstream status and headers are valid"))
     } else {
-        let bytes = upstream.bytes().await.map_err(|e| {
-            tracing::warn!(error = %e, "upstream response body read failed");
-            ProxyError::UpstreamUnavailable
-        })?;
+        let bytes = match upstream.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                tracing::warn!(error = %e, "upstream response body read failed");
+                if let Some(ctx) = log {
+                    ctx.finish(
+                        Some(status_code),
+                        None,
+                        None,
+                        None,
+                        Some("upstream response body read failed".to_string()),
+                    );
+                }
+                return Err(ProxyError::UpstreamUnavailable);
+            }
+        };
+        if let Some(ctx) = log {
+            let usage = logging::parse_usage(&bytes);
+            let response_body = ctx.capture_response_body(&bytes);
+            ctx.finish(
+                Some(status_code),
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                response_body,
+                None,
+            );
+        }
         Ok(response
             .body(Body::from(bytes))
             .expect("upstream status and headers are valid"))
     }
+}
+
+/// Gathers the log context for one chat request from the request's own
+/// pieces; the channel id comes from the authenticated key, which is what
+/// the log row must reference even if channel resolution later fails.
+fn chat_log_context(
+    state: &AppState,
+    auth: &ProxyAuth,
+    model: Option<String>,
+    start: Instant,
+    body: &Bytes,
+) -> ChatLogContext {
+    ChatLogContext::new(ChatLogInit {
+        db: &state.db,
+        tracker: &state.log_tracker,
+        log_bodies: state.log_bodies,
+        api_key_id: auth.key.id,
+        channel_id: auth.key.channel_id,
+        model,
+        start,
+        request_body: body,
+    })
+}
+
+/// Writes the audit row for an authenticated chat request rejected before
+/// the upstream was contacted. Rejections from the auth layer (401/403) and
+/// from the body extractor (413) happen before the handler and are not
+/// logged: they have no key row or no readable body to reference.
+fn log_rejection(
+    state: &AppState,
+    auth: &ProxyAuth,
+    model: Option<String>,
+    start: Instant,
+    body: &Bytes,
+    error: &ProxyError,
+) {
+    let ctx = chat_log_context(state, auth, model, start, body);
+    ctx.finish(None, None, None, None, Some(error.to_string()));
 }
 
 #[cfg(test)]

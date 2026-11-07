@@ -298,6 +298,8 @@ mod tests {
             admin_login: "admin".to_string(),
             admin_password: "secret".to_string(),
             client: crate::http::upstream_client(),
+            log_bodies: false,
+            log_tracker: crate::logging::LogTracker::default(),
         }
     }
 

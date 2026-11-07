@@ -60,6 +60,24 @@ pub fn test_app(db: SqlitePool) -> AppState {
         admin_login: "admin".to_string(),
         admin_password: "secret".to_string(),
         client: http::upstream_client(),
+        log_bodies: false,
+        log_tracker: hydra::logging::LogTracker::default(),
+    }
+}
+
+/// Application state with `HYDRA_LOG_BODIES` enabled, for tests that assert
+/// captured bodies.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
+pub fn test_app_logging(db: SqlitePool) -> AppState {
+    AppState {
+        db,
+        admin_login: "admin".to_string(),
+        admin_password: "secret".to_string(),
+        client: http::upstream_client(),
+        log_bodies: true,
+        log_tracker: hydra::logging::LogTracker::default(),
     }
 }
 
@@ -125,6 +143,9 @@ pub async fn seed_key(db: &SqlitePool, channel_id: i64) -> String {
 }
 
 /// Disables a key without deleting it, mirroring the admin PATCH.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub async fn disable_key(db: &SqlitePool, key_id: i64) {
     use hydra::db::keys::{KeyPatch, PatchOutcome};
     match within(key_rows::patch(
@@ -145,6 +166,9 @@ pub async fn disable_key(db: &SqlitePool, key_id: i64) {
 }
 
 /// A request the mock upstream received, with header names lowercased.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the fields, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub struct Recorded {
     pub method: String,
@@ -153,6 +177,9 @@ pub struct Recorded {
     pub body: Vec<u8>,
 }
 
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 impl Recorded {
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -168,6 +195,9 @@ pub struct Recorder {
     requests: Arc<Mutex<Vec<Recorded>>>,
 }
 
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 impl Recorder {
     pub fn record(&self, recorded: Recorded) {
         self.requests.lock().unwrap().push(recorded);

@@ -31,6 +31,10 @@ pub struct AppState {
     pub admin_password: String,
     /// The single upstream HTTP client reused by every proxy request.
     pub client: reqwest::Client,
+    /// Whether chat request/response bodies are captured into request_logs.
+    pub log_bodies: bool,
+    /// In-flight background log insert counter, drained on shutdown.
+    pub log_tracker: crate::logging::LogTracker,
 }
 
 /// Builds the shared upstream client. Only the connect timeout lives here:
@@ -106,6 +110,8 @@ mod tests {
             admin_login: "admin".to_string(),
             admin_password: "secret".to_string(),
             client: upstream_client(),
+            log_bodies: false,
+            log_tracker: crate::logging::LogTracker::default(),
         }
     }
 

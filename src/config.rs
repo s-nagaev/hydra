@@ -12,13 +12,12 @@ use std::net::SocketAddr;
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub db_path: String,
-    // Consumed by the admin Basic Auth and proxy logging tasks; validated
-    // here from day one so the config shape is final.
+    // Consumed by the admin Basic Auth; validated here from day one so the
+    // config shape is final.
     #[allow(dead_code)]
     pub admin_login: String,
     #[allow(dead_code)]
     pub admin_password: String,
-    #[allow(dead_code)]
     pub log_bodies: bool,
 }
 
