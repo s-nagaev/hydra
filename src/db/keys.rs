@@ -143,7 +143,7 @@ pub async fn patch(pool: &SqlitePool, id: i64, key_patch: &KeyPatch) -> sqlx::Re
     }
 
     let sql = format!(
-        "UPDATE api_keys SET {} WHERE id = ? RETURNING {SELECT_COLUMNS}",
+        "UPDATE api_keys SET {} WHERE id = ? AND deleted_at IS NULL RETURNING {SELECT_COLUMNS}",
         assignments.join(", ")
     );
     let mut query = sqlx::query(&sql);
@@ -157,7 +157,24 @@ pub async fn patch(pool: &SqlitePool, id: i64, key_patch: &KeyPatch) -> sqlx::Re
 
     match query.fetch_optional(pool).await? {
         Some(row) => Ok(PatchOutcome::Updated(map_key(&row)?)),
-        None => Ok(PatchOutcome::NotFound),
+        // The Rust-level guard above already rejected deleted rows, so None
+        // normally means the row vanished. The `deleted_at IS NULL` clause in
+        // the UPDATE keeps soft-deleted rows immutable at the SQL layer too;
+        // classify a concurrent delete as Deleted rather than silently
+        // reporting NotFound.
+        None => {
+            let deleted: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM api_keys WHERE id = ? AND deleted_at IS NOT NULL",
+            )
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+            if deleted.is_some() {
+                Ok(PatchOutcome::Deleted)
+            } else {
+                Ok(PatchOutcome::NotFound)
+            }
+        }
     }
 }
 

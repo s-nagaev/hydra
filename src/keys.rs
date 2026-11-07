@@ -1,7 +1,7 @@
 //! Client API key generation and hashing.
 //!
 //! A Hydra key is `hyd-` + 32 random bytes from the OS RNG encoded base62
-//! (43 characters). Only the SHA-256 hex of the full key string (prefix
+//! (typically 43 characters; the width varies with leading zero bits). Only the SHA-256 hex of the full key string (prefix
 //! included) is ever stored; the plaintext is returned exactly once by the
 //! creation endpoint. `display_prefix` (first 12 characters) is safe to show
 //! anywhere.
@@ -75,7 +75,20 @@ mod tests {
     fn generate_produces_prefixed_key_with_derived_fields() {
         let key = generate();
         assert!(key.full.starts_with(KEY_PREFIX));
-        assert_eq!(key.full.len(), KEY_PREFIX.len() + 43);
+        // Base62 of 32 random bytes is variable-width (leading zero bits are
+        // dropped): 43 digits with overwhelming probability, fewer only when
+        // the top digits happen to be zero. Accept the whole valid width
+        // range instead of asserting a fixed length, and pin the charset.
+        let body = &key.full[KEY_PREFIX.len()..];
+        assert!(
+            body.len() >= 41 && body.len() <= 43,
+            "base62 body of 32 bytes must be 41-43 chars, got {}",
+            body.len()
+        );
+        assert!(
+            body.bytes().all(|b| b.is_ascii_alphanumeric()),
+            "base62 body must contain only [0-9a-zA-Z]"
+        );
         assert_eq!(key.display_prefix, key.full[..DISPLAY_PREFIX_LEN]);
         assert_eq!(
             key.key_hash,
