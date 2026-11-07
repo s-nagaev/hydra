@@ -1,25 +1,21 @@
 //! Hydra: a self-hosted OpenAI-compatible API router (POC).
 //!
 //! Startup wires config, tracing, the SQLite pool and the axum router, then
-//! serves until SIGINT or SIGTERM.
-
-mod config;
-mod db;
-mod http;
-mod keys;
+//! serves until SIGINT or SIGTERM. All logic lives in the library target so
+//! integration tests can drive the same router.
 
 use std::error::Error;
 
 use tokio::signal::unix::{signal, SignalKind};
 
-use crate::http::AppState;
+use hydra::http::{self, AppState};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let cfg = config::Config::from_env()?;
+    let cfg = hydra::config::Config::from_env()?;
     init_tracing();
 
-    let pool = db::init_pool(&cfg.db_path).await?;
+    let pool = hydra::db::init_pool(&cfg.db_path).await?;
     let app = http::router(AppState {
         db: pool,
         admin_login: cfg.admin_login.clone(),
