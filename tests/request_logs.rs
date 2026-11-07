@@ -386,3 +386,95 @@ async fn captured_response_body_is_truncated_at_the_limit() {
     );
     assert!(captured.starts_with("{\"padding\":\"a"));
 }
+
+#[tokio::test]
+async fn upstream_500_response_logs_row_with_upstream_status() {
+    let db = common::test_pool().await;
+    let upstream_error =
+        br#"{"error":{"message":"upstream exploded","type":"server_error","code":null}}"#;
+    let base = common::spawn_upstream(fixed_response_router(
+        Recorder::default(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "application/json",
+        upstream_error.to_vec(),
+    ))
+    .await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db.clone());
+
+    let (status, body) = send_chat(app, &key, chat_body("gpt-4o", false)).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(
+        &body[..],
+        &upstream_error[..],
+        "the upstream error passes through verbatim"
+    );
+
+    let logs = wait_for_logs(&db, 1).await;
+    let row = &logs[0];
+    assert_eq!(row.api_key_id, key_id(&db, channel_id).await);
+    assert_eq!(row.channel_id, channel_id);
+    assert_eq!(row.model.as_deref(), Some("gpt-4o"));
+    assert_eq!(
+        row.status,
+        Some(500),
+        "the upstream error status must be recorded"
+    );
+    assert_eq!(row.prompt_tokens, None, "an error body carries no usage");
+    assert_eq!(row.completion_tokens, None);
+    assert!(
+        row.error.is_none(),
+        "the response did reach the client, so the row carries the status instead of an error: {:?}",
+        row.error
+    );
+    assert!(row.duration_ms > 0);
+}
+
+#[tokio::test]
+async fn concurrent_streaming_requests_complete_uncorrupted_and_log_once_each() {
+    let db = common::test_pool().await;
+    let chunks: Vec<Bytes> = vec![
+        br#"data: {"choices":[{"delta":{"content":"He"}}]}"#.to_vec().into(),
+        b"\n\n".to_vec().into(),
+        br#"data: {"choices":[{"delta":{"content":"llo"}}]}"#.to_vec().into(),
+        b"\n\n".to_vec().into(),
+        b"data: [DONE]\n\n".to_vec().into(),
+    ];
+    let expected: Vec<u8> = chunks.iter().flat_map(|c| c.iter().copied()).collect();
+    let base = common::spawn_upstream(sse_router(Recorder::default(), chunks)).await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let key = common::seed_key(&db, channel_id).await;
+
+    // Five parallel streaming calls through the same key and router wiring;
+    // each must see the full event sequence untouched by the others.
+    const PARALLEL: usize = 5;
+    let futures = std::iter::repeat_n(key.clone(), PARALLEL).map(|key| {
+        let app = common::test_app(db.clone());
+        let body = chat_body("gpt-4o", true);
+        async move { send_chat(app, &key, body).await }
+    });
+    let results: Vec<(StatusCode, Vec<u8>)> = within(futures_util::future::join_all(futures)).await;
+
+    assert_eq!(results.len(), PARALLEL);
+    for (status, body) in &results {
+        assert_eq!(*status, StatusCode::OK);
+        assert_eq!(
+            body, &expected,
+            "every stream must arrive byte-identical, no cross-request corruption"
+        );
+    }
+
+    let logs = wait_for_logs(&db, PARALLEL).await;
+    assert_eq!(
+        logs.len(),
+        PARALLEL,
+        "exactly one row per request, no double logging"
+    );
+    for row in &logs {
+        assert_eq!(row.api_key_id, key_id(&db, channel_id).await);
+        assert_eq!(row.status, Some(200));
+        assert_eq!(row.model.as_deref(), Some("gpt-4o"));
+        assert!(row.error.is_none());
+    }
+}
