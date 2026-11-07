@@ -3,6 +3,8 @@
 //! WAL mode is enabled on every connection so background log inserts do not
 //! contend with the single-writer lock against admin reads.
 
+pub mod channels;
+
 use std::str::FromStr;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};

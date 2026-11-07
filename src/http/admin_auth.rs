@@ -7,10 +7,6 @@
 //! authentication responds with 401 and a `WWW-Authenticate: Basic
 //! realm="hydra"` challenge and an empty body.
 
-// No protected route exists until the channels task wires one; the extractor
-// is exercised by its unit tests meanwhile.
-#![allow(dead_code)]
-
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
