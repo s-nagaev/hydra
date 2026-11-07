@@ -4,6 +4,7 @@
 //! contend with the single-writer lock against admin reads.
 
 pub mod channels;
+pub mod keys;
 
 use std::str::FromStr;
 
