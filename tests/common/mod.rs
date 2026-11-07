@@ -42,12 +42,14 @@ pub async fn within<T>(future: impl Future<Output = T>) -> T {
 /// A migrated in-memory SQLite pool. Single connection so every query sees
 /// the same `:memory:` database.
 pub async fn test_pool() -> SqlitePool {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
-        .await
-        .unwrap();
-    sqlx::migrate!().run(&pool).await.unwrap();
+    let pool = within(
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:"),
+    )
+    .await
+    .unwrap();
+    within(sqlx::migrate!().run(&pool)).await.unwrap();
     pool
 }
 
@@ -64,7 +66,7 @@ pub fn test_app(db: SqlitePool) -> AppState {
 /// Spawns the mock upstream on an ephemeral port and returns its base URL
 /// (no trailing slash).
 pub async fn spawn_upstream(router: Router) -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = within(TcpListener::bind("127.0.0.1:0")).await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         // The listener is held until serve takes it, so the port cannot be
@@ -78,7 +80,7 @@ pub async fn spawn_upstream(router: Router) -> String {
 /// bound, its address read, then dropped. Rebinding by another process in
 /// the microseconds between drop and connect is negligible.
 pub async fn unreachable_base_url() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let listener = within(TcpListener::bind("127.0.0.1:0")).await.unwrap();
     let addr = listener.local_addr().unwrap();
     drop(listener);
     format!("http://{addr}")
@@ -90,7 +92,7 @@ pub async fn seed_channel(
     base_url: &str,
     allowed_models: Option<Vec<String>>,
 ) -> i64 {
-    let channel = channel_rows::create(
+    let channel = within(channel_rows::create(
         db,
         &NewChannel {
             name: "test channel".to_string(),
@@ -98,7 +100,7 @@ pub async fn seed_channel(
             api_key: UPSTREAM_KEY.to_string(),
             allowed_models,
         },
-    )
+    ))
     .await
     .unwrap();
     channel.id
@@ -108,7 +110,7 @@ pub async fn seed_channel(
 /// plaintext (which is otherwise never stored).
 pub async fn seed_key(db: &SqlitePool, channel_id: i64) -> String {
     let generated = keygen::generate();
-    key_rows::create(
+    within(key_rows::create(
         db,
         &NewKey {
             key_hash: generated.key_hash,
@@ -116,7 +118,7 @@ pub async fn seed_key(db: &SqlitePool, channel_id: i64) -> String {
             name: None,
             channel_id,
         },
-    )
+    ))
     .await
     .unwrap();
     generated.full
@@ -125,14 +127,14 @@ pub async fn seed_key(db: &SqlitePool, channel_id: i64) -> String {
 /// Disables a key without deleting it, mirroring the admin PATCH.
 pub async fn disable_key(db: &SqlitePool, key_id: i64) {
     use hydra::db::keys::{KeyPatch, PatchOutcome};
-    match key_rows::patch(
+    match within(key_rows::patch(
         db,
         key_id,
         &KeyPatch {
             name: None,
             enabled: Some(false),
         },
-    )
+    ))
     .await
     .unwrap()
     {
