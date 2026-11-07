@@ -19,7 +19,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
     init_tracing();
 
     let pool = db::init_pool(&cfg.db_path).await?;
-    let app = http::router(AppState { db: pool });
+    let app = http::router(AppState {
+        db: pool,
+        admin_login: cfg.admin_login.clone(),
+        admin_password: cfg.admin_password.clone(),
+    });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
 
     tracing::info!(addr = %cfg.bind_addr, "hydra listening");
