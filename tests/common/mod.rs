@@ -20,7 +20,7 @@ use sqlx::sqlite::SqlitePoolOptions;
 use sqlx::SqlitePool;
 use tokio::net::TcpListener;
 
-use hydra::db::channels::{self as channel_rows, NewChannel};
+use hydra::db::channels::{self as channel_rows, ChannelPatch, NewChannel};
 use hydra::db::keys::{self as key_rows, NewKey};
 use hydra::http::{self, AppState};
 use hydra::keys as keygen;
@@ -122,6 +122,30 @@ pub async fn seed_channel(
     .await
     .unwrap();
     channel.id
+}
+/// Flips a channel's enabled flag the way the admin PATCH does, for tests
+/// that cut a channel off after keys were already bound to it.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
+pub async fn set_channel_enabled(db: &SqlitePool, channel_id: i64, enabled: bool) {
+    let patched = within(channel_rows::update(
+        db,
+        channel_id,
+        &ChannelPatch {
+            name: None,
+            base_url: None,
+            api_key: None,
+            allowed_models: None,
+            enabled: Some(enabled),
+        },
+    ))
+    .await
+    .unwrap();
+    assert!(
+        patched.is_some_and(|channel| channel.enabled == enabled),
+        "channel {channel_id} must exist for the flag flip"
+    );
 }
 
 /// Inserts an enabled client key bound to the channel and returns the

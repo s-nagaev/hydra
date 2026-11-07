@@ -551,3 +551,87 @@ async fn oversized_chat_body_returns_413_openai_error() {
         "an oversized body must never reach the upstream"
     );
 }
+
+/// Seeds a channel pointing at a live recorder upstream plus a bound key,
+/// with the channel's enabled flag flipped to `enabled`; returns the key.
+/// The live upstream proves a disabled channel receives no traffic at all.
+async fn seed_with_channel_flag(
+    db: &sqlx::SqlitePool,
+    recorder: &Recorder,
+    completion: &'static [u8],
+    channel_enabled: bool,
+) -> (i64, String) {
+    let base = common::spawn_upstream(fixed_response_router(
+        recorder.clone(),
+        StatusCode::OK,
+        "application/json",
+        completion.to_vec(),
+    ))
+    .await;
+    let channel_id = common::seed_channel(db, &base, None).await;
+    let key = common::seed_key(db, channel_id).await;
+    common::set_channel_enabled(db, channel_id, channel_enabled).await;
+    (channel_id, key)
+}
+
+#[tokio::test]
+async fn disabled_channel_returns_503_openai_error_on_chat() {
+    let db = common::test_pool().await;
+    let recorder = Recorder::default();
+    let (_, key) =
+        seed_with_channel_flag(&db, &recorder, br#"{"id":"chatcmpl-disabled"}"#, false).await;
+    let app = common::test_app(db);
+
+    let (status, _, body) = send(app, chat_request(&key, chat_body("gpt-4o", false))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let error = error_json(&body)["error"].clone();
+    assert_eq!(error["type"], "api_error");
+    assert_eq!(error["code"], "channel_disabled");
+    assert!(
+        error["message"].as_str().unwrap().contains("disabled"),
+        "message must say the channel is disabled: {error}"
+    );
+    assert_eq!(
+        recorder.requests().len(),
+        0,
+        "a disabled channel must receive no traffic"
+    );
+}
+
+#[tokio::test]
+async fn disabled_channel_returns_503_openai_error_on_models() {
+    let db = common::test_pool().await;
+    let recorder = Recorder::default();
+    let (_, key) =
+        seed_with_channel_flag(&db, &recorder, br#"{"id":"chatcmpl-disabled"}"#, false).await;
+    let app = common::test_app(db);
+
+    let (status, _, body) = send(app, models_request(&key)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let error = error_json(&body)["error"].clone();
+    assert_eq!(error["type"], "api_error");
+    assert_eq!(error["code"], "channel_disabled");
+    assert_eq!(recorder.requests().len(), 0);
+}
+
+#[tokio::test]
+async fn re_enabling_the_channel_restores_proxy_access_for_bound_keys() {
+    let db = common::test_pool().await;
+    let recorder = Recorder::default();
+    let completion = br#"{"id":"chatcmpl-back"}"#;
+    let (channel_id, key) = seed_with_channel_flag(&db, &recorder, completion, false).await;
+    let app = common::test_app(db.clone());
+
+    let (status, _, _) = send(app.clone(), chat_request(&key, chat_body("gpt-4o", false))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+    common::set_channel_enabled(&db, channel_id, true).await;
+    let (status, _, body) = send(app, chat_request(&key, chat_body("gpt-4o", false))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(&body[..], &completion[..]);
+    assert_eq!(
+        recorder.requests().len(),
+        1,
+        "only the post-re-enable call reaches the upstream"
+    );
+}

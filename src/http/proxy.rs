@@ -58,6 +58,8 @@ pub enum ProxyError {
     ModelNotAllowed(String),
     #[error("the channel bound to this API key does not exist")]
     ChannelGone,
+    #[error("the channel bound to this API key is disabled")]
+    ChannelDisabled,
     #[error("upstream request failed")]
     UpstreamUnavailable,
     #[error(transparent)]
@@ -93,6 +95,12 @@ impl IntoResponse for ProxyError {
                 "The channel bound to this API key is unavailable",
                 "api_error",
                 None,
+            ),
+            ProxyError::ChannelDisabled => openai_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "The channel bound to this API key is currently disabled",
+                "api_error",
+                Some("channel_disabled"),
             ),
             ProxyError::UpstreamUnavailable => openai_error(
                 StatusCode::BAD_GATEWAY,
@@ -166,9 +174,9 @@ pub async fn chat_completions(
     let channel = match resolve_channel(&state, &auth).await {
         Ok(channel) => channel,
         // When the database itself is failing there is no point attempting a
-        // log write; ChannelGone is a client-visible routing failure that
-        // still gets its audit row.
-        Err(e @ ProxyError::ChannelGone) => {
+        // log write; ChannelGone and ChannelDisabled are client-visible
+        // routing failures that still get their audit row.
+        Err(e @ (ProxyError::ChannelGone | ProxyError::ChannelDisabled)) => {
             log_rejection(&state, &auth, Some(model), start, &body, &e);
             return Err(e);
         }
@@ -315,10 +323,16 @@ fn ensure_model_allowed(channel: &Channel, model: &str) -> Result<(), ProxyError
 /// Loads the channel bound to the authenticated key. The FK plus the
 /// bound-keys delete guard make a missing row nearly impossible; if it does
 /// happen the caller sees a 502 rather than a panic or silent fallback.
+/// A disabled channel keeps its keys and their log history but must not
+/// serve traffic; its callers see a 503 so the key itself stays valid.
 async fn resolve_channel(state: &AppState, auth: &ProxyAuth) -> Result<Channel, ProxyError> {
-    channels::find(&state.db, auth.key.channel_id)
+    let channel = channels::find(&state.db, auth.key.channel_id)
         .await?
-        .ok_or(ProxyError::ChannelGone)
+        .ok_or(ProxyError::ChannelGone)?;
+    if !channel.enabled {
+        return Err(ProxyError::ChannelDisabled);
+    }
+    Ok(channel)
 }
 
 /// Joins a channel base URL with an API path so a trailing slash on the
