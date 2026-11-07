@@ -3,9 +3,13 @@
 //! `POST /v1/chat/completions` and `GET /v1/models` resolve the client key
 //! to its bound channel, enforce the channel's model whitelist, and forward
 //! to the upstream with the client `Authorization` dropped and the upstream
-//! key substituted. The chat body is buffered once (chat bodies are small)
-//! so `model` and `stream` can be peeked, then the original bytes are
-//! forwarded verbatim. Responses pass through untouched; streaming ones use
+//! key substituted. The chat body is buffered once, bounded by
+//! [`CHAT_BODY_LIMIT`] (32 MiB, well past axum's 2 MiB default because
+//! vision requests embed base64 images), so `model` and `stream` can be
+//! peeked, then the original bytes are forwarded verbatim. A body over the
+//! limit fails through the [`ChatBody`] extractor as an OpenAI-shaped 413,
+//! never axum's plain-text rejection, so client libraries always see a
+//! parseable error. Responses pass through untouched; streaming ones use
 //! `bytes_stream()` straight into `Body::from_stream` so SSE chunk semantics
 //! survive. The upstream-to-client response conversion lives in one place so
 //! the background logging task can tee into it later without touching the
@@ -14,7 +18,7 @@
 use std::time::Duration;
 
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{FromRequest, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -24,6 +28,13 @@ use crate::db::channels::{self, Channel};
 use crate::http::openai_error::openai_error;
 use crate::http::proxy_auth::ProxyAuth;
 use crate::http::AppState;
+
+/// Maximum accepted chat request body, in bytes (32 MiB). Vision requests
+/// embed base64-encoded images and long-context conversations run well past
+/// axum's 2 MiB default; 32 MiB covers both while still bounding memory.
+/// Applied to `/v1/chat/completions` via `DefaultBodyLimit`; an over-limit
+/// body fails into [`ProxyError::PayloadTooLarge`].
+pub const CHAT_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
 /// Total-request cap for non-streaming chat calls. Generous on purpose:
 /// reasoning models can think for minutes before the single response body
@@ -37,6 +48,8 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum ProxyError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("the chat request body exceeded the body limit")]
+    PayloadTooLarge,
     #[error("model {0} is not allowed by the channel whitelist")]
     ModelNotAllowed(String),
     #[error("the channel bound to this API key does not exist")]
@@ -53,6 +66,15 @@ impl IntoResponse for ProxyError {
             ProxyError::BadRequest(message) => openai_error(
                 StatusCode::BAD_REQUEST,
                 &message,
+                "invalid_request_error",
+                None,
+            ),
+            ProxyError::PayloadTooLarge => openai_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                &format!(
+                    "Request body exceeds the maximum allowed size of {} MiB",
+                    CHAT_BODY_LIMIT / (1024 * 1024)
+                ),
                 "invalid_request_error",
                 None,
             ),
@@ -87,6 +109,38 @@ impl IntoResponse for ProxyError {
     }
 }
 
+/// Buffered chat request body. Wrapping `Bytes` in a dedicated extractor is
+/// what makes an over-limit body surface as an OpenAI-shaped 413 (via
+/// [`ProxyError::PayloadTooLarge`]) instead of axum's default plain-text
+/// rejection, which OpenAI client libraries cannot parse.
+pub struct ChatBody(Bytes);
+
+impl<S> FromRequest<S> for ChatBody
+where
+    S: Send + Sync,
+{
+    type Rejection = ProxyError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Bytes::from_request(req, state).await {
+            Ok(bytes) => Ok(ChatBody(bytes)),
+            Err(rejection) => {
+                // `Bytes` only rejects on the length limit (413) or an
+                // unreadable body; the latter keeps the same 400 wording as
+                // malformed JSON, which the handler reports after the peek.
+                let status = rejection.into_response().status();
+                if status == StatusCode::PAYLOAD_TOO_LARGE {
+                    Err(ProxyError::PayloadTooLarge)
+                } else {
+                    Err(ProxyError::BadRequest(
+                        "Invalid request body: expected a JSON object".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
 /// `POST /v1/chat/completions`: peek `model`/`stream`, check the whitelist,
 /// forward the original bytes with the upstream key, pass the response
 /// through byte-for-byte.
@@ -94,7 +148,7 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     auth: ProxyAuth,
     headers: HeaderMap,
-    body: Bytes,
+    ChatBody(body): ChatBody,
 ) -> Result<Response, ProxyError> {
     let (model, stream_requested) = peek_request(&body)?;
     let channel = resolve_channel(&state, &auth).await?;

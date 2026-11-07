@@ -500,3 +500,54 @@ async fn models_upstream_unreachable_returns_502_openai_error() {
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     assert_eq!(error_json(&body)["error"]["type"], "api_error");
 }
+
+#[tokio::test]
+async fn oversized_chat_body_returns_413_openai_error() {
+    let db = common::test_pool().await;
+    let recorder = Recorder::default();
+    // A live upstream so the test proves the oversized body never leaves.
+    let base = common::spawn_upstream(fixed_response_router(
+        recorder.clone(),
+        StatusCode::OK,
+        "application/json",
+        br#"{"id":"never"}"#.to_vec(),
+    ))
+    .await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db);
+
+    // One 1 MiB chunk more than the production limit, streamed so the
+    // request is produced lazily; the router stops reading at the limit.
+    use tokio_stream::StreamExt as _;
+    let chunk: axum::body::Bytes = vec![b'x'; 1024 * 1024].into();
+    let chunks_needed = hydra::http::CHAT_BODY_LIMIT / chunk.len() + 1;
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from_stream(
+            tokio_stream::iter(std::iter::repeat_n(chunk, chunks_needed))
+                .map(Ok::<_, std::convert::Infallible>),
+        ))
+        .unwrap();
+
+    let (status, _, body) = send(app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let error = error_json(&body)["error"].clone();
+    assert_eq!(error["type"], "invalid_request_error");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("size"),
+        "message must say the payload is too large: {error}"
+    );
+    assert_eq!(
+        recorder.requests().len(),
+        0,
+        "an oversized body must never reach the upstream"
+    );
+}

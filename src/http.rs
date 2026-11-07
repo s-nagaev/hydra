@@ -13,10 +13,15 @@ mod proxy_auth;
 
 use std::time::Duration;
 
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
+
+/// Maximum buffered chat request body; re-exported so the integration
+/// suite can drive the production limit without weakening it.
+pub use proxy::CHAT_BODY_LIMIT;
 
 /// Shared application state handed to all handlers.
 #[derive(Clone)]
@@ -65,7 +70,15 @@ pub fn router(state: AppState) -> Router {
             "/admin/keys/{id}",
             patch(admin_keys::patch).delete(admin_keys::delete),
         )
-        .route("/v1/chat/completions", post(proxy::chat_completions))
+        .route(
+            "/v1/chat/completions",
+            post(proxy::chat_completions)
+                // 32 MiB instead of axum's 2 MiB default: base64 vision
+                // payloads and long conversations exceed the default. The
+                // over-limit rejection is reshaped to OpenAI JSON by the
+                // `ChatBody` extractor inside the handler.
+                .layer(DefaultBodyLimit::max(proxy::CHAT_BODY_LIMIT)),
+        )
         .route("/v1/models", get(proxy::models))
         .with_state(state)
 }
