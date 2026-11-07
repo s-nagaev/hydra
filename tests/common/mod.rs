@@ -97,6 +97,9 @@ pub async fn spawn_upstream(router: Router) -> String {
 /// A base URL on a loopback port nothing is listening on: the listener is
 /// bound, its address read, then dropped. Rebinding by another process in
 /// the microseconds between drop and connect is negligible.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub async fn unreachable_base_url() -> String {
     let listener = within(TcpListener::bind("127.0.0.1:0")).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -241,6 +244,7 @@ enum Reply {
     },
     /// SSE: the chunks are sent with a delay between them so the passthrough
     /// is exercised over a real stream, not one pre-sized buffer.
+    #[allow(dead_code)]
     Sse { chunks: Vec<Bytes> },
 }
 
@@ -320,6 +324,9 @@ pub fn fixed_response_router(
 /// Builds a mock upstream that records every request and answers with an
 /// SSE stream of `chunks` (sent with delays so buffering would be visible
 /// as an ordering hazard, and the collected bytes must still match).
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub fn sse_router(recorder: Recorder, chunks: Vec<Bytes>) -> Router {
     Router::new()
         .route("/{*path}", any(capture_and_reply))
