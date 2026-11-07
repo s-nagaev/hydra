@@ -217,4 +217,16 @@ CI (`.github/workflows/ci.yml`) runs these three gates on Rust stable plus a
 Docker image build; it never pushes. `AGENTS.md` at the repo root documents the
 conventions that govern changes to this code, including commit format.
 
+## Roadmap
+
+None of this is implemented yet; it is where Hydra is meant to grow.
+
+- Anthropic Messages API and OpenAI Responses API passthrough
+- Google request and response formats
+- Multi-channel keys: one key bound to several channels with failover
+- Quotas and budgets per key
+- `GET /admin/logs`, an admin endpoint for querying the stored request logs
+  (today the rows live in SQLite only)
+- Admin UI
+
 License: TBD.
