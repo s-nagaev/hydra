@@ -20,6 +20,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         db: pool,
         admin_login: cfg.admin_login.clone(),
         admin_password: cfg.admin_password.clone(),
+        client: http::upstream_client(),
     });
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
 

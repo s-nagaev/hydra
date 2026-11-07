@@ -1,11 +1,14 @@
 //! Axum routers and handlers.
 //!
 //! Admin routes carry the Basic Auth extractor from `admin_auth`; only the
-//! liveness check is public. Proxy routes slot in here in later tasks.
+//! liveness check is public. Proxy routes under `/v1/*` authenticate client
+//! keys through `proxy_auth` and forward to the bound channel's upstream.
 
 mod admin_auth;
 mod admin_channels;
 mod admin_keys;
+
+use std::time::Duration;
 
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
@@ -18,6 +21,19 @@ pub struct AppState {
     pub db: SqlitePool,
     pub admin_login: String,
     pub admin_password: String,
+    /// The single upstream HTTP client reused by every proxy request.
+    pub client: reqwest::Client,
+}
+
+/// Builds the shared upstream client. Only the connect timeout lives here:
+/// a client-level total or read timeout would cut long SSE generations
+/// short, so handlers set per-request timeouts where they are safe
+/// (non-streaming chat and `/v1/models` get one, streams get none).
+pub fn upstream_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .build()
+        .expect("client construction only fails when the TLS backend fails to initialize")
 }
 
 async fn health() -> Json<Value> {
@@ -71,6 +87,7 @@ mod tests {
             db: pool,
             admin_login: "admin".to_string(),
             admin_password: "secret".to_string(),
+            client: upstream_client(),
         }
     }
 
