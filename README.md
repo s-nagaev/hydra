@@ -28,6 +28,8 @@ user, no failover or quotas.
   every response
 - SQLite in WAL mode by default, PostgreSQL via `HYDRA_DATABASE_URL`; migrations
   apply automatically at startup for both backends
+- In-memory resolution cache: a fresh hit serves a proxy call without touching
+  the database; admin changes invalidate instantly (`HYDRA_CACHE_TTL_SECS`)
 
 ## Quickstart
 
@@ -212,6 +214,7 @@ normally get their configuration through `docker run -e` or compose instead.
 | `HYDRA_ADMIN_LOGIN` | required | admin user for `/admin/*` Basic Auth |
 | `HYDRA_ADMIN_PASSWORD` | required | admin password, compared in constant time |
 | `HYDRA_LOG_BODIES` | `false` | store request and response bodies in logs, 1 MB cap per side |
+| `HYDRA_CACHE_TTL_SECS` | `3600` | lifetime of the key→channel resolution cache, in seconds; `0` disables the cache |
 
 Missing or empty required variables abort startup with an error naming the
 variable.
@@ -224,6 +227,32 @@ the backend, so existing deployments keep working unchanged. Any other scheme
 aborts startup. Because the PostgreSQL URL carries credentials, Hydra never
 logs it: it is masked as `postgres://<redacted>` everywhere a human might see
 it, and an unsupported scheme fails without echoing the value.
+
+## Resolution cache
+
+Resolving a client key to its channel otherwise costs two `SELECT`s per proxy
+call. Hydra keeps successful resolutions in an in-process cache
+(`src/cache.rs`) keyed by the SHA-256 hash of the presented key; a fresh hit
+answers the proxy auth path without a single database query, over either
+backend.
+
+`HYDRA_CACHE_TTL_SECS` sets the entry lifetime (default 3600); `0` disables
+the cache entirely, so every call hits the database.
+
+What the cache guarantees:
+
+- Only successful resolutions are cached: an alive key bound to an enabled
+  channel. Unknown keys, disabled keys, deleted keys and gone or disabled
+  channels are never cached and keep consulting the database.
+- Admin mutations invalidate explicitly, before and after the write: key
+  PATCH/DELETE drops that key's entries, channel PATCH/DELETE drops every
+  entry bound to the channel. Rotating a channel's `base_url` or upstream
+  `api_key` therefore takes effect on the very next call, never at TTL
+  expiry.
+- The TTL is a safety net for out-of-band edits (direct database writes that
+  bypass the admin API, such as another process sharing the database): such
+  a change becomes visible at most `HYDRA_CACHE_TTL_SECS` seconds late.
+  Security flips done through the admin API are never delayed by the TTL.
 
 ## PostgreSQL
 

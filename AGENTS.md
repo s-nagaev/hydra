@@ -82,6 +82,24 @@ migration, never hand-edited DBs.
 - SQLite WAL mode enabled at pool init (single writer lock would otherwise
   contend with background log inserts).
 
+## Resolution cache
+
+- `src/cache.rs` keeps resolved (alive key, enabled channel) pairs in memory
+  keyed by the key's SHA-256 hash; a fresh hit serves proxy auth with zero
+  database queries, on both backends. Default TTL 3600 s via
+  `HYDRA_CACHE_TTL_SECS`; `0` disables the cache.
+- Only successful resolutions are cached; every rejection (unknown/disabled
+  key, gone/disabled channel) stays uncached and keeps hitting the database.
+- Admin mutations invalidate explicitly BEFORE and AFTER the write: key
+  PATCH/DELETE by key id, channel PATCH/DELETE by channel id (scanning the
+  entries). Rotating a channel's `base_url`/`api_key` must invalidate every
+  entry bound to that channel.
+- The TTL is only a drift bound for out-of-band database edits; never rely
+  on it for security flips — those go through explicit invalidation.
+- DB-skip in tests is proven by pool swap (a closed pool makes any query
+  fail), never by deleting rows: `request_logs.api_key_id` is
+  `ON DELETE RESTRICT`.
+
 ## API conventions
 
 - All proxy errors use the OpenAI body shape `{"error": {...}}`:
