@@ -2,7 +2,7 @@
 //!
 //! Every `/v1/chat/completions` request gets exactly one `request_logs`
 //! row, written by a detached task so the client flow never waits on, or
-//! fails from, logging — accepted calls and rejected ones alike. A
+//! fails from, logging: accepted calls and rejected ones alike. A
 //! rejected call stores its failure in `error` and its HTTP status where
 //! one was produced: auth-layer rejections (401 unknown key, 403 disabled
 //! key) resolve to no key row, so their rows carry NULL `api_key_id` and

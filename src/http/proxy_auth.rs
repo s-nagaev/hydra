@@ -23,7 +23,7 @@
 //! Before any key lookup, requests carrying a resolvable client IP pass
 //! through the per-IP flood cap ([`crate::flood`]): admission reserves one
 //! budget slot in a single atomic step, so a parallel burst of requests
-//! from one IP can never all pass the gate against a stale counter — at
+//! from one IP can never all pass the gate against a stale counter: at
 //! most `HYDRA_FLOOD_LIMIT` requests per window are past the gate at the
 //! same time, and once the budget is spent every request from that IP,
 //! valid keys included, is answered [`ProxyAuthError::FloodCapped`] without

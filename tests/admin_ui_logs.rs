@@ -542,8 +542,6 @@ async fn rejection_rows_with_null_ids_render_placeholder_labels() {
     assert!(body.contains("Invalid API key provided"));
 }
 
-// --- Detail drill-down ----------------------------------------------------
-
 /// Inserts a rejection-style row with NULL key and channel ids.
 async fn insert_rejection_log(db: &SqlitePool, error: &str, created_at: &str) -> i64 {
     within(

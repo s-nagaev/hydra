@@ -12,3 +12,7 @@
 ### Changed
 
 - Rejected requests (unknown or malformed key, flood-capped) are now written to the request log with a nullable key and channel reference, so failed authentications appear next to successful calls.
+
+### Fixed
+
+- A malformed id in the admin UI log detail URL now renders the styled "invalid log id" error banner instead of a bare server rejection.
