@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}Logs{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>Request logs</h1>
+  </div>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Time</th>
+        <th>Key</th>
+        <th>Model</th>
+        <th>Status</th>
+        <th>Tokens</th>
+        <th>Duration</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td colspan="6" class="empty-state">No requests logged yet.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+{% endblock %}

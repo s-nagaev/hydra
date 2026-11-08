@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+
+{% block title %}Channels{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>Channels</h1>
+  </div>
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Base URL</th>
+        <th>API key</th>
+        <th>Allowed models</th>
+        <th>Enabled</th>
+        <th class="actions-col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td colspan="6" class="empty-state">No channels yet. Create one to route client keys through it.</td>
+      </tr>
+    </tbody>
+  </table>
+</section>
+{% endblock %}

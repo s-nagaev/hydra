@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Admin{% endblock %} · Hydra</title>
+  <link rel="stylesheet" href="/admin/ui/static/admin.css">
+  <script src="/admin/ui/static/htmx.min.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="/admin/ui/channels">Hydra</a>
+      <nav class="main-nav">
+        <a href="/admin/ui/channels"
+          {%- if section == "channels" %} class="active"{% endif %}>Channels</a>
+        <a href="/admin/ui/keys"
+          {%- if section == "keys" %} class="active"{% endif %}>Keys</a>
+        <a href="/admin/ui/logs"
+          {%- if section == "logs" %} class="active"{% endif %}>Logs</a>
+      </nav>
+      <a class="api-link" href="/swagger-ui">API</a>
+    </div>
+  </header>
+  <main class="page">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="footer">hydra {{ version }} · admin</footer>
+</body>
+</html>
