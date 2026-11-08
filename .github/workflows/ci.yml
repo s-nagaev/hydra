@@ -42,3 +42,35 @@ jobs:
           tags: hydra:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  postgres:
+    name: test (postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: hydra
+          POSTGRES_PASSWORD: hydra
+        ports:
+          - 54329:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d hydra"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pg-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-pg-
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --test postgres
+        env:
+          HYDRA_TEST_PG_URL: postgres://postgres:hydra@127.0.0.1:54329/hydra
