@@ -431,3 +431,39 @@ async fn invalid_query_values_render_an_error_banner_not_a_crash() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("status_class must be one of"));
 }
+
+#[tokio::test]
+async fn page_beyond_the_last_one_renders_the_empty_state_with_correct_meta() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    for i in 0..2 {
+        insert_log(
+            &db,
+            key_id,
+            channel_id,
+            Some("gpt-4o"),
+            Some(200),
+            None,
+            None,
+            None,
+            None,
+            None,
+            &format!("2026-11-07 10:0{i}:00"),
+        )
+        .await;
+    }
+
+    // Two rows, page size 25: page 2 exists in the URL but has no rows.
+    let (status, body) = get_page(&db, "/admin/ui/logs?page=2&page_size=25").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("No rows on this page. Go back to an earlier page."));
+    // Meta reflects reality: one page total, no next link, prev works, and
+    // the range display is omitted because the page holds no rows.
+    assert!(!body.contains("of 2"));
+    assert!(body.contains("<span class=\"disabled\">Next</span>"));
+    assert!(body.contains(">Prev</a>"));
+    // The strip clamps to real pages: only page 1 renders, as a plain link
+    // (the requested page 2 exists in the URL but not in the strip).
+    assert!(body.contains(">1</a>"));
+    assert!(!body.contains("class=\"current\">2"));
+}

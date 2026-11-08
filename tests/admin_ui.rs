@@ -446,53 +446,73 @@ async fn key_create_for_unknown_or_disabled_channel_renders_error_banner() {
 
 // --- CSRF and auth gates --------------------------------------------------
 
+/// Every mutating admin UI route with a body its handler accepts, built for
+/// a freshly created channel. Single source of truth for the systematic
+/// CSRF test; the routers in `admin_ui_channels` and `admin_ui_keys` must
+/// stay in sync with this list, and every entry here sits inside the
+/// CSRF-guarded `/admin/ui` nest.
+fn mutating_ui_routes(channel_id: i64) -> Vec<(String, String)> {
+    vec![
+        (
+            "/admin/ui/channels".to_string(),
+            form(&[
+                ("name", "created"),
+                ("base_url", "https://api.example.com"),
+                ("api_key", "sk-upstream-secret-1234567890"),
+                ("allowed_models", ""),
+            ]),
+        ),
+        (
+            format!("/admin/ui/channels/{channel_id}"),
+            form(&[
+                ("name", "edited"),
+                ("base_url", "https://api.example.com/v1"),
+                ("api_key", ""),
+                ("allowed_models", "gpt-4o"),
+            ]),
+        ),
+        (
+            format!("/admin/ui/channels/{channel_id}/toggle"),
+            form(&[("enabled", "false")]),
+        ),
+        (
+            format!("/admin/ui/channels/{channel_id}/delete"),
+            String::new(),
+        ),
+        (
+            "/admin/ui/keys".to_string(),
+            form(&[("channel_id", &channel_id.to_string()), ("name", "")]),
+        ),
+        (
+            "/admin/ui/keys/1/toggle".to_string(),
+            form(&[("enabled", "false")]),
+        ),
+        ("/admin/ui/keys/1/delete".to_string(), String::new()),
+    ]
+}
+
 #[tokio::test]
-async fn cross_site_channel_and_key_and_toggle_posts_return_403() {
+async fn cross_site_posts_to_every_mutating_ui_route_return_403() {
     let db = test_pool().await;
     let channel_id = create_channel(&db).await;
 
-    let (status, _) = send(
-        &db,
-        "POST",
-        "/admin/ui/channels",
-        Some(form(&[
-            ("name", "evil"),
-            ("base_url", "https://evil.example"),
-            ("api_key", "sk-stolen"),
-            ("allowed_models", ""),
-        ])),
-        Some(("Sec-Fetch-Site", "cross-site")),
-        Some(&auth_header()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
+    let routes = mutating_ui_routes(channel_id);
+    assert_eq!(routes.len(), 7, "the route list must cover every POST");
+    for (uri, body) in &routes {
+        let (status, _) = send(
+            &db,
+            "POST",
+            uri,
+            Some(body.clone()),
+            Some(("Sec-Fetch-Site", "cross-site")),
+            Some(&auth_header()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "cross-site POST to {uri}");
+    }
 
-    let (status, _) = send(
-        &db,
-        "POST",
-        "/admin/ui/keys",
-        Some(form(&[
-            ("channel_id", &channel_id.to_string()),
-            ("name", ""),
-        ])),
-        Some(("Sec-Fetch-Site", "cross-site")),
-        Some(&auth_header()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-
-    let (status, _) = send(
-        &db,
-        "POST",
-        &format!("/admin/ui/channels/{channel_id}/toggle"),
-        Some(form(&[("enabled", "false")])),
-        Some(("Sec-Fetch-Site", "cross-site")),
-        Some(&auth_header()),
-    )
-    .await;
-    assert_eq!(status, StatusCode::FORBIDDEN);
-
-    // Nothing mutated behind the 403s.
+    // Nothing mutated behind the 403s: the channel survives enabled and no
+    // key was issued by the cross-site key-creation attempt.
     let count: i64 = within(sqlx::query_scalar("SELECT COUNT(*) FROM channels").fetch_one(&db))
         .await
         .unwrap();
@@ -533,4 +553,44 @@ async fn ui_posts_without_credentials_return_401() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+// --- Access control matrix --------------------------------------------------
+
+/// Every GET route on the admin UI; `/admin/ui` redirects when
+/// authenticated, everything else answers 200. Built with a real channel id
+/// so the edit-form route resolves an existing row.
+fn ui_get_routes(channel_id: i64) -> Vec<(String, StatusCode)> {
+    vec![
+        ("/admin/ui".to_string(), StatusCode::SEE_OTHER),
+        ("/admin/ui/channels".to_string(), StatusCode::OK),
+        ("/admin/ui/channels/form".to_string(), StatusCode::OK),
+        (
+            format!("/admin/ui/channels/{channel_id}/edit"),
+            StatusCode::OK,
+        ),
+        ("/admin/ui/keys".to_string(), StatusCode::OK),
+        ("/admin/ui/keys/form".to_string(), StatusCode::OK),
+        ("/admin/ui/logs".to_string(), StatusCode::OK),
+        ("/admin/ui/static/htmx.min.js".to_string(), StatusCode::OK),
+        ("/admin/ui/static/admin.css".to_string(), StatusCode::OK),
+    ]
+}
+
+#[tokio::test]
+async fn every_ui_get_route_is_401_without_credentials_and_serves_with_them() {
+    let db = test_pool().await;
+    let channel_id = create_channel(&db).await;
+
+    for (uri, expected) in ui_get_routes(channel_id) {
+        let (status, _) = send(&db, "GET", &uri, None, None, None).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "unauthenticated GET {uri}"
+        );
+
+        let (status, _) = send(&db, "GET", &uri, None, None, Some(&auth_header())).await;
+        assert_eq!(status, expected, "authenticated GET {uri}");
+    }
 }
