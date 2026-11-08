@@ -18,9 +18,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cfg = hydra::config::Config::from_env()?;
     init_tracing();
 
-    let pool = hydra::db::init_pool(&cfg.db_path).await?;
+    let db = hydra::db::init_pool(&cfg.db).await?;
+    tracing::info!(backend = %cfg.db.redacted(), "database ready");
     let state = AppState {
-        db: pool,
+        db,
         admin_login: cfg.admin_login.clone(),
         admin_password: cfg.admin_password.clone(),
         client: http::upstream_client(),
@@ -133,7 +134,10 @@ mod tests {
             cfg.bind_addr,
             "127.0.0.1:9099".parse::<std::net::SocketAddr>().unwrap()
         );
-        assert_eq!(cfg.db_path, "./from-env.db");
+        assert_eq!(
+            cfg.db,
+            hydra::config::DbTarget::Sqlite("./from-env.db".to_string())
+        );
         assert_eq!(cfg.admin_login, "file-login");
         assert_eq!(cfg.admin_password, "file-secret");
         assert!(cfg.log_bodies);

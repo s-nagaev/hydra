@@ -24,7 +24,6 @@ use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
-use sqlx::SqlitePool;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -35,7 +34,7 @@ pub use proxy::CHAT_BODY_LIMIT;
 /// Shared application state handed to all handlers.
 #[derive(Clone)]
 pub struct AppState {
-    pub db: SqlitePool,
+    pub db: crate::db::Db,
     pub admin_login: String,
     pub admin_password: String,
     /// The single upstream HTTP client reused by every proxy request.
@@ -132,7 +131,7 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         AppState {
-            db: pool,
+            db: pool.into(),
             admin_login: "admin".to_string(),
             admin_password: "secret".to_string(),
             client: upstream_client(),

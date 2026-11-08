@@ -2,9 +2,12 @@
 //!
 //! Rows are written only by the background logger in `crate::logging`; the
 //! insert is fire-and-forget from the client flow's point of view.
+//!
+//! One SQL body per query: fragments are written against the backend-aware
+//! [`Sql`] builder, which picks the placeholder per backend.
 
-use sqlx::sqlite::{SqlitePool, SqliteRow};
-use sqlx::{QueryBuilder, Row};
+use super::timestamp;
+use super::{Arg, Db, Fields, Row, Sql};
 
 /// A new request log row. `status` is the upstream HTTP status, or NULL when
 /// the request never reached the upstream; `created_at` is stamped in the
@@ -24,26 +27,32 @@ pub struct NewRequestLog {
 
 /// Inserts one log row. The caller runs this on a detached task; failures
 /// are reported through tracing, never to the proxied client.
-pub async fn insert(pool: &SqlitePool, log: &NewRequestLog) -> sqlx::Result<()> {
-    sqlx::query(
-        "INSERT INTO request_logs \
-         (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
-          duration_ms, request_body, response_body, error, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-    )
-    .bind(log.api_key_id)
-    .bind(log.channel_id)
-    .bind(&log.model)
-    .bind(log.status)
-    .bind(log.prompt_tokens)
-    .bind(log.completion_tokens)
-    .bind(log.duration_ms)
-    .bind(&log.request_body)
-    .bind(&log.response_body)
-    .bind(&log.error)
-    .bind(super::timestamp::now_utc())
-    .execute(pool)
-    .await?;
+pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
+    let mut sql = Sql::for_db(db);
+    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, duration_ms, request_body, response_body, error, created_at) VALUES (")
+        .bind(Arg::Int(log.api_key_id))
+        .push(", ")
+        .bind(Arg::Int(log.channel_id))
+        .push(", ")
+        .bind(Arg::Text(log.model.clone()))
+        .push(", ")
+        .bind(Arg::OptInt(log.status))
+        .push(", ")
+        .bind(Arg::OptInt(log.prompt_tokens))
+        .push(", ")
+        .bind(Arg::OptInt(log.completion_tokens))
+        .push(", ")
+        .bind(Arg::Int(log.duration_ms))
+        .push(", ")
+        .bind(Arg::Text(log.request_body.clone()))
+        .push(", ")
+        .bind(Arg::Text(log.response_body.clone()))
+        .push(", ")
+        .bind(Arg::Text(log.error.clone()))
+        .push(", ")
+        .bind(Arg::Text(Some(timestamp::now_utc())))
+        .push(")");
+    db.execute(sql).await?;
     Ok(())
 }
 
@@ -103,92 +112,95 @@ pub struct LogFilters {
     pub page_size: u64,
 }
 
-/// Adds the filter conditions to a query builder. Values always travel as
-/// bind parameters; user input never lands in the SQL text itself.
-fn push_conditions(builder: &mut QueryBuilder<'_, sqlx::Sqlite>, filters: &LogFilters) {
-    builder.push("1=1");
+/// Adds the filter conditions to a SQL body. Values always travel as bind
+/// parameters; user input never lands in the SQL text itself.
+fn push_conditions(sql: &mut Sql, filters: &LogFilters) {
+    sql.push("1=1");
     if let Some(key_id) = filters.key_id {
-        builder.push(" AND api_key_id = ").push_bind(key_id);
+        sql.push(" AND api_key_id = ").bind(Arg::Int(key_id));
     }
     if let Some(channel_id) = filters.channel_id {
-        builder.push(" AND channel_id = ").push_bind(channel_id);
+        sql.push(" AND channel_id = ").bind(Arg::Int(channel_id));
     }
     if let Some(model) = &filters.model {
-        builder.push(" AND model = ").push_bind(model.clone());
+        sql.push(" AND model = ")
+            .bind(Arg::Text(Some(model.clone())));
     }
     if let Some(status_class) = filters.status_class {
         match status_class {
             StatusClass::Ok2xx => {
-                builder.push(" AND status >= ").push_bind(200i64);
-                builder.push(" AND status < ").push_bind(300i64);
+                sql.push(" AND status >= ").bind(Arg::Int(200));
+                sql.push(" AND status < ").bind(Arg::Int(300));
             }
             StatusClass::Client4xx => {
-                builder.push(" AND status >= ").push_bind(400i64);
-                builder.push(" AND status < ").push_bind(500i64);
+                sql.push(" AND status >= ").bind(Arg::Int(400));
+                sql.push(" AND status < ").bind(Arg::Int(500));
             }
             StatusClass::Server5xx => {
-                builder.push(" AND status >= ").push_bind(500i64);
-                builder.push(" AND status < ").push_bind(600i64);
+                sql.push(" AND status >= ").bind(Arg::Int(500));
+                sql.push(" AND status < ").bind(Arg::Int(600));
             }
             // Failed transports have a null status and still count.
             StatusClass::Errors => {
-                builder
-                    .push(" AND (status IS NULL OR status >= ")
-                    .push_bind(400i64);
-                builder.push(")");
+                sql.push(" AND (status IS NULL OR status >= ")
+                    .bind(Arg::Int(400));
+                sql.push(")");
             }
         }
     }
     if let Some(from) = &filters.from {
-        builder.push(" AND created_at >= ").push_bind(from.clone());
+        sql.push(" AND created_at >= ")
+            .bind(Arg::Text(Some(from.clone())));
     }
     if let Some(to) = &filters.to {
-        builder.push(" AND created_at <= ").push_bind(to.clone());
+        sql.push(" AND created_at <= ")
+            .bind(Arg::Text(Some(to.clone())));
     }
 }
 
-fn map_row(row: &SqliteRow) -> sqlx::Result<RequestLog> {
+fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
     Ok(RequestLog {
-        id: row.try_get("id")?,
-        api_key_id: row.try_get("api_key_id")?,
-        channel_id: row.try_get("channel_id")?,
-        model: row.try_get("model")?,
-        status: row.try_get("status")?,
-        prompt_tokens: row.try_get("prompt_tokens")?,
-        completion_tokens: row.try_get("completion_tokens")?,
-        duration_ms: row.try_get("duration_ms")?,
-        request_body: row.try_get("request_body")?,
-        response_body: row.try_get("response_body")?,
-        error: row.try_get("error")?,
-        created_at: row.try_get("created_at")?,
+        id: row.int("id")?,
+        api_key_id: row.int("api_key_id")?,
+        channel_id: row.int("channel_id")?,
+        model: row.opt_text("model")?,
+        status: row.opt_int("status")?,
+        prompt_tokens: row.opt_int("prompt_tokens")?,
+        completion_tokens: row.opt_int("completion_tokens")?,
+        duration_ms: row.int("duration_ms")?,
+        request_body: row.opt_text("request_body")?,
+        response_body: row.opt_text("response_body")?,
+        error: row.opt_text("error")?,
+        created_at: row.text("created_at")?,
     })
 }
 
 /// One count query plus one page query, both sharing the same dynamically
 /// built WHERE clause. Rows are ordered by id DESC (newest first).
-pub async fn list(pool: &SqlitePool, filters: &LogFilters) -> sqlx::Result<(Vec<RequestLog>, i64)> {
-    let mut count_builder = QueryBuilder::new("SELECT COUNT(*) FROM request_logs WHERE ");
-    push_conditions(&mut count_builder, filters);
-    let total: i64 = count_builder.build_query_scalar().fetch_one(pool).await?;
+pub async fn list(db: &Db, filters: &LogFilters) -> sqlx::Result<(Vec<RequestLog>, i64)> {
+    let mut count = Sql::for_db(db);
+    count.push("SELECT COUNT(*) FROM request_logs WHERE ");
+    push_conditions(&mut count, filters);
+    let total = db.scalar(count).await?;
 
-    let mut page_builder = QueryBuilder::new(
+    let mut page = Sql::for_db(db);
+    page.push(
         "SELECT id, api_key_id, channel_id, model, status, prompt_tokens, \
          completion_tokens, duration_ms, request_body, response_body, error, created_at \
          FROM request_logs WHERE ",
     );
-    push_conditions(&mut page_builder, filters);
-    page_builder
-        .push(" ORDER BY id DESC LIMIT ")
-        .push_bind(filters.page_size as i64)
+    push_conditions(&mut page, filters);
+    page.push(" ORDER BY id DESC LIMIT ")
+        .bind(Arg::Int(filters.page_size as i64))
         .push(" OFFSET ")
-        .push_bind(
+        .bind(Arg::Int(
             filters
                 .page
                 .saturating_sub(1)
                 .saturating_mul(filters.page_size)
                 .min(i64::MAX as u64) as i64,
-        );
-    let rows = page_builder.build().fetch_all(pool).await?;
+        ));
+    let rows = db.fetch_all(page).await?;
     let items = rows.iter().map(map_row).collect::<sqlx::Result<Vec<_>>>()?;
     Ok((items, total))
 }

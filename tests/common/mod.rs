@@ -59,7 +59,7 @@ pub async fn test_pool() -> SqlitePool {
 /// Application state wired like production, with the test pool.
 pub fn test_app(db: SqlitePool) -> AppState {
     AppState {
-        db,
+        db: hydra::db::Db::from(db),
         admin_login: "admin".to_string(),
         admin_password: "secret".to_string(),
         client: http::upstream_client(),
@@ -75,7 +75,7 @@ pub fn test_app(db: SqlitePool) -> AppState {
 #[allow(dead_code)]
 pub fn test_app_logging(db: SqlitePool) -> AppState {
     AppState {
-        db,
+        db: hydra::db::Db::from(db),
         admin_login: "admin".to_string(),
         admin_password: "secret".to_string(),
         client: http::upstream_client(),
@@ -123,7 +123,7 @@ pub async fn seed_channel(
     allowed_models: Option<Vec<String>>,
 ) -> i64 {
     let channel = within(channel_rows::create(
-        db,
+        &hydra::db::Db::from(db.clone()),
         &NewChannel {
             name: "test channel".to_string(),
             base_url: base_url.to_string(),
@@ -142,7 +142,7 @@ pub async fn seed_channel(
 #[allow(dead_code)]
 pub async fn set_channel_enabled(db: &SqlitePool, channel_id: i64, enabled: bool) {
     let patched = within(channel_rows::update(
-        db,
+        &hydra::db::Db::from(db.clone()),
         channel_id,
         &ChannelPatch {
             name: None,
@@ -168,7 +168,7 @@ pub async fn set_channel_enabled(db: &SqlitePool, channel_id: i64, enabled: bool
 pub async fn seed_key(db: &SqlitePool, channel_id: i64) -> String {
     let generated = keygen::generate();
     within(key_rows::create(
-        db,
+        &hydra::db::Db::from(db.clone()),
         &NewKey {
             key_hash: generated.key_hash,
             display_prefix: generated.display_prefix,
@@ -188,7 +188,7 @@ pub async fn seed_key(db: &SqlitePool, channel_id: i64) -> String {
 pub async fn disable_key(db: &SqlitePool, key_id: i64) {
     use hydra::db::keys::{KeyPatch, PatchOutcome};
     match within(key_rows::patch(
-        db,
+        &hydra::db::Db::from(db.clone()),
         key_id,
         &KeyPatch {
             name: None,

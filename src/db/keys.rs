@@ -4,8 +4,12 @@
 //! and PATCH only see alive rows; listing shows the deleted state. Rows are
 //! never physically removed because `request_logs.api_key_id` is
 //! `ON DELETE RESTRICT`.
+//!
+//! One SQL body per query: fragments are written against the backend-aware
+//! [`Sql`] builder, which picks the placeholder per backend.
 
-use sqlx::{Row, SqlitePool};
+use super::timestamp;
+use super::{Arg, Db, Fields, Row, Sql};
 
 /// A stored client API key row. `key_hash` is the SHA-256 hex of the full
 /// key string; the plaintext never reaches this layer.
@@ -55,71 +59,75 @@ pub enum DeleteOutcome {
 const SELECT_COLUMNS: &str =
     "id, key_hash, display_prefix, name, channel_id, enabled, deleted_at, created_at";
 
-fn map_key(row: &sqlx::sqlite::SqliteRow) -> sqlx::Result<ApiKey> {
+fn map_key(row: &Row) -> sqlx::Result<ApiKey> {
     Ok(ApiKey {
-        id: row.try_get("id")?,
-        key_hash: row.try_get("key_hash")?,
-        display_prefix: row.try_get("display_prefix")?,
-        name: row.try_get("name")?,
-        channel_id: row.try_get("channel_id")?,
-        enabled: row.try_get("enabled")?,
-        deleted_at: row.try_get("deleted_at")?,
-        created_at: row.try_get("created_at")?,
+        id: row.int("id")?,
+        key_hash: row.text("key_hash")?,
+        display_prefix: row.text("display_prefix")?,
+        name: row.opt_text("name")?,
+        channel_id: row.int("channel_id")?,
+        enabled: row.boolean("enabled")?,
+        deleted_at: row.opt_text("deleted_at")?,
+        created_at: row.text("created_at")?,
     })
 }
 
 /// Inserts a key row. The caller retries on a UNIQUE collision of
 /// `key_hash` by generating a fresh key.
-pub async fn create(pool: &SqlitePool, key: &NewKey) -> sqlx::Result<ApiKey> {
-    let row = sqlx::query(&format!(
-        "INSERT INTO api_keys (key_hash, display_prefix, name, channel_id, enabled, created_at) \
-         VALUES (?, ?, ?, ?, 1, ?) \
-         RETURNING {SELECT_COLUMNS}"
-    ))
-    .bind(&key.key_hash)
-    .bind(&key.display_prefix)
-    .bind(&key.name)
-    .bind(key.channel_id)
-    .bind(super::timestamp::now_utc())
-    .fetch_one(pool)
-    .await?;
+pub async fn create(db: &Db, key: &NewKey) -> sqlx::Result<ApiKey> {
+    let mut sql = Sql::for_db(db);
+    sql.push("INSERT INTO api_keys (key_hash, display_prefix, name, channel_id, enabled, created_at) VALUES (")
+        .bind(Arg::Text(Some(key.key_hash.clone())))
+        .push(", ")
+        .bind(Arg::Text(Some(key.display_prefix.clone())))
+        .push(", ")
+        .bind(Arg::Text(key.name.clone()))
+        .push(", ")
+        .bind(Arg::Int(key.channel_id))
+        .push(", ")
+        .bind(Arg::Bool(true))
+        .push(", ")
+        .bind(Arg::Text(Some(timestamp::now_utc())))
+        .push(") RETURNING ")
+        .push(SELECT_COLUMNS);
+    let row = db.fetch_one(sql).await?;
     map_key(&row)
 }
 
 /// Lists every key row, soft-deleted ones included, so the admin sees the
 /// full state.
-pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<ApiKey>> {
-    let rows = sqlx::query(&format!(
-        "SELECT {SELECT_COLUMNS} FROM api_keys ORDER BY id"
-    ))
-    .fetch_all(pool)
-    .await?;
+pub async fn list(db: &Db) -> sqlx::Result<Vec<ApiKey>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM api_keys ORDER BY id");
+    let rows = db.fetch_all(sql).await?;
     rows.iter().map(map_key).collect()
 }
 
 /// Auth lookup for the proxy path: matches by hash and excludes soft-deleted
 /// rows.
-pub async fn find_alive_by_hash(pool: &SqlitePool, key_hash: &str) -> sqlx::Result<Option<ApiKey>> {
-    let row = sqlx::query(&format!(
-        "SELECT {SELECT_COLUMNS} FROM api_keys \
-         WHERE key_hash = ? AND deleted_at IS NULL"
-    ))
-    .bind(key_hash)
-    .fetch_optional(pool)
-    .await?;
+pub async fn find_alive_by_hash(db: &Db, key_hash: &str) -> sqlx::Result<Option<ApiKey>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM api_keys WHERE key_hash = ")
+        .bind(Arg::Text(Some(key_hash.to_string())))
+        .push(" AND deleted_at IS NULL");
+    let row = db.fetch_optional(sql).await?;
     row.as_ref().map(map_key).transpose()
 }
 
 /// Applies a partial update. Soft-deleted keys are immutable: they report
 /// [`PatchOutcome::Deleted`] instead of being modified.
-pub async fn patch(pool: &SqlitePool, id: i64, key_patch: &KeyPatch) -> sqlx::Result<PatchOutcome> {
-    let existing: Option<ApiKey> = match sqlx::query(&format!(
-        "SELECT {SELECT_COLUMNS} FROM api_keys WHERE id = ?"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?
-    {
+pub async fn patch(db: &Db, id: i64, key_patch: &KeyPatch) -> sqlx::Result<PatchOutcome> {
+    let mut select = Sql::for_db(db);
+    select
+        .push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM api_keys WHERE id = ")
+        .bind(Arg::Int(id));
+    let existing: Option<ApiKey> = match db.fetch_optional(select).await? {
         Some(row) => Some(map_key(&row)?),
         None => None,
     };
@@ -130,31 +138,29 @@ pub async fn patch(pool: &SqlitePool, id: i64, key_patch: &KeyPatch) -> sqlx::Re
         return Ok(PatchOutcome::Deleted);
     }
 
-    let mut assignments: Vec<&str> = Vec::new();
-    if key_patch.name.is_some() {
-        assignments.push("name = ?");
-    }
-    if key_patch.enabled.is_some() {
-        assignments.push("enabled = ?");
-    }
-    if assignments.is_empty() {
-        return Ok(PatchOutcome::Updated(existing));
-    }
-
-    let sql = format!(
-        "UPDATE api_keys SET {} WHERE id = ? AND deleted_at IS NULL RETURNING {SELECT_COLUMNS}",
-        assignments.join(", ")
-    );
-    let mut query = sqlx::query(&sql);
+    let mut sql = Sql::for_db(db);
+    sql.push("UPDATE api_keys SET ");
+    let mut assignments = 0;
     if let Some(name) = &key_patch.name {
-        query = query.bind(name);
+        sql.push("name = ").bind(Arg::Text(name.clone()));
+        assignments += 1;
     }
     if let Some(enabled) = key_patch.enabled {
-        query = query.bind(enabled);
+        if assignments > 0 {
+            sql.push(", ");
+        }
+        sql.push("enabled = ").bind(Arg::Bool(enabled));
+        assignments += 1;
     }
-    query = query.bind(id);
+    if assignments == 0 {
+        return Ok(PatchOutcome::Updated(existing));
+    }
+    sql.push(" WHERE id = ")
+        .bind(Arg::Int(id))
+        .push(" AND deleted_at IS NULL RETURNING ")
+        .push(SELECT_COLUMNS);
 
-    match query.fetch_optional(pool).await? {
+    match db.fetch_optional(sql).await? {
         Some(row) => Ok(PatchOutcome::Updated(map_key(&row)?)),
         // The Rust-level guard above already rejected deleted rows, so None
         // normally means the row vanished. The `deleted_at IS NULL` clause in
@@ -162,13 +168,12 @@ pub async fn patch(pool: &SqlitePool, id: i64, key_patch: &KeyPatch) -> sqlx::Re
         // classify a concurrent delete as Deleted rather than silently
         // reporting NotFound.
         None => {
-            let deleted: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM api_keys WHERE id = ? AND deleted_at IS NOT NULL",
-            )
-            .bind(id)
-            .fetch_optional(pool)
-            .await?;
-            if deleted.is_some() {
+            let mut probe = Sql::for_db(db);
+            probe
+                .push("SELECT CAST(1 AS BIGINT) FROM api_keys WHERE id = ")
+                .bind(Arg::Int(id))
+                .push(" AND deleted_at IS NOT NULL");
+            if db.scalar_optional(probe).await?.is_some() {
                 Ok(PatchOutcome::Deleted)
             } else {
                 Ok(PatchOutcome::NotFound)
@@ -178,30 +183,27 @@ pub async fn patch(pool: &SqlitePool, id: i64, key_patch: &KeyPatch) -> sqlx::Re
 }
 
 /// Soft delete: stamps `deleted_at` and leaves the row in place.
-pub async fn delete(pool: &SqlitePool, id: i64) -> sqlx::Result<DeleteOutcome> {
-    let deleted_at: Option<Option<String>> = sqlx::query(
-        "UPDATE api_keys SET deleted_at = ? \
-         WHERE id = ? AND deleted_at IS NULL \
-         RETURNING deleted_at",
-    )
-    .bind(super::timestamp::now_utc())
-    .bind(id)
-    .fetch_optional(pool)
-    .await?
-    .map(|row| row.try_get("deleted_at").map(Some))
-    .transpose()?;
-    match deleted_at {
-        Some(_) => Ok(DeleteOutcome::Deleted),
-        None => {
-            let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM api_keys WHERE id = ?")
-                .bind(id)
-                .fetch_optional(pool)
-                .await?;
-            if exists.is_some() {
-                Ok(DeleteOutcome::AlreadyDeleted)
-            } else {
-                Ok(DeleteOutcome::NotFound)
-            }
-        }
+pub async fn delete(db: &Db, id: i64) -> sqlx::Result<DeleteOutcome> {
+    let mut sql = Sql::for_db(db);
+    sql.push("UPDATE api_keys SET deleted_at = ")
+        .bind(Arg::Text(Some(timestamp::now_utc())))
+        .push(" WHERE id = ")
+        .bind(Arg::Int(id))
+        .push(" AND deleted_at IS NULL RETURNING deleted_at");
+    let deleted_at = match db.fetch_optional(sql).await? {
+        Some(row) => row.opt_text("deleted_at")?,
+        None => None,
+    };
+    if deleted_at.is_some() {
+        return Ok(DeleteOutcome::Deleted);
+    }
+    let mut exists = Sql::for_db(db);
+    exists
+        .push("SELECT CAST(1 AS BIGINT) FROM api_keys WHERE id = ")
+        .bind(Arg::Int(id));
+    if db.scalar_optional(exists).await?.is_some() {
+        Ok(DeleteOutcome::AlreadyDeleted)
+    } else {
+        Ok(DeleteOutcome::NotFound)
     }
 }

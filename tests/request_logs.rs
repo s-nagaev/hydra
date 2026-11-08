@@ -338,9 +338,12 @@ async fn log_rows_survive_key_soft_delete() {
     // Soft delete the key the way the admin endpoint does; the log rows
     // must keep referencing it (the FK stays satisfied precisely because
     // the row is not physically removed).
-    let outcome = within(hydra::db::keys::delete(&db, key_row_id))
-        .await
-        .unwrap();
+    let outcome = within(hydra::db::keys::delete(
+        &hydra::db::Db::from(db.clone()),
+        key_row_id,
+    ))
+    .await
+    .unwrap();
     assert!(matches!(outcome, hydra::db::keys::DeleteOutcome::Deleted));
 
     let logs = fetch_logs(&db).await;

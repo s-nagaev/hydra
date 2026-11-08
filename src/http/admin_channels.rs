@@ -517,7 +517,7 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         AppState {
-            db: pool,
+            db: pool.into(),
             admin_login: "admin".to_string(),
             admin_password: "secret".to_string(),
             client: crate::http::upstream_client(),
@@ -696,7 +696,7 @@ mod tests {
         .bind("hyd-abcd")
         .bind(channel_id)
         .bind(crate::db::timestamp::now_utc())
-        .execute(&state.db)
+        .execute(state.db.as_sqlite())
         .await
         .unwrap();
 

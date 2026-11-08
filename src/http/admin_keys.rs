@@ -442,7 +442,7 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         AppState {
-            db: pool,
+            db: pool.into(),
             admin_login: "admin".to_string(),
             admin_password: "secret".to_string(),
             client: crate::http::upstream_client(),
@@ -557,7 +557,7 @@ mod tests {
 
         let stored_hash: String = sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE id = ?")
             .bind(created["id"].as_i64().unwrap())
-            .fetch_one(&state.db)
+            .fetch_one(state.db.as_sqlite())
             .await
             .unwrap();
         assert_eq!(stored_hash, keygen::sha256_hex(full.as_bytes()));

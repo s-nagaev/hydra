@@ -26,9 +26,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::db::Db;
 use axum::body::Bytes;
 use futures_util::{Stream, StreamExt};
-use sqlx::SqlitePool;
 
 use crate::db::request_logs::NewRequestLog;
 
@@ -70,7 +70,7 @@ impl Drop for LogGuard {
 /// Inputs for one chat request's log context, gathered before the request
 /// body is handed to the forwarder.
 pub struct ChatLogInit<'a> {
-    pub db: &'a SqlitePool,
+    pub db: &'a Db,
     pub tracker: &'a LogTracker,
     pub log_bodies: bool,
     pub api_key_id: i64,
@@ -83,7 +83,7 @@ pub struct ChatLogInit<'a> {
 /// Everything the detached log task needs about one chat request. Built in
 /// the handler, finished exactly once by whichever path resolves the request.
 pub struct ChatLogContext {
-    db: SqlitePool,
+    db: Db,
     tracker: LogTracker,
     log_bodies: bool,
     api_key_id: i64,
@@ -146,7 +146,7 @@ impl ChatLogContext {
 
 /// Detached single-row insert. Failures are logged at WARN and dropped: the
 /// client flow has already moved on.
-fn spawn_insert(db: SqlitePool, tracker: LogTracker, record: NewRequestLog) {
+fn spawn_insert(db: Db, tracker: LogTracker, record: NewRequestLog) {
     let guard = tracker.guard();
     tokio::spawn(async move {
         let _inflight = guard;
@@ -291,6 +291,7 @@ fn elapsed_ms(start: Instant) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use sqlx::sqlite::SqlitePool;
     use sqlx::sqlite::SqlitePoolOptions;
     use sqlx::Row;
 
@@ -370,8 +371,9 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
+        let db = Db::from(pool.clone());
         let channel = channels::create(
-            &pool,
+            &db,
             &NewChannel {
                 name: "test".to_string(),
                 base_url: "http://127.0.0.1:9".to_string(),
@@ -382,7 +384,7 @@ mod tests {
         .await
         .unwrap();
         keys::create(
-            &pool,
+            &db,
             &NewKey {
                 key_hash: "hash".to_string(),
                 display_prefix: "hyd-".to_string(),
@@ -408,7 +410,7 @@ mod tests {
         let pool = seeded_pool().await;
         let tracker = LogTracker::default();
         spawn_insert(
-            pool.clone(),
+            Db::from(pool.clone()),
             tracker.clone(),
             NewRequestLog {
                 api_key_id: 1,
@@ -448,7 +450,7 @@ mod tests {
         // No api_keys row with id 99: the FK rejects the insert, which must
         // surface as a WARN in the task, not as a panic here.
         spawn_insert(
-            pool.clone(),
+            Db::from(pool.clone()),
             tracker.clone(),
             NewRequestLog {
                 api_key_id: 99,

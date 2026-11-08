@@ -149,7 +149,7 @@ mod tests {
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         AppState {
-            db: pool,
+            db: pool.into(),
             admin_login: "admin".to_string(),
             admin_password: "secret".to_string(),
             client: crate::http::upstream_client(),

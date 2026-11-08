@@ -1,6 +1,10 @@
 //! Runtime sqlx queries for the `channels` table.
+//!
+//! One SQL body per query: fragments are written against the backend-aware
+//! [`Sql`] builder, which picks the placeholder per backend.
 
-use sqlx::{Row, SqlitePool};
+use super::timestamp;
+use super::{Arg, Db, Fields, Row, Sql};
 
 /// A stored channel row. `api_key` is the upstream secret and must never
 /// cross the HTTP boundary unmasked.
@@ -38,11 +42,11 @@ pub struct ChannelPatch {
 /// Count of keys bound to a channel, alive or soft-deleted; the number the
 /// admin UI shows when a delete is refused. Mirrors the check `delete`
 /// runs to make that decision.
-pub async fn bound_key_count(pool: &SqlitePool, id: i64) -> sqlx::Result<i64> {
-    sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE channel_id = ?")
-        .bind(id)
-        .fetch_one(pool)
-        .await
+pub async fn bound_key_count(db: &Db, id: i64) -> sqlx::Result<i64> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT COUNT(*) FROM api_keys WHERE channel_id = ")
+        .bind(Arg::Int(id));
+    db.scalar(sql).await
 }
 
 /// Result of a channel delete attempt.
@@ -54,8 +58,8 @@ pub enum DeleteOutcome {
 
 const SELECT_COLUMNS: &str = "id, name, base_url, api_key, allowed_models, enabled, created_at";
 
-fn map_channel(row: &sqlx::sqlite::SqliteRow) -> sqlx::Result<Channel> {
-    let allowed_raw: Option<String> = row.try_get("allowed_models")?;
+fn map_channel(row: &Row) -> sqlx::Result<Channel> {
+    let allowed_raw: Option<String> = row.opt_text("allowed_models")?;
     let allowed_models = allowed_raw
         .map(|raw| {
             serde_json::from_str(&raw).map_err(|e| sqlx::Error::ColumnDecode {
@@ -65,124 +69,126 @@ fn map_channel(row: &sqlx::sqlite::SqliteRow) -> sqlx::Result<Channel> {
         })
         .transpose()?;
     Ok(Channel {
-        id: row.try_get("id")?,
-        name: row.try_get("name")?,
-        base_url: row.try_get("base_url")?,
-        api_key: row.try_get("api_key")?,
+        id: row.int("id")?,
+        name: row.text("name")?,
+        base_url: row.text("base_url")?,
+        api_key: row.text("api_key")?,
         allowed_models,
-        enabled: row.try_get("enabled")?,
-        created_at: row.try_get("created_at")?,
+        enabled: row.boolean("enabled")?,
+        created_at: row.text("created_at")?,
     })
 }
 
-pub async fn create(pool: &SqlitePool, channel: &NewChannel) -> sqlx::Result<Channel> {
+pub async fn create(db: &Db, channel: &NewChannel) -> sqlx::Result<Channel> {
     let allowed_json = allowed_models_json(channel.allowed_models.as_ref());
-    let row = sqlx::query(&format!(
-        "INSERT INTO channels (name, base_url, api_key, allowed_models, enabled, created_at) \
-         VALUES (?, ?, ?, ?, 1, ?) \
-         RETURNING {SELECT_COLUMNS}"
-    ))
-    .bind(&channel.name)
-    .bind(&channel.base_url)
-    .bind(&channel.api_key)
-    .bind(allowed_json)
-    .bind(super::timestamp::now_utc())
-    .fetch_one(pool)
-    .await?;
+    let mut sql = Sql::for_db(db);
+    sql.push("INSERT INTO channels (name, base_url, api_key, allowed_models, enabled, created_at) VALUES (")
+        .bind(Arg::Text(Some(channel.name.clone())))
+        .push(", ")
+        .bind(Arg::Text(Some(channel.base_url.clone())))
+        .push(", ")
+        .bind(Arg::Text(Some(channel.api_key.clone())))
+        .push(", ")
+        .bind(Arg::Text(allowed_json))
+        .push(", ")
+        .bind(Arg::Bool(true))
+        .push(", ")
+        .bind(Arg::Text(Some(timestamp::now_utc())))
+        .push(") RETURNING ")
+        .push(SELECT_COLUMNS);
+    let row = db.fetch_one(sql).await?;
     map_channel(&row)
 }
 
-pub async fn list(pool: &SqlitePool) -> sqlx::Result<Vec<Channel>> {
-    let rows = sqlx::query(&format!(
-        "SELECT {SELECT_COLUMNS} FROM channels ORDER BY id"
-    ))
-    .fetch_all(pool)
-    .await?;
+pub async fn list(db: &Db) -> sqlx::Result<Vec<Channel>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM channels ORDER BY id");
+    let rows = db.fetch_all(sql).await?;
     rows.iter().map(map_channel).collect()
 }
 
-pub async fn find(pool: &SqlitePool, id: i64) -> sqlx::Result<Option<Channel>> {
-    let row = sqlx::query(&format!(
-        "SELECT {SELECT_COLUMNS} FROM channels WHERE id = ?"
-    ))
-    .bind(id)
-    .fetch_optional(pool)
-    .await?;
+pub async fn find(db: &Db, id: i64) -> sqlx::Result<Option<Channel>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM channels WHERE id = ")
+        .bind(Arg::Int(id));
+    let row = db.fetch_optional(sql).await?;
     row.as_ref().map(map_channel).transpose()
 }
 
-pub async fn update(
-    pool: &SqlitePool,
-    id: i64,
-    patch: &ChannelPatch,
-) -> sqlx::Result<Option<Channel>> {
-    let mut assignments: Vec<&str> = Vec::new();
-    if patch.name.is_some() {
-        assignments.push("name = ?");
-    }
-    if patch.base_url.is_some() {
-        assignments.push("base_url = ?");
-    }
-    if patch.api_key.is_some() {
-        assignments.push("api_key = ?");
-    }
-    if patch.allowed_models.is_some() {
-        assignments.push("allowed_models = ?");
-    }
-    if patch.enabled.is_some() {
-        assignments.push("enabled = ?");
-    }
-    if assignments.is_empty() {
-        return find(pool, id).await;
-    }
-
-    let sql = format!(
-        "UPDATE channels SET {} WHERE id = ? RETURNING {SELECT_COLUMNS}",
-        assignments.join(", ")
-    );
-    let mut query = sqlx::query(&sql);
+pub async fn update(db: &Db, id: i64, patch: &ChannelPatch) -> sqlx::Result<Option<Channel>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("UPDATE channels SET ");
+    let mut assignments = 0;
     if let Some(name) = &patch.name {
-        query = query.bind(name);
+        sql.push("name = ").bind(Arg::Text(Some(name.clone())));
+        assignments += 1;
     }
     if let Some(base_url) = &patch.base_url {
-        query = query.bind(base_url);
+        if assignments > 0 {
+            sql.push(", ");
+        }
+        sql.push("base_url = ")
+            .bind(Arg::Text(Some(base_url.clone())));
+        assignments += 1;
     }
     if let Some(api_key) = &patch.api_key {
-        query = query.bind(api_key);
+        if assignments > 0 {
+            sql.push(", ");
+        }
+        sql.push("api_key = ")
+            .bind(Arg::Text(Some(api_key.clone())));
+        assignments += 1;
     }
     if let Some(allowed_models) = &patch.allowed_models {
-        query = query.bind(allowed_models_json(allowed_models.as_ref()));
+        if assignments > 0 {
+            sql.push(", ");
+        }
+        sql.push("allowed_models = ")
+            .bind(Arg::Text(allowed_models_json(allowed_models.as_ref())));
+        assignments += 1;
     }
     if let Some(enabled) = patch.enabled {
-        query = query.bind(enabled);
+        if assignments > 0 {
+            sql.push(", ");
+        }
+        sql.push("enabled = ").bind(Arg::Bool(enabled));
+        assignments += 1;
     }
-    query = query.bind(id);
+    if assignments == 0 {
+        return find(db, id).await;
+    }
+    sql.push(" WHERE id = ")
+        .bind(Arg::Int(id))
+        .push(" RETURNING ")
+        .push(SELECT_COLUMNS);
 
-    let row = query.fetch_optional(pool).await?;
+    let row = db.fetch_optional(sql).await?;
     row.as_ref().map(map_channel).transpose()
 }
 
-pub async fn delete(pool: &SqlitePool, id: i64) -> sqlx::Result<DeleteOutcome> {
-    let exists = sqlx::query("SELECT 1 AS one FROM channels WHERE id = ?")
-        .bind(id)
-        .fetch_optional(pool)
-        .await?;
-    if exists.is_none() {
+pub async fn delete(db: &Db, id: i64) -> sqlx::Result<DeleteOutcome> {
+    let mut exists = Sql::for_db(db);
+    exists
+        .push("SELECT CAST(1 AS BIGINT) FROM channels WHERE id = ")
+        .bind(Arg::Int(id));
+    if db.scalar_optional(exists).await?.is_none() {
         return Ok(DeleteOutcome::NotFound);
     }
     // Any bound key row, alive or soft-deleted, blocks the delete: the FK
     // from api_keys and the request_logs history both depend on it.
-    let bound_keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE channel_id = ?")
-        .bind(id)
-        .fetch_one(pool)
-        .await?;
+    let bound_keys = bound_key_count(db, id).await?;
     if bound_keys > 0 {
         return Ok(DeleteOutcome::HasBoundKeys);
     }
-    sqlx::query("DELETE FROM channels WHERE id = ?")
-        .bind(id)
-        .execute(pool)
-        .await?;
+    let mut remove = Sql::for_db(db);
+    remove
+        .push("DELETE FROM channels WHERE id = ")
+        .bind(Arg::Int(id));
+    db.execute(remove).await?;
     Ok(DeleteOutcome::Deleted)
 }
 
