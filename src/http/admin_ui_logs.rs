@@ -826,12 +826,23 @@ fn back_page(query: &LogsQuery) -> u64 {
 pub async fn detail(
     State(state): State<AppState>,
     _auth: AdminAuth,
-    Path(id): Path<i64>,
+    Path(raw_id): Path<String>,
     query: Result<Query<LogsQuery>, QueryRejection>,
 ) -> (StatusCode, LogDetailPage) {
     let back_url = match query {
         Ok(Query(query)) => view_url(&query, back_page(&query)),
         Err(_) => "/admin/ui/logs".to_string(),
+    };
+    // Parse the id here instead of in Path<i64>: a malformed one then gets
+    // the same styled banner as a missing row instead of a bare rejection.
+    let id: i64 = match raw_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                empty_detail(0, back_url, "invalid log id".to_string()),
+            )
+        }
     };
     match request_logs::find(&state.db, id).await {
         Ok(Some(log)) => (StatusCode::OK, build_detail(&state, log, back_url).await),

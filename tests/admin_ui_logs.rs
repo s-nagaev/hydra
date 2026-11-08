@@ -677,6 +677,14 @@ async fn unknown_log_id_renders_the_not_found_banner() {
 }
 
 #[tokio::test]
+async fn malformed_log_id_renders_the_bad_request_banner() {
+    let db = test_pool().await;
+    let (status, body) = get_page(&db, "/admin/ui/logs/not-a-number").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("invalid log id"));
+}
+
+#[tokio::test]
 async fn detail_page_without_credentials_returns_401() {
     let db = test_pool().await;
     let (status, body) = send(&db, "/admin/ui/logs/1", None).await;
