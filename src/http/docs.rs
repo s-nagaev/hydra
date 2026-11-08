@@ -248,6 +248,25 @@ mod tests {
             create_key["security"][0]["basic_auth"].is_array(),
             "admin routes must require the basic scheme"
         );
+
+        // The /admin/logs route template has no {param} placeholders, so a
+        // filter emitted as a path parameter is unusable from Swagger UI and
+        // a required one misrepresents the handler. Location and
+        // optionality are exactly what the route is about.
+        let logs = &doc["paths"]["/admin/logs"]["get"];
+        let params = logs["parameters"].as_array().unwrap();
+        assert_eq!(params.len(), 7, "all seven log filters must be documented");
+        for param in params {
+            assert_eq!(
+                param["in"], "query",
+                "log filters must be query parameters, not path"
+            );
+            assert_ne!(
+                param["required"], true,
+                "log filters must be optional: {}",
+                param["name"]
+            );
+        }
         let schemes = &doc["components"]["securitySchemes"];
         assert_eq!(schemes["basic_auth"]["scheme"], "basic");
         assert_eq!(schemes["bearer_auth"]["scheme"], "bearer");

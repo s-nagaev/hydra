@@ -48,7 +48,11 @@ impl IntoResponse for LogsError {
     }
 }
 
+// The route template has no {param} placeholders; without the explicit
+// location utoipa's IntoParams default (path) would document the filters as
+// required path parameters that Swagger UI cannot even send.
 #[derive(Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct LogListQuery {
     /// Result page, 1-based; values below 1 clamp to 1.
     #[serde(default)]
@@ -181,7 +185,8 @@ fn sqlite_timestamp(raw: &str, label: &str) -> Result<String, LogsError> {
             e.g. a non-RFC3339 time bound or a non-integer page", body = AdminErrorBody, example = json!({
             "error": "from must be an RFC3339 timestamp"
         })),
-        (status = 401, description = "Missing or wrong admin credentials")
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body")
     )
 )]
 pub async fn list(
