@@ -27,6 +27,9 @@ use hydra::keys as keygen;
 
 /// The upstream key seeded into every test channel; proxying must
 /// substitute it for the client key.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub const UPSTREAM_KEY: &str = "sk-upstream-secret";
 
 /// Per-test cap on any single awaited step.
@@ -111,6 +114,9 @@ pub async fn unreachable_base_url() -> String {
 }
 
 /// Inserts a channel bound to `base_url` with the shared upstream key.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub async fn seed_channel(
     db: &SqlitePool,
     base_url: &str,
