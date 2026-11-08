@@ -6,23 +6,129 @@
 <section class="panel">
   <div class="panel-head">
     <h1>Request logs</h1>
+    <a class="button" href="{{ refresh_url }}">Refresh</a>
   </div>
-  <table class="data-table">
+
+  {% if let Some(error) = error %}
+  <div class="error-banner" role="alert">{{ error }}</div>
+  {% endif %}
+
+  <form class="filter-bar" method="get" action="/admin/ui/logs">
+    <div class="filter-field">
+      <label for="log-preset">Period</label>
+      <select id="log-preset" name="preset">
+        {% for option in preset_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="log-from">From (UTC)</label>
+      <input type="datetime-local" id="log-from" name="from" value="{{ from_value }}">
+    </div>
+    <div class="filter-field">
+      <label for="log-to">To (UTC)</label>
+      <input type="datetime-local" id="log-to" name="to" value="{{ to_value }}">
+    </div>
+    <div class="filter-field">
+      <label for="log-key">Key</label>
+      <select id="log-key" name="key_id">
+        {% for option in key_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="log-channel">Channel</label>
+      <select id="log-channel" name="channel_id">
+        {% for option in channel_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="log-model">Model</label>
+      <input type="text" id="log-model" name="model" value="{{ model_value }}">
+    </div>
+    <div class="filter-field">
+      <label for="log-status">Status</label>
+      <select id="log-status" name="status_class">
+        {% for option in status_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="log-page-size">Per page</label>
+      <select id="log-page-size" name="page_size">
+        {% for option in page_size_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <button type="submit" class="primary">Apply</button>
+    </div>
+  </form>
+
+  <table class="data-table logs-table">
     <thead>
       <tr>
-        <th>Time</th>
+        <th>Time (UTC)</th>
         <th>Key</th>
+        <th>Channel</th>
         <th>Model</th>
         <th>Status</th>
         <th>Tokens</th>
-        <th>Duration</th>
+        <th>Duration (ms)</th>
+        <th>Bodies</th>
+        <th>Error</th>
       </tr>
     </thead>
     <tbody>
+      {% if rows.is_empty() %}
       <tr>
-        <td colspan="6" class="empty-state">No requests logged yet.</td>
+        <td colspan="9" class="empty-state">{{ empty_message }}</td>
       </tr>
+      {% else %}
+      {% for row in rows %}
+      <tr>
+        <td class="mono">{{ row.created_at }}</td>
+        <td class="mono">{{ row.key_prefix }}</td>
+        <td>{{ row.channel_name }}</td>
+        <td>{% if let Some(model) = row.model %}{{ model }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+        <td><span class="badge {{ row.status_css }}">{{ row.status_text }}</span></td>
+        <td class="mono">{{ row.tokens }}</td>
+        <td class="mono">{{ row.duration_ms }}</td>
+        <td>{% if row.has_bodies %}<span class="badge bodies" title="Request and/or response bodies were captured">bodies</span>{% else %}<span class="text-muted">-</span>{% endif %}</td>
+        <td class="error-cell">{% if let Some(full) = row.error_full %}<span title="{{ full }}">{% if let Some(shown) = row.error_shown %}{{ shown }}{% endif %}</span>{% else %}<span class="text-muted">-</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+      {% endif %}
     </tbody>
   </table>
+
+  {% if total > 0 %}
+  <div class="table-meta">{{ range_display }}</div>
+  <div class="pagination">
+    {% if let Some(url) = prev_url %}
+    <a href="{{ url }}">Prev</a>
+    {% else %}
+    <span class="disabled">Prev</span>
+    {% endif %}
+    {% for link in page_links %}
+    {% if let Some(url) = link.url %}
+    {% if link.current %}<span class="current">{{ link.label }}</span>{% else %}<a href="{{ url }}">{{ link.label }}</a>{% endif %}
+    {% else %}
+    <span class="gap">&#8230;</span>
+    {% endif %}
+    {% endfor %}
+    {% if let Some(url) = next_url %}
+    <a href="{{ url }}">Next</a>
+    {% else %}
+    <span class="disabled">Next</span>
+    {% endif %}
+  </div>
+  {% endif %}
 </section>
 {% endblock %}

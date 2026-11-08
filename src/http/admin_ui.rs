@@ -21,6 +21,7 @@ use crate::http::AppState;
 
 use crate::http::admin_ui_channels;
 use crate::http::admin_ui_keys;
+use crate::http::admin_ui_logs;
 
 // Vendored htmx 2.0.11, self-hosted so the UI works without network access.
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
@@ -28,16 +29,6 @@ const ADMIN_CSS: &[u8] = include_bytes!("../../assets/admin.css");
 
 const JS_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const CSS_CONTENT_TYPE: &str = "text/css; charset=utf-8";
-
-/// Crate version shown in the base layout footer.
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Template, WebTemplate)]
-#[template(path = "logs.html")]
-pub struct LogsPage {
-    pub version: &'static str,
-    pub section: &'static str,
-}
 
 /// Htmx-ready fragment for flash-style error banners, returned by failed
 /// form submissions in later tasks.
@@ -49,13 +40,6 @@ pub struct ErrorBanner {
 
 async fn index(_auth: AdminAuth) -> Redirect {
     Redirect::to("/admin/ui/channels")
-}
-
-async fn logs(_auth: AdminAuth) -> LogsPage {
-    LogsPage {
-        version: VERSION,
-        section: "logs",
-    }
 }
 
 fn asset(bytes: &'static [u8], content_type: &'static str) -> Response {
@@ -84,11 +68,11 @@ async fn admin_css(_auth: AdminAuth) -> Response {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(index))
-        .route("/logs", get(logs))
         .route("/static/htmx.min.js", get(htmx_js))
         .route("/static/admin.css", get(admin_css))
         .merge(admin_ui_channels::router())
         .merge(admin_ui_keys::router())
+        .merge(admin_ui_logs::router())
         .layer(axum::middleware::from_fn(crate::http::csrf::guard))
 }
 

@@ -21,7 +21,8 @@ use crate::http::admin_auth::AdminAuth;
 use crate::http::docs::AdminErrorBody;
 use crate::http::AppState;
 
-const DEFAULT_PAGE_SIZE: u64 = 50;
+/// Default rows per page, shared with the admin UI logs page.
+pub(crate) const DEFAULT_PAGE_SIZE: u64 = 50;
 const MAX_PAGE_SIZE: u64 = 500;
 
 /// Valid values of the status-class filter, phrased for error messages.
