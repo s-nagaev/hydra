@@ -8,6 +8,7 @@ mod admin_auth;
 mod admin_channels;
 mod admin_keys;
 mod admin_logs;
+mod docs;
 mod openai_error;
 mod proxy;
 mod proxy_auth;
@@ -19,6 +20,8 @@ use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 /// Maximum buffered chat request body; re-exported so the integration
 /// suite can drive the production limit without weakening it.
@@ -49,12 +52,26 @@ pub fn upstream_client() -> reqwest::Client {
         .expect("client construction only fails when the TLS backend fails to initialize")
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/health",
+    tag = "Admin",
+    operation_id = "health",
+    summary = "Liveness check",
+    description = "Public heartbeat, no authentication. Docker HEALTHCHECK \
+        and load balancers probe this route.",
+    responses(
+        (status = 200, description = "The service is up", body = Object, example = json!({ "status": "ok" }))
+    )
+)]
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
 /// Builds the full application router.
 pub fn router(state: AppState) -> Router {
+    let swagger =
+        SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", docs::ApiDoc::openapi());
     Router::new()
         .route("/admin/health", get(health))
         .route(
@@ -87,6 +104,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/models", get(proxy::models))
         .with_state(state)
+        .merge(swagger)
 }
 
 #[cfg(test)]

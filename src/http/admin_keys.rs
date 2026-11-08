@@ -15,10 +15,12 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::db::channels;
 use crate::db::keys::{self, ApiKey, DeleteOutcome, KeyPatch, NewKey, PatchOutcome};
 use crate::http::admin_auth::AdminAuth;
+use crate::http::docs::AdminErrorBody;
 use crate::http::AppState;
 use crate::keys as keygen;
 
@@ -52,23 +54,32 @@ impl IntoResponse for KeysError {
     }
 }
 
-#[derive(Deserialize)]
+/// Body for issuing a client key.
+#[derive(Deserialize, ToSchema)]
 pub struct CreateKeyRequest {
+    /// Channel this key forwards to; the key is bound at creation.
+    #[schema(example = 1)]
     pub channel_id: i64,
+    /// Free-form label for the key, shown in listings.
     #[serde(default)]
+    #[schema(example = "ci-bot")]
     pub name: Option<String>,
 }
 
-#[derive(Deserialize)]
+/// Body for editing a client key.
+#[derive(Deserialize, ToSchema)]
 pub struct PatchKeyRequest {
+    /// Enables or disables the key; a disabled key gets 403 from /v1 routes.
     #[serde(default)]
     pub enabled: Option<bool>,
+    /// `null` (JSON null) clears the label; the field being absent leaves
+    /// the label unchanged.
     #[serde(default, deserialize_with = "double_option")]
     pub name: Option<Option<String>>,
 }
 
 /// View without the key material; safe everywhere except creation.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct KeyView {
     pub id: i64,
     pub display_prefix: String,
@@ -94,9 +105,12 @@ impl From<ApiKey> for KeyView {
 }
 
 /// Creation response; the only place the full key is ever exposed.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct CreatedKeyView {
     pub id: i64,
+    /// The full plaintext key, shown exactly once, here. Store it now;
+    /// only its SHA-256 hash is kept server-side.
+    #[schema(example = "hyd-4f9dEg2xQ7aZpKm3Wv8cLbN1rTtY6hJ5sD0uRfIeAq")]
     pub key: String,
     pub display_prefix: String,
     pub channel_id: i64,
@@ -121,6 +135,55 @@ impl CreatedKeyView {
 
 const CREATION_ATTEMPTS: usize = 5;
 
+#[utoipa::path(
+    post,
+    path = "/admin/keys",
+    tag = "Admin",
+    operation_id = "create_key",
+    summary = "Issue a client key",
+    description = "Generates a `hyd-` prefixed key bound to the given \
+        channel and returns the plaintext exactly once, in this response. \
+        Only a SHA-256 hash is stored, so the key cannot be recovered later; \
+        losing it means issuing a new key.",
+    security(("basic_auth" = [])),
+    request_body(
+        content = CreateKeyRequest,
+        examples(
+            ("named" = (
+                summary = "Key with a label",
+                value = json!({ "channel_id": 1, "name": "ci-bot" })
+            )),
+            ("unnamed" = (
+                summary = "Key without a label",
+                value = json!({ "channel_id": 1 })
+            )),
+            ("invalid" = (
+                summary = "Rejected with 404: no such channel",
+                value = json!({ "channel_id": 999 })
+            ))
+        )
+    ),
+    responses(
+        (status = 201, description = "Key created; `key` holds the full \
+            plaintext and appears only here", body = CreatedKeyView, example = json!({
+            "id": 1,
+            "key": "hyd-4f9dEg2xQ7aZpKm3Wv8cLbN1rTtY6hJ5sD0uRfIeAq",
+            "display_prefix": "hyd-4f9dEg2x",
+            "channel_id": 1,
+            "name": "ci-bot",
+            "enabled": true,
+            "created_at": "2026-11-07 23:59:59"
+        })),
+        (status = 400, description = "The bound channel is disabled; enable \
+            the channel first", body = AdminErrorBody, example = json!({
+            "error": "channel is disabled"
+        })),
+        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 404, description = "No channel with this id", body = AdminErrorBody, example = json!({
+            "error": "channel not found"
+        }))
+    )
+)]
 pub async fn create(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -172,6 +235,40 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
         .is_some_and(|db_error| db_error.is_unique_violation())
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/keys",
+    tag = "Admin",
+    operation_id = "list_keys",
+    summary = "List client keys",
+    description = "Returns every key with its channel binding and state. \
+        Soft-deleted keys appear with a `deleted_at` timestamp; the full key
+        material is never in this response.",
+    security(("basic_auth" = [])),
+    responses(
+        (status = 200, description = "All keys, oldest first", body = Vec<KeyView>, example = json!([
+            {
+                "id": 1,
+                "display_prefix": "hyd-4f9dEg2x",
+                "name": "ci-bot",
+                "channel_id": 1,
+                "enabled": true,
+                "deleted_at": null,
+                "created_at": "2026-11-07 23:59:59"
+            },
+            {
+                "id": 2,
+                "display_prefix": "hyd-Km3Wv8cLb",
+                "name": null,
+                "channel_id": 1,
+                "enabled": false,
+                "deleted_at": "2026-11-06 10:00:00",
+                "created_at": "2026-11-05 09:00:00"
+            }
+        ])),
+        (status = 401, description = "Missing or wrong admin credentials")
+    )
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -180,6 +277,57 @@ pub async fn list(
     Ok(Json(key_list.into_iter().map(Into::into).collect()))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/admin/keys/{id}",
+    tag = "Admin",
+    operation_id = "patch_key",
+    summary = "Edit a client key",
+    description = "Enables or disables the key and changes its label. This \
+        never deletes: a disabled key can be re-enabled; deleting is DELETE,
+        and a deleted key cannot be edited.",
+    security(("basic_auth" = [])),
+    params(("id" = i64, Path, description = "Key id", example = 1)),
+    request_body(
+        content = PatchKeyRequest,
+        examples(
+            ("disable" = (
+                summary = "Disable the key",
+                value = json!({ "enabled": false })
+            )),
+            ("rename" = (
+                summary = "Relabel the key",
+                value = json!({ "name": "ci-bot" })
+            )),
+            ("clear_name" = (
+                summary = "Clear the label with an explicit null",
+                value = json!({ "name": null })
+            ))
+        )
+    ),
+    responses(
+        (status = 200, description = "The updated key", body = KeyView, example = json!({
+            "id": 1,
+            "display_prefix": "hyd-4f9dEg2x",
+            "name": "ci-bot",
+            "channel_id": 1,
+            "enabled": false,
+            "deleted_at": null,
+            "created_at": "2026-11-07 23:59:59"
+        })),
+        (status = 400, description = "Empty label string", body = AdminErrorBody, example = json!({
+            "error": "name must not be empty"
+        })),
+        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 404, description = "No key with this id", body = AdminErrorBody, example = json!({
+            "error": "key not found"
+        })),
+        (status = 409, description = "The key is soft-deleted and cannot be \
+            edited", body = AdminErrorBody, example = json!({
+            "error": "key is deleted and cannot be edited"
+        }))
+    )
+)]
 pub async fn patch(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -211,6 +359,29 @@ pub async fn patch(
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/admin/keys/{id}",
+    tag = "Admin",
+    operation_id = "delete_key",
+    summary = "Soft-delete a client key",
+    description = "Marks the key deleted: it immediately stops \
+        authenticating, but its row and request logs stay for auditing. \
+        This is not the same as disabling; a deleted key cannot be edited \
+        or re-enabled.",
+    security(("basic_auth" = [])),
+    params(("id" = i64, Path, description = "Key id", example = 1)),
+    responses(
+        (status = 204, description = "Key deleted, no body"),
+        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 404, description = "No key with this id", body = AdminErrorBody, example = json!({
+            "error": "key not found"
+        })),
+        (status = 409, description = "The key was already deleted", body = AdminErrorBody, example = json!({
+            "error": "key is already deleted"
+        }))
+    )
+)]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: AdminAuth,

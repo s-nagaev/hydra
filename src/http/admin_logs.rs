@@ -14,9 +14,11 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::db::request_logs::{self, LogFilters, RequestLog};
 use crate::http::admin_auth::AdminAuth;
+use crate::http::docs::AdminErrorBody;
 use crate::http::AppState;
 
 const DEFAULT_PAGE_SIZE: u64 = 50;
@@ -46,26 +48,40 @@ impl IntoResponse for LogsError {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 pub struct LogListQuery {
+    /// Result page, 1-based; values below 1 clamp to 1.
     #[serde(default)]
+    #[param(example = 1)]
     page: Option<u64>,
+    /// Rows per page; default 50, capped at 500.
     #[serde(default)]
+    #[param(example = 50)]
     page_size: Option<u64>,
+    /// Only rows produced by this key.
     #[serde(default)]
+    #[param(example = 1)]
     key_id: Option<i64>,
+    /// Only rows routed through this channel.
     #[serde(default)]
+    #[param(example = 1)]
     channel_id: Option<i64>,
+    /// Only rows that requested this model.
     #[serde(default)]
+    #[param(example = "gpt-4o")]
     model: Option<String>,
+    /// Inclusive lower bound, RFC3339; compared as UTC.
     #[serde(default)]
+    #[param(example = "2026-11-01T00:00:00Z")]
     from: Option<String>,
+    /// Inclusive upper bound, RFC3339; compared as UTC.
     #[serde(default)]
+    #[param(example = "2026-11-07T23:59:59Z")]
     to: Option<String>,
 }
 
 /// Listing view; the stored bodies are exposed only when they exist.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct RequestLogView {
     pub id: i64,
     pub api_key_id: i64,
@@ -102,7 +118,7 @@ impl From<RequestLog> for RequestLogView {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct LogListResponse {
     pub items: Vec<RequestLogView>,
     pub page: u64,
@@ -128,6 +144,46 @@ fn sqlite_timestamp(raw: &str, label: &str) -> Result<String, LogsError> {
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/logs",
+    tag = "Admin",
+    operation_id = "list_request_logs",
+    summary = "List request logs",
+    description = "Reads the stored request audit rows, newest first, with \
+        pagination and optional filters. `request_body` and `response_body` \
+        are present on a row only when body capture (HYDRA_LOG_BODIES) was \
+        on for that request; a row that never reached the upstream has a \
+        null `status` and its failure in `error`.",
+    security(("basic_auth" = [])),
+    params(LogListQuery),
+    responses(
+        (status = 200, description = "One page of log rows", body = LogListResponse, example = json!({
+            "items": [
+                {
+                    "id": 42,
+                    "api_key_id": 1,
+                    "channel_id": 1,
+                    "model": "gpt-4o",
+                    "status": 200,
+                    "prompt_tokens": 12,
+                    "completion_tokens": 34,
+                    "duration_ms": 845,
+                    "error": null,
+                    "created_at": "2026-11-07 23:59:59"
+                }
+            ],
+            "page": 1,
+            "page_size": 50,
+            "total": 128
+        })),
+        (status = 400, description = "A query parameter has a bad value, \
+            e.g. a non-RFC3339 time bound or a non-integer page", body = AdminErrorBody, example = json!({
+            "error": "from must be an RFC3339 timestamp"
+        })),
+        (status = 401, description = "Missing or wrong admin credentials")
+    )
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: AdminAuth,

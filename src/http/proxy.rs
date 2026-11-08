@@ -26,8 +26,10 @@ use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::db::channels::{self, Channel};
+use crate::http::docs::OpenAiError;
 use crate::http::openai_error::openai_error;
 use crate::http::proxy_auth::ProxyAuth;
 use crate::http::AppState;
@@ -157,6 +159,104 @@ where
 /// forward the original bytes with the upstream key, pass the response
 /// through byte-for-byte, and leave exactly one background log row behind
 /// whatever the outcome.
+#[utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    tag = "Proxy",
+    operation_id = "chat_completions",
+    summary = "Create a chat completion",
+    description = "Forwards an OpenAI Chat Completions request to the \
+        channel bound to the key, with the client Authorization dropped and \
+        the upstream key substituted. The body passes through byte-for-byte, \
+        so anything the upstream accepts works here; the two fields Hydra \
+        itself reads are `model` (whitelist check) and `stream` (streaming \
+        path). Upstream responses, errors included, come back with the \
+        upstream status and body unchanged. Every call leaves exactly one \
+        row in the request log.",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = Object,
+        description = "Any OpenAI Chat Completions request body. `model` is \
+            required; `stream: true` switches the response to \
+            text/event-stream. Bodies above 32 MiB are rejected with 413.",
+        examples(
+            ("plain" = (
+                summary = "Non-streaming request",
+                value = json!({
+                    "model": "gpt-4o",
+                    "messages": [{ "role": "user", "content": "Say hello" }]
+                })
+            )),
+            ("streaming" = (
+                summary = "Streaming request (SSE response)",
+                value = json!({
+                    "model": "gpt-4o",
+                    "messages": [{ "role": "user", "content": "Tell me a joke" }],
+                    "stream": true
+                })
+            )),
+            ("invalid" = (
+                summary = "Rejected with 400: no model parameter",
+                value = json!({
+                    "messages": [{ "role": "user", "content": "Hi" }]
+                })
+            ))
+        )
+    ),
+    responses(
+        (status = 200, description = "The upstream response passed through \
+            unchanged; with `stream: true` the content type is \
+            text/event-stream and chunks arrive as the upstream sends them", body = Object, example = json!({
+            "id": "chatcmpl-A1b2C3",
+            "object": "chat.completion",
+            "created": 1770000000,
+            "model": "gpt-4o",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": { "role": "assistant", "content": "Hello!" },
+                    "finish_reason": "stop"
+                }
+            ],
+            "usage": { "prompt_tokens": 12, "completion_tokens": 34, "total_tokens": 46 }
+        })),
+        (status = 400, description = "Body is not JSON or has no string \
+            `model` parameter", body = OpenAiError, example = json!({
+            "error": { "message": "you must provide a model parameter", "type": "invalid_request_error", "code": null }
+        })),
+        (status = 401, description = "Missing, malformed, unknown or deleted \
+            key", body = OpenAiError, example = json!({
+            "error": { "message": "Invalid API key provided", "type": "invalid_request_error", "code": "invalid_api_key" }
+        })),
+        (status = 403, description = "The key exists but is disabled", body = OpenAiError, example = json!({
+            "error": { "message": "This API key has been disabled", "type": "invalid_request_error", "code": "key_disabled" }
+        })),
+        (status = 404, description = "The requested model is not in the \
+            channel's whitelist", body = OpenAiError, example = json!({
+            "error": {
+                "message": "The model `gpt-4` does not exist or you do not have access to it.",
+                "type": "invalid_request_error",
+                "code": "model_not_found"
+            }
+        })),
+        (status = 413, description = "The request body exceeds 32 MiB", body = OpenAiError, example = json!({
+            "error": { "message": "Request body exceeds the maximum allowed size of 32 MiB", "type": "invalid_request_error", "code": null }
+        })),
+        (status = 502, description = "The bound channel is gone, or the \
+            upstream could not be reached; other upstream statuses pass \
+            through unchanged", body = OpenAiError, example = json!({
+            "error": { "message": "Failed to connect to the upstream provider", "type": "api_error", "code": null }
+        })),
+        (status = 503, description = "The channel bound to the key is \
+            disabled; the key itself stays valid", body = OpenAiError, example = json!({
+            "error": {
+                "message": "The channel bound to this API key is currently disabled",
+                "type": "api_error",
+                "code": "channel_disabled"
+            }
+        }))
+    )
+)]
 pub async fn chat_completions(
     State(state): State<AppState>,
     auth: ProxyAuth,
@@ -227,6 +327,49 @@ pub async fn chat_completions(
 /// `GET /v1/models`: a set whitelist is returned as a locally built OpenAI
 /// list; a NULL or empty whitelist proxies the upstream list with the same
 /// key substitution as chat.
+#[utoipa::path(
+    get,
+    path = "/v1/models",
+    tag = "Proxy",
+    operation_id = "list_models",
+    summary = "List models",
+    description = "Serves model discovery for the key's channel. A channel \
+        with a whitelist gets a locally built OpenAI list containing exactly \
+        the whitelisted ids; a channel without one proxies the upstream \
+        listing with the same key substitution as chat. This endpoint is \
+        not logged.",
+    security(("bearer_auth" = [])),
+    responses(
+        (status = 200, description = "OpenAI model list, either the \
+            whitelisted ids built locally or the upstream listing passed \
+            through", body = ModelList, example = json!({
+            "object": "list",
+            "data": [
+                { "id": "gpt-4o", "object": "model", "created": 0, "owned_by": "hydra" },
+                { "id": "gpt-4o-mini", "object": "model", "created": 0, "owned_by": "hydra" }
+            ]
+        })),
+        (status = 401, description = "Missing, malformed, unknown or deleted \
+            key", body = OpenAiError, example = json!({
+            "error": { "message": "Invalid API key provided", "type": "invalid_request_error", "code": "invalid_api_key" }
+        })),
+        (status = 403, description = "The key exists but is disabled", body = OpenAiError, example = json!({
+            "error": { "message": "This API key has been disabled", "type": "invalid_request_error", "code": "key_disabled" }
+        })),
+        (status = 502, description = "The upstream models listing could not \
+            be fetched, or the bound channel is gone", body = OpenAiError, example = json!({
+            "error": { "message": "Failed to connect to the upstream provider", "type": "api_error", "code": null }
+        })),
+        (status = 503, description = "The channel bound to the key is \
+            disabled", body = OpenAiError, example = json!({
+            "error": {
+                "message": "The channel bound to this API key is currently disabled",
+                "type": "api_error",
+                "code": "channel_disabled"
+            }
+        }))
+    )
+)]
 pub async fn models(
     State(state): State<AppState>,
     auth: ProxyAuth,
@@ -254,16 +397,16 @@ pub async fn models(
     }
 }
 
-#[derive(Serialize)]
-struct ModelEntry {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ModelEntry {
     id: String,
     object: &'static str,
     created: i64,
     owned_by: &'static str,
 }
 
-#[derive(Serialize)]
-struct ModelList {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ModelList {
     object: &'static str,
     data: Vec<ModelEntry>,
 }

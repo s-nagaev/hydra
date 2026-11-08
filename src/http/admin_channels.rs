@@ -16,9 +16,11 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 use url::Url;
+use utoipa::ToSchema;
 
 use crate::db::channels::{self, Channel, ChannelPatch, DeleteOutcome, NewChannel};
 use crate::http::admin_auth::AdminAuth;
+use crate::http::docs::AdminErrorBody;
 use crate::http::AppState;
 
 #[derive(Debug, thiserror::Error)]
@@ -51,23 +53,39 @@ impl IntoResponse for AdminError {
     }
 }
 
-#[derive(Deserialize)]
+/// Body for creating a channel.
+#[derive(Deserialize, ToSchema)]
 pub struct CreateChannelRequest {
+    /// Human-readable channel label, shown in listings and logs.
+    #[schema(example = "openai")]
     pub name: String,
+    /// Absolute http(s) URL of the upstream; the API path is appended.
+    #[schema(example = "https://api.openai.com")]
     pub base_url: String,
+    /// Upstream API key, stored server-side and never returned in full.
+    #[schema(example = "sk-upstream-secret-1234567890")]
     pub api_key: String,
+    /// Exact-match model whitelist. Omitted or null allows every model the
+    /// upstream serves; an empty array also means allow-all.
     #[serde(default)]
+    #[schema(example = json!(["gpt-4o", "gpt-4o-mini"]))]
     pub allowed_models: Option<Vec<String>>,
 }
 
-#[derive(Deserialize)]
+/// Body for editing a channel; only the sent fields change.
+#[derive(Deserialize, ToSchema)]
 pub struct PatchChannelRequest {
     #[serde(default)]
+    #[schema(example = "renamed")]
     pub name: Option<String>,
     #[serde(default)]
+    #[schema(example = "https://api.openai.com/v1")]
     pub base_url: Option<String>,
     #[serde(default)]
+    #[schema(example = "sk-new-upstream-secret-1234567890")]
     pub api_key: Option<String>,
+    /// `null` (JSON null) clears the whitelist back to allow-all; the field
+    /// being absent leaves it unchanged.
     #[serde(default, deserialize_with = "double_option")]
     pub allowed_models: Option<Option<Vec<String>>>,
     #[serde(default)]
@@ -75,7 +93,7 @@ pub struct PatchChannelRequest {
 }
 
 /// Public view of a channel; the upstream key is masked.
-#[derive(Serialize)]
+#[derive(Serialize, ToSchema)]
 pub struct ChannelView {
     pub id: i64,
     pub name: String,
@@ -160,6 +178,69 @@ fn validate_common(
     validate_allowed_models(allowed_models)
 }
 
+#[utoipa::path(
+    post,
+    path = "/admin/channels",
+    tag = "Admin",
+    operation_id = "create_channel",
+    summary = "Create a channel",
+    description = "Registers an upstream provider that client keys can be \
+        bound to. The upstream key is stored server-side; every response \
+        returns only a masked preview, never the full secret. New channels \
+        start enabled.",
+    security(("basic_auth" = [])),
+    request_body(
+        content = CreateChannelRequest,
+        description = "Channel definition. Omit `allowed_models` to allow \
+            every model the upstream serves.",
+        examples(
+            ("whitelist" = (
+                summary = "Channel restricted to two models",
+                value = json!({
+                    "name": "openai",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "sk-upstream-secret-1234567890",
+                    "allowed_models": ["gpt-4o", "gpt-4o-mini"]
+                })
+            )),
+            ("allow_all" = (
+                summary = "Channel serving every upstream model",
+                value = json!({
+                    "name": "openai",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "sk-upstream-secret-1234567890"
+                })
+            )),
+            ("invalid" = (
+                summary = "Rejected with 400: base_url is not a URL",
+                value = json!({
+                    "name": "broken",
+                    "base_url": "not a url",
+                    "api_key": "sk-upstream-secret-1234567890"
+                })
+            ))
+        )
+    ),
+    responses(
+        (status = 201, description = "Channel created", body = ChannelView, example = json!({
+            "id": 1,
+            "name": "openai",
+            "base_url": "https://api.openai.com",
+            "api_key_masked": "sk-u...7890",
+            "has_api_key": true,
+            "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+            "enabled": true,
+            "created_at": "2026-11-07 23:59:59"
+        })),
+        (status = 400, description = "Invalid input: empty name or api_key, \
+            a non-absolute or non-http base_url, or an empty string inside \
+            allowed_models", body = AdminErrorBody, example = json!({
+            "error": "invalid base_url: not a url"
+        })),
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body")
+    )
+)]
 pub async fn create(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -186,6 +267,31 @@ pub async fn create(
     Ok((StatusCode::CREATED, Json(channel.into())))
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/channels",
+    tag = "Admin",
+    operation_id = "list_channels",
+    summary = "List channels",
+    description = "Returns every channel, including disabled ones, with the
+        upstream key masked in each row.",
+    security(("basic_auth" = [])),
+    responses(
+        (status = 200, description = "All channels, oldest first", body = Vec<ChannelView>, example = json!([
+            {
+                "id": 1,
+                "name": "openai",
+                "base_url": "https://api.openai.com",
+                "api_key_masked": "sk-u...7890",
+                "has_api_key": true,
+                "allowed_models": null,
+                "enabled": true,
+                "created_at": "2026-11-07 23:59:59"
+            }
+        ])),
+        (status = 401, description = "Missing or wrong admin credentials")
+    )
+)]
 pub async fn list(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -194,6 +300,32 @@ pub async fn list(
     Ok(Json(channel_list.into_iter().map(Into::into).collect()))
 }
 
+#[utoipa::path(
+    get,
+    path = "/admin/channels/{id}",
+    tag = "Admin",
+    operation_id = "get_channel",
+    summary = "Fetch one channel",
+    description = "Returns the channel by id, with the upstream key masked.",
+    security(("basic_auth" = [])),
+    params(("id" = i64, Path, description = "Channel id", example = 1)),
+    responses(
+        (status = 200, description = "The channel", body = ChannelView, example = json!({
+            "id": 1,
+            "name": "openai",
+            "base_url": "https://api.openai.com",
+            "api_key_masked": "sk-u...7890",
+            "has_api_key": true,
+            "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+            "enabled": true,
+            "created_at": "2026-11-07 23:59:59"
+        })),
+        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 404, description = "No channel with this id", body = AdminErrorBody, example = json!({
+            "error": "channel not found"
+        }))
+    )
+)]
 pub async fn get_one(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -205,6 +337,61 @@ pub async fn get_one(
     Ok(Json(channel.into()))
 }
 
+#[utoipa::path(
+    patch,
+    path = "/admin/channels/{id}",
+    tag = "Admin",
+    operation_id = "patch_channel",
+    summary = "Edit a channel",
+    description = "Updates only the fields present in the body. Sending JSON
+        null as `allowed_models` clears the whitelist back to allow-all;
+        an empty array does the same. This is also how a channel is enabled
+        or disabled.",
+    security(("basic_auth" = [])),
+    params(("id" = i64, Path, description = "Channel id", example = 1)),
+    request_body(
+        content = PatchChannelRequest,
+        description = "Fields to change; everything absent stays as it is.",
+        examples(
+            ("rename_and_restrict" = (
+                summary = "Rename and set a whitelist",
+                value = json!({
+                    "name": "renamed",
+                    "allowed_models": ["gpt-4o"],
+                    "enabled": false
+                })
+            )),
+            ("clear_whitelist" = (
+                summary = "Clear the whitelist with an explicit null",
+                value = json!({ "allowed_models": null })
+            )),
+            ("invalid" = (
+                summary = "Rejected with 400: ftp scheme",
+                value = json!({ "base_url": "ftp://api.example.com" })
+            ))
+        )
+    ),
+    responses(
+        (status = 200, description = "The updated channel", body = ChannelView, example = json!({
+            "id": 1,
+            "name": "renamed",
+            "base_url": "https://api.openai.com",
+            "api_key_masked": "sk-u...7890",
+            "has_api_key": true,
+            "allowed_models": ["gpt-4o"],
+            "enabled": false,
+            "created_at": "2026-11-07 23:59:59"
+        })),
+        (status = 400, description = "Invalid field value, same rules as on \
+            create", body = AdminErrorBody, example = json!({
+            "error": "base_url must be an absolute http(s) URL: ftp://api.example.com"
+        })),
+        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 404, description = "No channel with this id", body = AdminErrorBody, example = json!({
+            "error": "channel not found"
+        }))
+    )
+)]
 pub async fn patch(
     State(state): State<AppState>,
     _auth: AdminAuth,
@@ -248,6 +435,27 @@ pub async fn patch(
     Ok(Json(channel.into()))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/admin/channels/{id}",
+    tag = "Admin",
+    operation_id = "delete_channel",
+    summary = "Delete a channel",
+    description = "Removes the channel. A channel that still has client keys
+        bound to it refuses deletion with 409; disable it instead.",
+    security(("basic_auth" = [])),
+    params(("id" = i64, Path, description = "Channel id", example = 1)),
+    responses(
+        (status = 204, description = "Channel deleted, no body"),
+        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 404, description = "No channel with this id", body = AdminErrorBody, example = json!({
+            "error": "channel not found"
+        })),
+        (status = 409, description = "The channel still has bound keys", body = AdminErrorBody, example = json!({
+            "error": "channel has bound API keys; disable it instead"
+        }))
+    )
+)]
 pub async fn delete(
     State(state): State<AppState>,
     _auth: AdminAuth,
