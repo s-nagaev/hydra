@@ -143,6 +143,17 @@ Two invariants worth knowing: disabling a key and deleting it are different
 operations (PATCH sets `enabled`, DELETE sets `deleted_at`), and a channel
 with bound keys refuses deletion with 409; disable it instead.
 
+## Swagger UI
+
+The binary serves an embedded Swagger UI at
+[http://127.0.0.1:8080/swagger-ui](http://127.0.0.1:8080/swagger-ui); the
+raw OpenAPI document is at `/api-docs/openapi.json`. The page itself is
+public; authenticated calls still need credentials. Click Authorize and
+enter either the admin login and password (`basic_auth`, for the `/admin/*`
+routes) or a `hyd-` client key (`bearer_auth`, for the `/v1/*` routes), then
+"Try it out" works directly against the running instance. `GET /admin/health`
+needs no auth, neither in the UI nor from a client.
+
 ## Configuration
 
 Configuration comes from environment variables. At startup the binary also
