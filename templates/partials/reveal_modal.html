@@ -1,0 +1,50 @@
+{% if let Some(modal) = reveal %}
+<div class="modal-backdrop" id="reveal-backdrop">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="reveal-heading">
+    <h2 id="reveal-heading">Client key created</h2>
+    <p class="modal-warning">This is the only time the full key is shown. Only a hash of
+      it is stored, so it cannot be displayed again later. Store it now; if it is lost,
+      issue a new key.</p>
+    <div class="key-value" id="reveal-key">{{ modal.full_key }}</div>
+    <div class="modal-actions">
+      <button type="button" class="copy-key">Copy key</button>
+    </div>
+    <p class="snippet-label">Ready to use against this Hydra instance (channel: {{ modal.channel_name }}):</p>
+    <pre class="code-snippet" id="reveal-curl"></pre>
+    <label class="stored-label">
+      <input type="checkbox" id="reveal-stored">
+      I have stored the key somewhere safe
+    </label>
+    <div class="modal-actions">
+      <button type="button" class="primary" id="reveal-close" disabled>Close</button>
+    </div>
+  </div>
+</div>
+<script>
+  (function () {
+    var key = document.getElementById('reveal-key').textContent;
+    document.getElementById('reveal-curl').textContent =
+      'curl ' + window.location.origin + '/v1/chat/completions \\\n' +
+      '  -H "Authorization: Bearer ' + key + '" \\\n' +
+      '  -H "Content-Type: application/json" \\\n' +
+      '  -d \'{"model": "gpt-4o", "messages": [{"role": "user", "content": "Hello"}]}\'';
+    var copyButton = document.querySelector('.copy-key');
+    copyButton.addEventListener('click', function () {
+      navigator.clipboard.writeText(key).then(function () {
+        copyButton.textContent = 'Copied';
+        copyButton.classList.add('copied');
+      }, function () {
+        copyButton.textContent = 'Copy failed';
+      });
+    });
+    var stored = document.getElementById('reveal-stored');
+    var close = document.getElementById('reveal-close');
+    stored.addEventListener('change', function () {
+      close.disabled = !stored.checked;
+    });
+    close.addEventListener('click', function () {
+      document.getElementById('reveal-backdrop').remove();
+    });
+  })();
+</script>
+{% endif %}

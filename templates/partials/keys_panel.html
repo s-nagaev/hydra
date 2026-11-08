@@ -1,0 +1,89 @@
+<section class="panel" id="keys-panel">
+  <div class="panel-head">
+    <h1>Client keys</h1>
+    <button type="button" class="primary"
+      hx-get="/admin/ui/keys/form"
+      hx-target="#keys-panel"
+      hx-swap="outerHTML">New key</button>
+  </div>
+  {% if let Some(error) = error %}
+  <div class="error-banner" role="alert">{{ error }}</div>
+  {% endif %}
+  {% if let Some(form) = form %}
+  <form class="stack key-form"
+    hx-post="/admin/ui/keys"
+    hx-target="#keys-panel"
+    hx-swap="outerHTML">
+    <div>
+      <label for="key-channel">Channel</label>
+      <select id="key-channel" name="channel_id" required>
+        {% for option in form.channel_options %}
+        <option value="{{ option.id }}"{% if option.selected %} selected{% endif %}>{{ option.name }}</option>
+        {% endfor %}
+      </select>
+      <div class="field-hint">The key forwards requests to this channel. Only enabled channels can receive new keys.</div>
+    </div>
+    <div>
+      <label for="key-name">Name (optional)</label>
+      <input type="text" id="key-name" name="name" value="{{ form.name }}">
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="primary">Issue key</button>
+      <button type="button"
+        hx-get="/admin/ui/keys"
+        hx-target="#keys-panel"
+        hx-swap="outerHTML">Cancel</button>
+    </div>
+  </form>
+  {% endif %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Prefix</th>
+        <th>Name</th>
+        <th>Channel</th>
+        <th>State</th>
+        <th>Created</th>
+        <th class="actions-col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if rows.is_empty() %}
+      <tr>
+        <td colspan="6" class="empty-state">No keys yet. Issue one to start routing requests.</td>
+      </tr>
+      {% else %}
+      {% for row in rows %}
+      <tr>
+        <td class="mono">{{ row.display_prefix }}</td>
+        <td>{% if let Some(name) = row.name %}{{ name }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+        <td>{{ row.channel_name }}</td>
+        <td>
+          {% if row.deleted %}<span class="badge deleted">deleted</span>
+          {% else %}{% if row.enabled %}<span class="badge ok">enabled</span>
+          {% else %}<span class="badge off">disabled</span>{% endif %}{% endif %}
+        </td>
+        <td>{{ row.created_at }}</td>
+        <td class="actions-col">
+          {% if row.deleted %}
+          <span class="text-muted">-</span>
+          {% else %}
+          <form class="inline" hx-post="/admin/ui/keys/{{ row.id }}/toggle"
+            hx-target="#keys-panel" hx-swap="outerHTML">
+            <input type="hidden" name="enabled" value="{% if row.enabled %}false{% else %}true{% endif %}">
+            <button type="submit">{% if row.enabled %}Disable{% else %}Enable{% endif %}</button>
+          </form>
+          <form class="inline" hx-post="/admin/ui/keys/{{ row.id }}/delete"
+            hx-target="#keys-panel" hx-swap="outerHTML"
+            hx-confirm="Delete this key? Request logs referencing it are preserved.">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+    </tbody>
+  </table>
+  {% include "partials/reveal_modal.html" %}
+</section>

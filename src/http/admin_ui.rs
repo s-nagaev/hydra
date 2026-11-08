@@ -20,6 +20,7 @@ use crate::http::admin_auth::AdminAuth;
 use crate::http::AppState;
 
 use crate::http::admin_ui_channels;
+use crate::http::admin_ui_keys;
 
 // Vendored htmx 2.0.11, self-hosted so the UI works without network access.
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
@@ -30,13 +31,6 @@ const CSS_CONTENT_TYPE: &str = "text/css; charset=utf-8";
 
 /// Crate version shown in the base layout footer.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Template, WebTemplate)]
-#[template(path = "keys.html")]
-pub struct KeysPage {
-    pub version: &'static str,
-    pub section: &'static str,
-}
 
 #[derive(Template, WebTemplate)]
 #[template(path = "logs.html")]
@@ -55,13 +49,6 @@ pub struct ErrorBanner {
 
 async fn index(_auth: AdminAuth) -> Redirect {
     Redirect::to("/admin/ui/channels")
-}
-
-async fn keys(_auth: AdminAuth) -> KeysPage {
-    KeysPage {
-        version: VERSION,
-        section: "keys",
-    }
 }
 
 async fn logs(_auth: AdminAuth) -> LogsPage {
@@ -97,11 +84,11 @@ async fn admin_css(_auth: AdminAuth) -> Response {
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(index))
-        .route("/keys", get(keys))
         .route("/logs", get(logs))
         .route("/static/htmx.min.js", get(htmx_js))
         .route("/static/admin.css", get(admin_css))
         .merge(admin_ui_channels::router())
+        .merge(admin_ui_keys::router())
         .layer(axum::middleware::from_fn(crate::http::csrf::guard))
 }
 

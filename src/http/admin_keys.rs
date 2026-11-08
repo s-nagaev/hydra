@@ -135,6 +135,48 @@ impl CreatedKeyView {
 
 const CREATION_ATTEMPTS: usize = 5;
 
+/// Shared key-issuance path for the JSON API and the admin UI form:
+/// resolves and validates the channel, then generates and stores the key,
+/// retrying on the astronomically unlikely hash collision. The returned
+/// plaintext must be shown exactly once by the caller.
+pub(crate) async fn issue_key(
+    state: &AppState,
+    channel_id: i64,
+    name: Option<String>,
+) -> Result<(ApiKey, crate::keys::GeneratedKey), KeysError> {
+    let channel = channels::find(&state.db, channel_id)
+        .await?
+        .ok_or_else(|| KeysError::NotFound("channel not found".to_string()))?;
+    if !channel.enabled {
+        return Err(KeysError::BadRequest("channel is disabled".to_string()));
+    }
+
+    // A key_hash UNIQUE collision means two OS-RNG draws agreed; regenerate
+    // rather than fail the admin request.
+    let mut last_error: Option<sqlx::Error> = None;
+    for _ in 0..CREATION_ATTEMPTS {
+        let generated = keygen::generate();
+        let result = keys::create(
+            &state.db,
+            &NewKey {
+                key_hash: generated.key_hash.clone(),
+                display_prefix: generated.display_prefix.clone(),
+                name: name.clone(),
+                channel_id,
+            },
+        )
+        .await;
+        match result {
+            Ok(stored) => return Ok((stored, generated)),
+            Err(e) if is_unique_violation(&e) => last_error = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(KeysError::Database(
+        last_error.expect("at least one attempt"),
+    ))
+}
+
 #[utoipa::path(
     post,
     path = "/admin/keys",
@@ -192,41 +234,10 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<CreatedKeyView>), KeysError> {
     let Json(request) =
         payload.map_err(|rejection| KeysError::BadRequest(rejection.body_text()))?;
-    let channel = channels::find(&state.db, request.channel_id)
-        .await?
-        .ok_or_else(|| KeysError::NotFound("channel not found".to_string()))?;
-    if !channel.enabled {
-        return Err(KeysError::BadRequest("channel is disabled".to_string()));
-    }
-
-    // A key_hash UNIQUE collision means two OS-RNG draws agreed; regenerate
-    // rather than fail the admin request.
-    let mut last_error: Option<sqlx::Error> = None;
-    for _ in 0..CREATION_ATTEMPTS {
-        let generated = keygen::generate();
-        let result = keys::create(
-            &state.db,
-            &NewKey {
-                key_hash: generated.key_hash,
-                display_prefix: generated.display_prefix,
-                name: request.name.clone(),
-                channel_id: request.channel_id,
-            },
-        )
-        .await;
-        match result {
-            Ok(stored) => {
-                return Ok((
-                    StatusCode::CREATED,
-                    Json(CreatedKeyView::new(stored, generated.full)),
-                ))
-            }
-            Err(e) if is_unique_violation(&e) => last_error = Some(e),
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(KeysError::Database(
-        last_error.expect("at least one attempt"),
+    let (stored, generated) = issue_key(&state, request.channel_id, request.name).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CreatedKeyView::new(stored, generated.full)),
     ))
 }
 

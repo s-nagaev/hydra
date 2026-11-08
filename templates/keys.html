@@ -3,25 +3,5 @@
 {% block title %}Keys{% endblock %}
 
 {% block content %}
-<section class="panel">
-  <div class="panel-head">
-    <h1>Keys</h1>
-  </div>
-  <table class="data-table">
-    <thead>
-      <tr>
-        <th>Prefix</th>
-        <th>Name</th>
-        <th>Channel</th>
-        <th>State</th>
-        <th class="actions-col">Actions</th>
-      </tr>
-    </thead>
-    <tbody>
-      <tr>
-        <td colspan="5" class="empty-state">No keys yet. Issue one to start routing requests.</td>
-      </tr>
-    </tbody>
-  </table>
-</section>
+{% include "partials/keys_panel.html" %}
 {% endblock %}
