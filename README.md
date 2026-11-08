@@ -254,6 +254,37 @@ PostgreSQL server:
 HYDRA_DATABASE_URL=postgres://postgres:secret@db.internal:5432/hydra cargo run
 ```
 
+For a self-contained end-to-end check against real PostgreSQL, `scripts/mock_upstream.py`
+plays the upstream OpenAI API (stdlib only, any POST to `/v1/chat/completions` gets a
+fixed completion back):
+
+```bash
+docker build -t hydra:local .
+docker network create hydra-demo
+docker run -d --name hydra-demo-pg --network hydra-demo \
+  -e POSTGRES_DB=hydra -e POSTGRES_PASSWORD=hydra postgres:16-alpine
+docker run -d --name hydra-demo-mock --network hydra-demo \
+  -v "$(pwd)/scripts/mock_upstream.py:/srv/mock.py:ro" -w /srv \
+  python:3-alpine python mock.py 8000
+docker run -d --name hydra-demo --network hydra-demo -p 18080:8080 \
+  -e HYDRA_DATABASE_URL=postgres://postgres:hydra@hydra-demo-pg:5432/hydra \
+  -e HYDRA_ADMIN_LOGIN=admin -e HYDRA_ADMIN_PASSWORD=change-me hydra:local
+
+curl -sS -u admin:change-me -X POST http://127.0.0.1:18080/admin/channels \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"mock","base_url":"http://hydra-demo-mock:8000","api_key":"sk-upstream-secret","allowed_models":["demo-model"]}'
+KEY=$(curl -sS -u admin:change-me -X POST http://127.0.0.1:18080/admin/keys \
+  -H 'Content-Type: application/json' \
+  -d '{"channel_id":1,"name":"demo-bot"}' | python3 -c 'import json,sys;print(json.load(sys.stdin)["key"])')
+curl -sS http://127.0.0.1:18080/v1/chat/completions \
+  -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
+  -d '{"model":"demo-model","messages":[{"role":"user","content":"Say hello"}]}'
+docker exec hydra-demo-pg psql -U postgres -d hydra \
+  -c "SELECT id, channel_id, model, status FROM request_logs;"
+
+docker rm -f hydra-demo hydra-demo-mock hydra-demo-pg && docker network rm hydra-demo
+```
+
 The PostgreSQL integration tests are gated behind `HYDRA_TEST_PG_URL` and
 skipped (they print a note and pass) when the variable is unset, so plain
 `cargo test` never needs a database server. To run them against a real
