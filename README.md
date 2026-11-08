@@ -236,8 +236,6 @@ None of this is implemented yet; it is where Hydra is meant to grow.
 - Google request and response formats
 - Multi-channel keys: one key bound to several channels with failover
 - Quotas and budgets per key
-- `GET /admin/logs`, an admin endpoint for querying the stored request logs
-  (today the rows live in SQLite only)
 - Admin UI
 
 License: TBD.
