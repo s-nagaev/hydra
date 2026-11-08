@@ -307,7 +307,7 @@ button.danger:hover {
   margin: 10px 0;
 }
 
-.modal .code-snippet {
+.code-snippet {
   font-family: var(--mono);
   font-size: 12.5px;
   background: var(--bg);
@@ -544,4 +544,44 @@ form.inline {
 
 .logs-table td.error-cell {
   white-space: normal;
+}
+
+/* Log detail drill-down */
+
+.logs-table tbody tr {
+  position: relative;
+}
+
+/* The time cell anchor stretches over the whole row, so the row itself
+   is the link to the detail page. */
+.logs-table .row-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.logs-table .row-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+.detail-meta {
+  margin-top: 4px;
+}
+
+.detail-meta th {
+  width: 150px;
+  border-bottom: 1px solid var(--border);
+  font-weight: 500;
+  white-space: nowrap;
+  vertical-align: top;
+}
+
+.detail-meta td {
+  white-space: normal;
+  word-break: break-word;
+}
+
+.detail-error {
+  color: var(--danger);
 }

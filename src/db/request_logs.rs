@@ -13,8 +13,13 @@ use super::{Arg, Db, Fields, Row, Sql};
 /// the request never reached the upstream; `created_at` is stamped in the
 /// canonical UTC text format at insert time.
 pub struct NewRequestLog {
-    pub api_key_id: i64,
-    pub channel_id: i64,
+    /// The key that made the request. NULL for rows about requests whose
+    /// key never resolved: an unknown key 401 or a key lookup failure has
+    /// no key row to reference.
+    pub api_key_id: Option<i64>,
+    /// The channel the request routed through. NULL exactly when
+    /// `api_key_id` is NULL: both come from the same key resolution.
+    pub channel_id: Option<i64>,
     pub model: Option<String>,
     pub status: Option<i64>,
     pub prompt_tokens: Option<i64>,
@@ -23,16 +28,17 @@ pub struct NewRequestLog {
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,
+    pub client_ip: Option<String>,
 }
 
 /// Inserts one log row. The caller runs this on a detached task; failures
 /// are reported through tracing, never to the proxied client.
 pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
     let mut sql = Sql::for_db(db);
-    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, duration_ms, request_body, response_body, error, created_at) VALUES (")
-        .bind(Arg::Int(log.api_key_id))
+    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, duration_ms, request_body, response_body, error, client_ip, created_at) VALUES (")
+        .bind(Arg::OptInt(log.api_key_id))
         .push(", ")
-        .bind(Arg::Int(log.channel_id))
+        .bind(Arg::OptInt(log.channel_id))
         .push(", ")
         .bind(Arg::Text(log.model.clone()))
         .push(", ")
@@ -50,6 +56,8 @@ pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
         .push(", ")
         .bind(Arg::Text(log.error.clone()))
         .push(", ")
+        .bind(Arg::Text(log.client_ip.clone()))
+        .push(", ")
         .bind(Arg::Text(Some(timestamp::now_utc())))
         .push(")");
     db.execute(sql).await?;
@@ -60,8 +68,11 @@ pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
 #[derive(Debug)]
 pub struct RequestLog {
     pub id: i64,
-    pub api_key_id: i64,
-    pub channel_id: i64,
+    /// NULL when the request was rejected before its key resolved (unknown
+    /// key 401, lookup failure); otherwise the key row id.
+    pub api_key_id: Option<i64>,
+    /// NULL exactly when `api_key_id` is NULL.
+    pub channel_id: Option<i64>,
     pub model: Option<String>,
     pub status: Option<i64>,
     pub prompt_tokens: Option<i64>,
@@ -70,6 +81,7 @@ pub struct RequestLog {
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,
+    pub client_ip: Option<String>,
     pub created_at: String,
 }
 
@@ -161,8 +173,8 @@ fn push_conditions(sql: &mut Sql, filters: &LogFilters) {
 fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
     Ok(RequestLog {
         id: row.int("id")?,
-        api_key_id: row.int("api_key_id")?,
-        channel_id: row.int("channel_id")?,
+        api_key_id: row.opt_int("api_key_id")?,
+        channel_id: row.opt_int("channel_id")?,
         model: row.opt_text("model")?,
         status: row.opt_int("status")?,
         prompt_tokens: row.opt_int("prompt_tokens")?,
@@ -171,8 +183,28 @@ fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
         request_body: row.opt_text("request_body")?,
         response_body: row.opt_text("response_body")?,
         error: row.opt_text("error")?,
+        client_ip: row.opt_text("client_ip")?,
         created_at: row.text("created_at")?,
     })
+}
+
+/// Column list shared by the listing and the per-row lookup so both stay in
+/// sync with `map_row`.
+const SELECT_COLUMNS: &str = "id, api_key_id, channel_id, model, status, prompt_tokens, \
+     completion_tokens, duration_ms, request_body, response_body, error, \
+     client_ip, created_at";
+
+/// Fetches one log row by id; `None` when no row carries this id. Backs the
+/// admin detail endpoint, which needs the stored bodies alongside the
+/// metadata the listing shows.
+pub async fn find(db: &Db, id: i64) -> sqlx::Result<Option<RequestLog>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM request_logs WHERE id = ")
+        .bind(Arg::Int(id));
+    let row = db.fetch_optional(sql).await?;
+    row.as_ref().map(map_row).transpose()
 }
 
 /// One count query plus one page query, both sharing the same dynamically
@@ -184,11 +216,9 @@ pub async fn list(db: &Db, filters: &LogFilters) -> sqlx::Result<(Vec<RequestLog
     let total = db.scalar(count).await?;
 
     let mut page = Sql::for_db(db);
-    page.push(
-        "SELECT id, api_key_id, channel_id, model, status, prompt_tokens, \
-         completion_tokens, duration_ms, request_body, response_body, error, created_at \
-         FROM request_logs WHERE ",
-    );
+    page.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM request_logs WHERE ");
     push_conditions(&mut page, filters);
     page.push(" ORDER BY id DESC LIMIT ")
         .bind(Arg::Int(filters.page_size as i64))

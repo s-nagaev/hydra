@@ -28,14 +28,21 @@ async fn main() -> Result<(), Box<dyn Error>> {
         log_bodies: cfg.log_bodies,
         log_tracker: LogTracker::default(),
         cache: hydra::cache::ResolutionCache::default(),
+        trusted_proxies: cfg.trusted_proxies,
+        flood: hydra::flood::FloodCap::new(cfg.flood_limit, cfg.flood_window_secs),
     };
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
 
     tracing::info!(addr = %cfg.bind_addr, "hydra listening");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // ConnectInfo makes the peer address available to handlers, which is
+    // what client-IP logging and trusted-proxy XFF resolution read from.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     // In-flight requests have finished; give their detached log inserts a
     // brief window to land before the process exits. Whatever misses the

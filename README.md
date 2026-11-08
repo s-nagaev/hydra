@@ -30,6 +30,15 @@ user, no failover or quotas.
   apply automatically at startup for both backends
 - In-memory resolution cache: a fresh hit serves a proxy call without touching
   the database; admin changes invalidate instantly (`HYDRA_CACHE_TTL_SECS`)
+- Flood cap on anonymous 401 spam: after `HYDRA_FLOOD_LIMIT` failed
+  authentications per client IP per window, bad-key requests are answered
+  401 without any database access (`HYDRA_FLOOD_WINDOW_SECS`)
+- Client IP attribution per request: the direct peer address, or the first
+  untrusted `X-Forwarded-For` hop when Hydra runs behind a reverse proxy
+  declared in `HYDRA_TRUSTED_PROXIES` (Caddy, Nginx, ...)
+- Request log drill-down: `GET /admin/logs/{id}` and a detail page in the
+  admin UI with status, token usage, duration, client IP, error text and
+  the captured bodies
 
 ## Quickstart
 
@@ -146,6 +155,8 @@ which is public liveness. Admin errors use a plain `{"error": "..."}` body.
 | GET | `/admin/keys` | list keys, deleted state included |
 | PATCH | `/admin/keys/{id}` | enable or disable, rename |
 | DELETE | `/admin/keys/{id}` | soft delete; the key stops authenticating but its row and logs stay |
+| GET | `/admin/logs` | list request logs, paginated, filterable by key, channel, model, status class and time window |
+| GET | `/admin/logs/{id}` | fetch one log; includes the client IP and the stored bodies when capture was on |
 | GET | `/admin/health` | liveness, no auth |
 
 Two invariants worth knowing: disabling a key and deleting it are different
@@ -196,7 +207,11 @@ status class (2xx/4xx/5xx/errors) and time period (presets or a custom
 range); the whole view state lives in the URL, so any filtered view can be
 reloaded, shared or revisited with the browser back button. Rows show
 colored status badges and a small "bodies" marker when request or response
-bodies were captured; body content itself is never rendered.
+bodies were captured; body content itself is never rendered. Each row
+links to a drill-down page (`/admin/ui/logs/{id}`) with the full record:
+status, token usage, duration, client IP, error text and the captured
+request and response bodies, plus a back link that restores the exact
+filters and page of the list view.
 
 ![Keys page](docs/screenshots/keys.png)
 
@@ -220,6 +235,9 @@ normally get their configuration through `docker run -e` or compose instead.
 | `HYDRA_ADMIN_PASSWORD` | required | admin password, compared in constant time |
 | `HYDRA_LOG_BODIES` | `false` | store request and response bodies in logs, 1 MB cap per side |
 | `HYDRA_CACHE_TTL_SECS` | `3600` | lifetime of the key→channel resolution cache, in seconds; `0` disables the cache |
+| `HYDRA_TRUSTED_PROXIES` | unset | comma-separated IPv4/IPv6 CIDR networks of reverse proxies in front of Hydra; a request from one of them has its client IP taken from `X-Forwarded-For`. Invalid entries abort startup |
+| `HYDRA_FLOOD_LIMIT` | `60` | failed key authentications per client IP per window before the flood cap; `0` disables the cap |
+| `HYDRA_FLOOD_WINDOW_SECS` | `60` | length of the flood-cap window in seconds; must be at least 1 |
 
 Missing or empty required variables abort startup with an error naming the
 variable.
@@ -263,6 +281,79 @@ What the cache guarantees:
   Security flips done through the admin API are never delayed by the TTL,
   including against requests that were already in flight when the flip
   happened.
+
+## Client IP
+
+Every request log row stores the client IP the request was attributed to.
+By default this is the direct peer address of the connection. When Hydra
+runs behind a reverse proxy (Caddy, Nginx, ...), every row would otherwise
+carry the proxy's address; set `HYDRA_TRUSTED_PROXIES` to the
+comma-separated CIDR networks your proxies live in (a bare IP counts as a
+single host), for example `HYDRA_TRUSTED_PROXIES=127.0.0.1/32,10.0.0.0/8`.
+For a request whose direct peer falls inside a trusted network, the client
+IP is then taken from the `X-Forwarded-For` header: the first entry of the
+list that is not part of the trusted set. When clients reach Hydra
+directly, leave the variable unset: a client-sent `X-Forwarded-For` header
+is then ignored entirely, and the direct peer address is recorded. Invalid
+entries abort startup. The flood cap counts failures against the same
+resolved address, so clients behind one proxy are capped individually.
+
+## Flood cap
+
+Failed key authentications are the one proxy path that can never be cached:
+an unknown key costs one or two `SELECT`s per request, every time. To bound
+the cost of anonymous 401 spam, Hydra counts failed authentications
+(missing, malformed or unknown key) per client IP in a fixed window of
+`HYDRA_FLOOD_WINDOW_SECS` seconds (default 60). Once an IP has accumulated
+`HYDRA_FLOOD_LIMIT` failures (default 60) inside the current window,
+further requests from that IP are answered with the same 401 an unknown key
+gets, but the key lookup never runs: no cache probe, no database query.
+Admission is a single atomic step, so even a parallel burst of requests
+cannot slip past the gate against a stale counter: at most
+`HYDRA_FLOOD_LIMIT` requests per window are being processed outside the
+gate at any time.
+
+Details that are fixed by design:
+
+- The capped response is byte-identical to the unknown-key 401, so the cap
+  never becomes an oracle distinguishing a bad key from a flood-capped
+  address.
+- Once an IP is capped, every request from that IP is rejected for the rest
+  of the window, requests carrying a valid API key included: legitimate
+  traffic behind the same NAT or proxy address is locked out too, and the
+  body still says "Invalid API key provided" even though the key itself is
+  fine.
+- Only failed authentications end up counted. A request being processed
+  holds one budget slot until its authentication settles: an invalid key
+  keeps the slot as a recorded failure, while successes, disabled keys
+  (403) and storage failures release it. In-flight reservations count
+  toward the limit (that is what bounds a parallel burst), so with a small
+  limit a burst of legitimate concurrent requests from one IP can
+  transiently be capped; with the default limit of 60 this only affects
+  clients holding more than 60 simultaneous requests.
+- The capped phase writes at most one `request_logs` row per window per IP
+  (status 401, error text "flood cap: ...", request body captured only when
+  `HYDRA_LOG_BODIES` is on). The first `HYDRA_FLOOD_LIMIT` failures are
+  logged normally, one row each.
+- The failure counter and the log-row budget reset only when the window
+  expires. Capped requests change no state: they neither extend the window
+  nor reset the count.
+- Counting uses the same client IP resolution as the request log (direct
+  peer, or the first untrusted `X-Forwarded-For` hop behind a configured
+  trusted proxy, see `HYDRA_TRUSTED_PROXIES`), so clients behind one proxy
+  are capped individually, not as one shared address.
+- The state is in-memory per process and bounded (at most 65 536 tracked
+  IPs; expired entries are evicted, and a map kept full by an IP-rotating
+  flood evicts an arbitrary live entry). It resets on restart, and `0` for
+  `HYDRA_FLOOD_LIMIT` disables the cap entirely.
+
+One ordering caveat: the chat body is buffered (up to the 32 MiB body
+limit) before a missing or bad key is answered, so an unauthenticated
+request always pays the body buffering, and a request whose body exceeds
+32 MiB is rejected with 413 even when its key is also invalid. This is the
+same behavior as for ordinary unknown-key rejections; the flood cap runs
+before the key lookup but after the body extractor.
+
 
 ## PostgreSQL
 

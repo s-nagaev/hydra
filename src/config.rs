@@ -44,6 +44,95 @@ impl fmt::Debug for DbTarget {
     }
 }
 
+/// Trusted reverse-proxy networks, parsed from `HYDRA_TRUSTED_PROXIES`
+/// (comma-separated IPv4/IPv6 CIDRs; a bare address means a single host).
+/// An empty list (the default) means no peer is ever treated as a proxy:
+/// every request is attributed to its direct peer address, so a spoofed
+/// `X-Forwarded-For` header cannot influence the logged IP.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TrustedProxies {
+    networks: Vec<(std::net::IpAddr, u8)>,
+}
+
+impl TrustedProxies {
+    /// Parses the comma-separated CIDR list. Fails naming the first
+    /// malformed entry so a typo aborts startup instead of silently
+    /// disabling proxy trust.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let mut networks = Vec::new();
+        for entry in raw.split(',') {
+            let entry = entry.trim();
+            if entry.is_empty() {
+                continue;
+            }
+            let (addr_text, prefix) = match entry.split_once('/') {
+                Some((addr, prefix)) => (addr, Some(prefix)),
+                None => (entry, None),
+            };
+            let addr: std::net::IpAddr = addr_text
+                .parse()
+                .map_err(|_| format!("invalid IP address in CIDR entry: {addr_text}"))?;
+            let max_prefix = match addr {
+                std::net::IpAddr::V4(_) => 32,
+                std::net::IpAddr::V6(_) => 128,
+            };
+            let prefix = match prefix {
+                Some(prefix) => prefix
+                    .trim()
+                    .parse::<u8>()
+                    .ok()
+                    .filter(|value| *value <= max_prefix)
+                    .ok_or_else(|| format!("invalid prefix length in CIDR entry: {entry}"))?,
+                None => max_prefix,
+            };
+            networks.push((addr, prefix));
+        }
+        Ok(Self { networks })
+    }
+
+    /// Whether `ip` falls inside any trusted network.
+    pub fn contains(&self, ip: std::net::IpAddr) -> bool {
+        self.networks
+            .iter()
+            .any(|(network_addr, prefix)| match (network_addr, ip) {
+                (std::net::IpAddr::V4(net), std::net::IpAddr::V4(ip)) => {
+                    mask_v4(net, *prefix) == mask_v4(&ip, *prefix)
+                }
+                (std::net::IpAddr::V6(net), std::net::IpAddr::V6(ip)) => {
+                    mask_v6(net, *prefix) == mask_v6(&ip, *prefix)
+                }
+                _ => false,
+            })
+    }
+
+    /// Whether no proxy is trusted at all (the default configuration).
+    pub fn is_empty(&self) -> bool {
+        self.networks.is_empty()
+    }
+}
+
+/// Zeroes the host bits of an IPv4 address, keeping only the `prefix`
+/// network bits.
+fn mask_v4(addr: &std::net::Ipv4Addr, prefix: u8) -> u32 {
+    let bits = u32::from(*addr);
+    if prefix == 0 {
+        0
+    } else {
+        bits & (u32::MAX << (32 - prefix as u32))
+    }
+}
+
+/// Zeroes the host bits of an IPv6 address, keeping only the `prefix`
+/// network bits.
+fn mask_v6(addr: &std::net::Ipv6Addr, prefix: u8) -> u128 {
+    let bits = u128::from(*addr);
+    if prefix == 0 {
+        0
+    } else {
+        bits & (u128::MAX << (128 - prefix as u32))
+    }
+}
+
 /// Runtime configuration parsed from environment variables.
 #[derive(Clone)]
 pub struct Config {
@@ -59,6 +148,16 @@ pub struct Config {
     /// Lifetime of a key→channel cache entry, in seconds; 0 disables the
     /// cache. Semantics live in [`crate::cache`].
     pub cache_ttl_secs: u64,
+    /// Reverse-proxy networks trusted for `X-Forwarded-For` resolution.
+    /// Empty by default: every client is then attributed to its direct
+    /// peer address.
+    pub trusted_proxies: TrustedProxies,
+    /// Failed authentications per client IP per window before the flood
+    /// cap kicks in; `0` disables the cap. Semantics live in
+    /// [`crate::flood`].
+    pub flood_limit: u64,
+    /// Length of the flood-cap window, in seconds; must be at least 1.
+    pub flood_window_secs: u64,
 }
 
 impl fmt::Debug for Config {
@@ -72,6 +171,9 @@ impl fmt::Debug for Config {
             .field("admin_password", &"<redacted>")
             .field("log_bodies", &self.log_bodies)
             .field("cache_ttl_secs", &self.cache_ttl_secs)
+            .field("trusted_proxies", &self.trusted_proxies)
+            .field("flood_limit", &self.flood_limit)
+            .field("flood_window_secs", &self.flood_window_secs)
             .finish()
     }
 }
@@ -112,6 +214,31 @@ impl Config {
                 .map_err(|e| ConfigError::Invalid("HYDRA_CACHE_TTL_SECS", e.to_string()))?,
             Err(_) => crate::cache::DEFAULT_TTL_SECS,
         };
+        let trusted_proxies = match env::var("HYDRA_TRUSTED_PROXIES") {
+            Ok(raw) => TrustedProxies::parse(&raw)
+                .map_err(|reason| ConfigError::Invalid("HYDRA_TRUSTED_PROXIES", reason))?,
+            Err(_) => TrustedProxies::default(),
+        };
+        let flood_limit = match env::var("HYDRA_FLOOD_LIMIT") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| ConfigError::Invalid("HYDRA_FLOOD_LIMIT", e.to_string()))?,
+            Err(_) => crate::flood::DEFAULT_LIMIT,
+        };
+        let flood_window_secs = match env::var("HYDRA_FLOOD_WINDOW_SECS") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| ConfigError::Invalid("HYDRA_FLOOD_WINDOW_SECS", e.to_string()))?,
+            Err(_) => crate::flood::DEFAULT_WINDOW_SECS,
+        };
+        if flood_window_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "HYDRA_FLOOD_WINDOW_SECS",
+                "window must be at least 1 second".to_string(),
+            ));
+        }
 
         Ok(Self {
             bind_addr,
@@ -120,6 +247,9 @@ impl Config {
             admin_password,
             log_bodies,
             cache_ttl_secs,
+            trusted_proxies,
+            flood_limit,
+            flood_window_secs,
         })
     }
 }
@@ -188,6 +318,8 @@ mod tests {
         env::remove_var("HYDRA_DATABASE_URL");
         env::remove_var("HYDRA_LOG_BODIES");
         env::remove_var("HYDRA_CACHE_TTL_SECS");
+        env::remove_var("HYDRA_FLOOD_LIMIT");
+        env::remove_var("HYDRA_FLOOD_WINDOW_SECS");
         env::set_var("HYDRA_ADMIN_LOGIN", "admin");
         env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
         let cfg = Config::from_env().unwrap();
@@ -198,6 +330,12 @@ mod tests {
         assert_eq!(cfg.db, DbTarget::Sqlite("./hydra.db".to_string()));
         assert!(!cfg.log_bodies);
         assert_eq!(cfg.cache_ttl_secs, 3600);
+        assert!(
+            cfg.trusted_proxies.is_empty(),
+            "no trusted proxies by default"
+        );
+        assert_eq!(cfg.flood_limit, 60);
+        assert_eq!(cfg.flood_window_secs, 60);
     }
 
     #[test]
@@ -240,6 +378,71 @@ mod tests {
         let err = Config::from_env().unwrap_err();
         assert!(err.to_string().contains("HYDRA_BIND_ADDR"));
         env::remove_var("HYDRA_BIND_ADDR");
+    }
+
+    #[test]
+    fn trusted_proxies_default_to_empty_and_parse_from_the_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("HYDRA_BIND_ADDR");
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+        env::remove_var("HYDRA_DATABASE_URL");
+        env::remove_var("HYDRA_TRUSTED_PROXIES");
+        let cfg = Config::from_env().unwrap();
+        assert!(cfg.trusted_proxies.is_empty());
+
+        env::set_var(
+            "HYDRA_TRUSTED_PROXIES",
+            "127.0.0.1/32, 10.0.0.0/8, fe80::/10",
+        );
+        let cfg = Config::from_env().unwrap();
+        assert!(cfg.trusted_proxies.contains("127.0.0.1".parse().unwrap()));
+        assert!(cfg.trusted_proxies.contains("10.1.2.3".parse().unwrap()));
+        assert!(cfg.trusted_proxies.contains("fe80::1".parse().unwrap()));
+        assert!(!cfg.trusted_proxies.contains("11.0.0.1".parse().unwrap()));
+        env::remove_var("HYDRA_TRUSTED_PROXIES");
+    }
+
+    #[test]
+    fn invalid_trusted_proxies_abort_naming_the_variable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+        env::remove_var("HYDRA_DATABASE_URL");
+
+        for bad in [
+            "not-a-cidr",
+            "10.0.0.0/40",
+            "2001:db8::/200",
+            "10.0.0.0/oops",
+        ] {
+            env::set_var("HYDRA_TRUSTED_PROXIES", bad);
+            let err = Config::from_env().unwrap_err();
+            assert!(
+                err.to_string().contains("HYDRA_TRUSTED_PROXIES"),
+                "entry {bad} must abort with the variable named"
+            );
+        }
+        env::remove_var("HYDRA_TRUSTED_PROXIES");
+    }
+
+    #[test]
+    fn trusted_proxies_match_v4_and_v6_networks_exactly() {
+        let proxies = TrustedProxies::parse("10.0.0.0/8, 2001:db8::/32").unwrap();
+        assert!(proxies.contains("10.255.255.255".parse().unwrap()));
+        assert!(!proxies.contains("11.0.0.0".parse().unwrap()));
+        assert!(proxies.contains("2001:db8:dead::1".parse().unwrap()));
+        assert!(!proxies.contains("2001:db9::1".parse().unwrap()));
+
+        // A bare address means a single host.
+        let single = TrustedProxies::parse("127.0.0.1").unwrap();
+        assert!(single.contains("127.0.0.1".parse().unwrap()));
+        assert!(!single.contains("127.0.0.2".parse().unwrap()));
+
+        // An empty list trusts nobody.
+        let empty = TrustedProxies::parse("").unwrap();
+        assert!(empty.is_empty());
+        assert!(!empty.contains("127.0.0.1".parse().unwrap()));
     }
 
     #[test]
@@ -338,11 +541,61 @@ mod tests {
             admin_password: "sekret".to_string(),
             log_bodies: false,
             cache_ttl_secs: 3600,
+            trusted_proxies: TrustedProxies::default(),
+            flood_limit: 60,
+            flood_window_secs: 60,
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("sekret"));
         assert!(!shown.contains("user@"));
         assert!(!shown.contains("postgres://user"));
         assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn flood_settings_default_and_parse_from_the_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("HYDRA_BIND_ADDR");
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+        env::remove_var("HYDRA_DATABASE_URL");
+
+        env::set_var("HYDRA_FLOOD_LIMIT", "120");
+        env::set_var("HYDRA_FLOOD_WINDOW_SECS", "30");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.flood_limit, 120);
+        assert_eq!(cfg.flood_window_secs, 30);
+
+        // Zero limit disables the cap and must be accepted.
+        env::set_var("HYDRA_FLOOD_LIMIT", "0");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.flood_limit, 0);
+
+        env::remove_var("HYDRA_FLOOD_LIMIT");
+        env::remove_var("HYDRA_FLOOD_WINDOW_SECS");
+    }
+
+    #[test]
+    fn invalid_flood_settings_abort_naming_the_variable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("HYDRA_BIND_ADDR");
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+        env::remove_var("HYDRA_DATABASE_URL");
+
+        for (var, value) in [
+            ("HYDRA_FLOOD_LIMIT", "soon"),
+            ("HYDRA_FLOOD_LIMIT", "-1"),
+            ("HYDRA_FLOOD_WINDOW_SECS", "0"),
+            ("HYDRA_FLOOD_WINDOW_SECS", "half a minute"),
+        ] {
+            env::set_var(var, value);
+            let err = Config::from_env().unwrap_err();
+            assert!(
+                err.to_string().contains(var),
+                "{var}={value} must abort with the variable named"
+            );
+            env::remove_var(var);
+        }
     }
 }
