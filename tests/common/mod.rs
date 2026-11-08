@@ -44,6 +44,9 @@ pub async fn within<T>(future: impl Future<Output = T>) -> T {
 
 /// A migrated in-memory SQLite pool. Single connection so every query sees
 /// the same `:memory:` database.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub async fn test_pool() -> SqlitePool {
     let pool = within(
         SqlitePoolOptions::new()
@@ -57,6 +60,9 @@ pub async fn test_pool() -> SqlitePool {
 }
 
 /// Application state wired like production, with the test pool.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub fn test_app(db: SqlitePool) -> AppState {
     AppState {
         db: hydra::db::Db::from(db),
