@@ -21,11 +21,13 @@ user, no failover or quotas.
   plaintext appears exactly once, in the creation response
 - Each key is bound to one channel; channels can restrict requests to an
   exact-match model whitelist (no wildcards, `null` or empty means allow all)
-- Background request logging into SQLite: status, token usage, duration,
-  errors; bodies are opt-in via `HYDRA_LOG_BODIES` and capped at 1 MB per side
+- Background request logging into the configured database (SQLite or
+  PostgreSQL): status, token usage, duration, errors; bodies are opt-in via
+  `HYDRA_LOG_BODIES` and capped at 1 MB per side
 - Single admin over HTTP Basic Auth on `/admin/*`; upstream keys are masked in
   every response
-- SQLite in WAL mode; migrations apply automatically at startup
+- SQLite in WAL mode by default, PostgreSQL via `HYDRA_DATABASE_URL`; migrations
+  apply automatically at startup for both backends
 
 ## Quickstart
 
@@ -205,13 +207,62 @@ normally get their configuration through `docker run -e` or compose instead.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `HYDRA_BIND_ADDR` | `127.0.0.1:8080` | HTTP listener address |
-| `HYDRA_DB_PATH` | `./hydra.db` | SQLite file path, created on first run |
+| `HYDRA_DATABASE_URL` | unset | Database target, see below |
+| `HYDRA_DB_PATH` | `./hydra.db` | SQLite file path, created on first run; used only when `HYDRA_DATABASE_URL` is absent |
 | `HYDRA_ADMIN_LOGIN` | required | admin user for `/admin/*` Basic Auth |
 | `HYDRA_ADMIN_PASSWORD` | required | admin password, compared in constant time |
 | `HYDRA_LOG_BODIES` | `false` | store request and response bodies in logs, 1 MB cap per side |
 
 Missing or empty required variables abort startup with an error naming the
 variable.
+
+`HYDRA_DATABASE_URL` picks the backend by scheme: `sqlite:<path>` selects
+SQLite (equivalent to setting `HYDRA_DB_PATH=<path>`), and
+`postgres://user:password@host:5432/dbname` selects PostgreSQL. When the
+variable is unset, the legacy `HYDRA_DB_PATH` (or its default) keeps SQLite as
+the backend, so existing deployments keep working unchanged. Any other scheme
+aborts startup. Because the PostgreSQL URL carries credentials, Hydra never
+logs it: it is masked as `postgres://<redacted>` everywhere a human might see
+it, and an unsupported scheme fails without echoing the value.
+
+## PostgreSQL
+
+SQLite suits a single instance with modest traffic and is the default; choose
+PostgreSQL when several Hydra instances must share one database, when you want
+server-side backups and monitoring already in place for a Postgres server, or
+when the write volume outgrows a single file. The schema is identical in
+shape, the tables and indexes match one-to-one, and migrations for the chosen
+backend apply automatically at startup — nothing to run by hand.
+
+With Docker Compose, a profile-gated stack brings up PostgreSQL plus a second
+Hydra instance wired to it, while the default `docker compose up -d` stays
+SQLite-only:
+
+```bash
+docker compose --profile postgres up -d
+# postgres:   internal service, port not published
+# hydra:      SQLite instance on host port 8080 (unchanged)
+# hydra-pg:   PostgreSQL instance on host port 8081
+```
+
+The compose PostgreSQL service uses a named volume and a `pg_isready`
+healthcheck; the `hydra-pg` instance waits for it to be healthy before
+starting. Without Docker, point `HYDRA_DATABASE_URL` at any reachable
+PostgreSQL server:
+
+```bash
+HYDRA_DATABASE_URL=postgres://postgres:secret@db.internal:5432/hydra cargo run
+```
+
+The PostgreSQL integration tests are gated behind `HYDRA_TEST_PG_URL` and
+skipped (they print a note and pass) when the variable is unset, so plain
+`cargo test` never needs a database server. To run them against a real
+PostgreSQL, e.g. in Docker:
+
+```bash
+docker run -d --name hydra-pg-test -e POSTGRES_PASSWORD=hydra -p 54329:5432 postgres:16-alpine
+HYDRA_TEST_PG_URL=postgres://postgres:hydra@127.0.0.1:54329/postgres cargo test --test postgres
+```
 
 ## Error semantics
 
@@ -253,7 +304,9 @@ The image listens on `0.0.0.0:8080`, stores the database at `/data/hydra.db`
 (put a volume there), runs as a non-root user and ships a `HEALTHCHECK` on
 `/admin/health`. With compose, copy `.env.example` to `.env`, set the admin
 credentials and run `docker compose up -d`; the compose file overrides the
-bind address and DB path for the container.
+bind address and DB path for the container. The default compose run is
+SQLite-only; see the PostgreSQL section above for the `--profile postgres`
+variant.
 
 ## Development
 
@@ -263,8 +316,14 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+The three gates above need no database server: the PostgreSQL integration
+tests skip themselves unless `HYDRA_TEST_PG_URL` is set (see the PostgreSQL
+section for the exact command).
+
 CI (`.github/workflows/ci.yml`) runs these three gates on Rust stable plus a
-Docker image build; it never pushes. `AGENTS.md` at the repo root documents the
+Docker image build; it never pushes. A fourth job runs the PostgreSQL
+integration suite against a Postgres service container, so the gated path is
+exercised on every push. `AGENTS.md` at the repo root documents the
 conventions that govern changes to this code, including commit format.
 
 The admin UI embeds `assets/htmx.min.js` (vendored htmx 2.0.11) and
