@@ -103,6 +103,7 @@ pub fn router(state: AppState) -> Router {
             patch(admin_keys::patch).delete(admin_keys::delete),
         )
         .route("/admin/logs", get(admin_logs::list))
+        .route("/admin/logs/{id}", get(admin_logs::get_one))
         .nest("/admin/ui", admin_ui::router())
         .route(
             "/v1/chat/completions",

@@ -1,13 +1,15 @@
 //! Admin listing of request logs.
 //!
 //! Read-only view over `request_logs` with pagination and optional filters
-//! (key, channel, model, inclusive UTC time window). Bodies are passed
-//! through exactly as stored: `request_body`/`response_body` appear in the
-//! response only when capture was on for that request. Errors are plain
-//! JSON, matching the other admin routes.
+//! (key, channel, model, inclusive UTC time window), plus the per-row
+//! detail endpoint `GET /admin/logs/{id}` that exposes the stored bodies
+//! and client IP of a single request. Bodies are passed through exactly as
+//! stored: `request_body`/`response_body` appear in the listing only when
+//! capture was on for that request, and arrive as explicit nulls on the
+//! detail endpoint. Errors are plain JSON, matching the other admin routes.
 
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -32,6 +34,8 @@ pub(crate) const STATUS_CLASS_VALUES: &str = "`2xx`, `4xx`, `5xx`, `errors`";
 pub enum LogsError {
     #[error("{0}")]
     BadRequest(String),
+    #[error("request log not found")]
+    NotFound,
     #[error(transparent)]
     Database(#[from] sqlx::Error),
 }
@@ -40,6 +44,7 @@ impl IntoResponse for LogsError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
             LogsError::BadRequest(message) => (StatusCode::BAD_REQUEST, message),
+            LogsError::NotFound => (StatusCode::NOT_FOUND, "request log not found".to_string()),
             LogsError::Database(e) => {
                 tracing::error!(error = %e, "admin log query failed");
                 (
@@ -200,6 +205,96 @@ fn sqlite_timestamp(raw: &str, label: &str) -> Result<String, LogsError> {
     Ok(crate::db::timestamp::format_utc(
         parsed.to_offset(UtcOffset::UTC),
     ))
+}
+
+/// Detail view of one log row. Unlike the listing, the body fields are
+/// always present in the JSON: a null means the bodies were not captured
+/// for that request, which the drill-down UI renders as a placeholder.
+#[derive(Serialize, ToSchema)]
+pub struct RequestLogDetailView {
+    pub id: i64,
+    pub api_key_id: i64,
+    pub channel_id: i64,
+    pub model: Option<String>,
+    pub status: Option<i64>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub duration_ms: i64,
+    pub error: Option<String>,
+    pub created_at: String,
+    /// Resolved client IP; null when no peer address was available for the
+    /// request or the row predates IP capture.
+    pub client_ip: Option<String>,
+    /// Stored request body; null when body capture was off.
+    pub request_body: Option<String>,
+    /// Stored response body; null when body capture was off.
+    pub response_body: Option<String>,
+}
+
+impl From<RequestLog> for RequestLogDetailView {
+    fn from(log: RequestLog) -> Self {
+        Self {
+            id: log.id,
+            api_key_id: log.api_key_id,
+            channel_id: log.channel_id,
+            model: log.model,
+            status: log.status,
+            prompt_tokens: log.prompt_tokens,
+            completion_tokens: log.completion_tokens,
+            duration_ms: log.duration_ms,
+            error: log.error,
+            created_at: log.created_at,
+            client_ip: log.client_ip,
+            request_body: log.request_body,
+            response_body: log.response_body,
+        }
+    }
+}
+
+#[utoipa::path(
+    get,
+    path = "/admin/logs/{id}",
+    tag = "Admin",
+    operation_id = "get_request_log",
+    summary = "Fetch one request log",
+    description = "Returns the full log row by id: the listing metadata plus \
+        the stored `request_body` and `response_body` (null when body \
+        capture, HYDRA_LOG_BODIES, was off for that request), the resolved \
+        `client_ip`, and the transport or upstream `error` if any.",
+    security(("basic_auth" = [])),
+    params(("id" = i64, Path, description = "Request log row id", example = 42)),
+    responses(
+        (status = 200, description = "The full log row", body = RequestLogDetailView, example = json!({
+            "id": 42,
+            "api_key_id": 1,
+            "channel_id": 1,
+            "model": "gpt-4o",
+            "status": 200,
+            "prompt_tokens": 12,
+            "completion_tokens": 34,
+            "duration_ms": 845,
+            "error": null,
+            "created_at": "2026-11-07 23:59:59",
+            "client_ip": "203.0.113.7",
+            "request_body": "{\"model\":\"gpt-4o\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}",
+            "response_body": "{\"id\":\"chatcmpl-1\",\"choices\":[]}"
+        })),
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body"),
+        (status = 404, description = "No log row with this id", body = AdminErrorBody, example = json!({
+            "error": "request log not found"
+        }))
+    )
+)]
+pub async fn get_one(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<i64>,
+) -> Result<Json<RequestLogDetailView>, LogsError> {
+    let log = request_logs::find(&state.db, id)
+        .await?
+        .ok_or(LogsError::NotFound)?;
+    Ok(Json(log.into()))
 }
 
 #[utoipa::path(

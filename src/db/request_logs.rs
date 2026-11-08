@@ -180,6 +180,25 @@ fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
     })
 }
 
+/// Column list shared by the listing and the per-row lookup so both stay in
+/// sync with `map_row`.
+const SELECT_COLUMNS: &str = "id, api_key_id, channel_id, model, status, prompt_tokens, \
+     completion_tokens, duration_ms, request_body, response_body, error, \
+     client_ip, created_at";
+
+/// Fetches one log row by id; `None` when no row carries this id. Backs the
+/// admin detail endpoint, which needs the stored bodies alongside the
+/// metadata the listing shows.
+pub async fn find(db: &Db, id: i64) -> sqlx::Result<Option<RequestLog>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM request_logs WHERE id = ")
+        .bind(Arg::Int(id));
+    let row = db.fetch_optional(sql).await?;
+    row.as_ref().map(map_row).transpose()
+}
+
 /// One count query plus one page query, both sharing the same dynamically
 /// built WHERE clause. Rows are ordered by id DESC (newest first).
 pub async fn list(db: &Db, filters: &LogFilters) -> sqlx::Result<(Vec<RequestLog>, i64)> {
@@ -189,12 +208,9 @@ pub async fn list(db: &Db, filters: &LogFilters) -> sqlx::Result<(Vec<RequestLog
     let total = db.scalar(count).await?;
 
     let mut page = Sql::for_db(db);
-    page.push(
-        "SELECT id, api_key_id, channel_id, model, status, prompt_tokens, \
-         completion_tokens, duration_ms, request_body, response_body, error, \
-         client_ip, created_at \
-         FROM request_logs WHERE ",
-    );
+    page.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM request_logs WHERE ");
     push_conditions(&mut page, filters);
     page.push(" ORDER BY id DESC LIMIT ")
         .bind(Arg::Int(filters.page_size as i64))

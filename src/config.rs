@@ -44,7 +44,6 @@ impl fmt::Debug for DbTarget {
     }
 }
 
-/// Runtime configuration parsed from environment variables.
 /// Trusted reverse-proxy networks, parsed from `HYDRA_TRUSTED_PROXIES`
 /// (comma-separated IPv4/IPv6 CIDRs; a bare address means a single host).
 /// An empty list (the default) means no peer is ever treated as a proxy:
@@ -134,6 +133,7 @@ fn mask_v6(addr: &std::net::Ipv6Addr, prefix: u8) -> u128 {
     }
 }
 
+/// Runtime configuration parsed from environment variables.
 #[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,

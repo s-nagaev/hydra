@@ -566,3 +566,122 @@ async fn invalid_status_class_returns_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].as_str().unwrap().contains("status_class"));
 }
+
+#[tokio::test]
+async fn log_detail_returns_the_full_row_including_bodies_and_client_ip() {
+    let db = test_pool().await;
+    let (channel_id, key_id) = seed_channel_and_key(&db).await;
+    let id: i64 = within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
+              duration_ms, request_body, response_body, error, client_ip, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key_id)
+        .bind(channel_id)
+        .bind("gpt-4o")
+        .bind(200)
+        .bind(12)
+        .bind(34)
+        .bind(845)
+        .bind(r#"{"model":"gpt-4o","messages":[]}"#)
+        .bind(r#"{"id":"chatcmpl-1"}"#)
+        .bind(Option::<String>::None)
+        .bind("203.0.113.7")
+        .bind("2026-11-07 23:59:59")
+        .execute(&db),
+    )
+    .await
+    .unwrap()
+    .last_insert_rowid();
+
+    let (status, body) = send_get_on(&db, &format!("/admin/logs/{id}"), Some(&auth_header())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], id);
+    assert_eq!(body["api_key_id"], key_id);
+    assert_eq!(body["channel_id"], channel_id);
+    assert_eq!(body["model"], "gpt-4o");
+    assert_eq!(body["status"], 200);
+    assert_eq!(body["prompt_tokens"], 12);
+    assert_eq!(body["completion_tokens"], 34);
+    assert_eq!(body["duration_ms"], 845);
+    assert_eq!(body["error"], Value::Null);
+    assert_eq!(body["created_at"], "2026-11-07 23:59:59");
+    assert_eq!(body["client_ip"], "203.0.113.7");
+    assert_eq!(
+        body["request_body"],
+        json!(r#"{"model":"gpt-4o","messages":[]}"#)
+    );
+    assert_eq!(body["response_body"], json!(r#"{"id":"chatcmpl-1"}"#));
+}
+
+#[tokio::test]
+async fn log_detail_bodies_are_explicit_null_when_not_captured() {
+    let db = test_pool().await;
+    let (channel_id, key_id) = seed_channel_and_key(&db).await;
+    let id: i64 = within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
+              duration_ms, request_body, response_body, error, client_ip, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key_id)
+        .bind(channel_id)
+        .bind(Option::<String>::None)
+        .bind(200)
+        .bind(1)
+        .bind(1)
+        .bind(5)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind(Option::<String>::None)
+        .bind("2026-11-07 10:00:00")
+        .execute(&db),
+    )
+    .await
+    .unwrap()
+    .last_insert_rowid();
+
+    let (status, body) = send_get_on(&db, &format!("/admin/logs/{id}"), Some(&auth_header())).await;
+    assert_eq!(status, StatusCode::OK);
+    // Unlike the listing, the detail view keeps the body keys present so a
+    // consumer can tell "not captured" apart from "missing field".
+    assert!(body.get("request_body").is_some());
+    assert_eq!(body["request_body"], Value::Null);
+    assert!(body.get("response_body").is_some());
+    assert_eq!(body["response_body"], Value::Null);
+    assert_eq!(body["client_ip"], Value::Null);
+    assert_eq!(body["error"], Value::Null);
+}
+
+#[tokio::test]
+async fn unknown_log_id_returns_404() {
+    let db = test_pool().await;
+    let (status, body) = send_get_on(&db, "/admin/logs/999999", Some(&auth_header())).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["error"], "request log not found");
+}
+
+#[tokio::test]
+async fn log_detail_without_credentials_returns_401_with_challenge() {
+    let db = test_pool().await;
+    let app = test_app(db.clone());
+    let response = within(
+        hydra::http::router(app).oneshot(
+            Request::builder()
+                .uri("/admin/logs/1")
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        response.headers()["WWW-Authenticate"],
+        r#"Basic realm="hydra""#
+    );
+}

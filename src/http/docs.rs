@@ -99,6 +99,7 @@ impl Modify for SecurityAddon {
         super::admin_keys::patch,
         super::admin_keys::delete,
         super::admin_logs::list,
+        super::admin_logs::get_one,
         super::proxy::chat_completions,
         super::proxy::models
     ),
@@ -116,6 +117,7 @@ impl Modify for SecurityAddon {
             super::admin_keys::CreatedKeyView,
             super::admin_logs::RequestLogView,
             super::admin_logs::LogListResponse,
+            super::admin_logs::RequestLogDetailView,
             super::proxy::ModelList,
             super::proxy::ModelEntry
         )
@@ -219,6 +221,7 @@ mod tests {
             "/admin/keys",
             "/admin/keys/{id}",
             "/admin/logs",
+            "/admin/logs/{id}",
             "/v1/chat/completions",
             "/v1/models",
         ] {

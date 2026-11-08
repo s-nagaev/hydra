@@ -309,6 +309,7 @@ struct LogsData {
 fn error_message(error: LogsError) -> String {
     match error {
         LogsError::BadRequest(message) => message,
+        LogsError::NotFound => "request log not found".to_string(),
         LogsError::Database(e) => internal_error(&e),
     }
 }
