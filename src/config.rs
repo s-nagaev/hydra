@@ -203,6 +203,7 @@ mod tests {
     #[test]
     fn invalid_cache_ttl_is_rejected_with_reason() {
         let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("HYDRA_BIND_ADDR");
         env::set_var("HYDRA_ADMIN_LOGIN", "admin");
         env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
         env::remove_var("HYDRA_DATABASE_URL");
@@ -218,6 +219,7 @@ mod tests {
     #[test]
     fn zero_cache_ttl_is_accepted_and_disables_the_cache() {
         let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("HYDRA_BIND_ADDR");
         env::set_var("HYDRA_ADMIN_LOGIN", "admin");
         env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
         env::remove_var("HYDRA_DATABASE_URL");
@@ -237,6 +239,7 @@ mod tests {
         env::remove_var("HYDRA_LOG_BODIES");
         let err = Config::from_env().unwrap_err();
         assert!(err.to_string().contains("HYDRA_BIND_ADDR"));
+        env::remove_var("HYDRA_BIND_ADDR");
     }
 
     #[test]
