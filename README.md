@@ -161,10 +161,24 @@ A server-rendered admin UI lives at `/admin/ui`: open
 authenticate with the same Basic Auth credentials as the JSON API. Pages are
 compiled from askama templates with vendored htmx 2.0.11 (self-hosted, no
 CDN, no JavaScript build step) and a small custom stylesheet, desktop-first
-by design; the channels, keys and logs pages are still stubs while the
-management flows are being built on top of this layout. Every mutating UI
-request is checked against same-origin browser metadata (`Sec-Fetch-Site`
-and `Origin`) and rejected with 403 when it is cross-site.
+by design. Every mutating UI request is checked against same-origin browser
+metadata (`Sec-Fetch-Site` and `Origin`) and rejected with 403 when it is
+cross-site.
+
+The channels and keys pages are fully usable: create and edit channels with
+the same validation messages the JSON API produces, enable or disable them,
+and delete them (a channel with bound keys refuses deletion with the count
+of those keys and an offer to disable it instead, which preserves the keys
+and their request logs). On the keys page, issue client keys, toggle them,
+and soft-delete them (request logs referencing a deleted key are preserved).
+
+Every interaction swaps a server-rendered fragment into the page; no action
+navigates away. When a key is issued, a modal shows the full key exactly
+once: a clipboard copy button, a ready-made curl snippet, and a required "I
+have stored the key" checkbox before the modal can be closed. Only a SHA-256
+hash of the key is stored, so after that modal there is no way to display
+the key again; losing it means issuing a new one. The logs page is still a
+stub while the request-log table is being built.
 
 ## Configuration
 
