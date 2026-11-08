@@ -516,13 +516,18 @@ fn resolve_channel(auth: &ProxyAuth) -> Result<Channel, ProxyError> {
 
 /// Joins a channel base URL with an API path so a trailing slash on the
 /// stored URL or a leading slash on the path never produces a double slash
-/// or drops the path.
+/// or drops the path. A base URL written in OpenAI-SDK style (ending in
+/// `/v1`) does not double the version segment when the path already starts
+/// with `/v1/`: `https://api.example.com/v1` forwards to
+/// `/v1/chat/completions`, not `/v1/v1/chat/completions`.
 fn join_url(base_url: &str, path: &str) -> String {
-    format!(
-        "{}/{}",
-        base_url.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
+    let base = base_url.trim_end_matches('/');
+    let base = if path.starts_with("/v1/") {
+        base.strip_suffix("/v1").unwrap_or(base)
+    } else {
+        base
+    };
+    format!("{}/{}", base, path.trim_start_matches('/'))
 }
 
 /// Converts an upstream response into the client response: status and
@@ -655,6 +660,46 @@ mod tests {
         assert_eq!(
             join_url("http://127.0.0.1:9///", "/v1/models"),
             "http://127.0.0.1:9/v1/models"
+        );
+    }
+
+    #[test]
+    fn join_url_drops_a_doubled_v1_segment() {
+        // OpenAI-SDK style base URL: the path already carries the version.
+        assert_eq!(
+            join_url("https://api.example.com/v1", "/v1/chat/completions"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1/", "/v1/models"),
+            "https://api.example.com/v1/models"
+        );
+        // A nested prefix keeps everything except the redundant tail.
+        assert_eq!(
+            join_url(
+                "https://proxy.example.com/openai/v1",
+                "/v1/chat/completions"
+            ),
+            "https://proxy.example.com/openai/v1/chat/completions"
+        );
+        // Version-less bases stay untouched.
+        assert_eq!(
+            join_url("https://api.example.com", "/v1/chat/completions"),
+            "https://api.example.com/v1/chat/completions"
+        );
+        // Only an exact `/v1` tail is dropped; lookalikes stay.
+        assert_eq!(
+            join_url("https://api.example.com/v11", "/v1/chat/completions"),
+            "https://api.example.com/v11/v1/chat/completions"
+        );
+        assert_eq!(
+            join_url("https://api.example.com/v1beta", "/v1/chat/completions"),
+            "https://api.example.com/v1beta/v1/chat/completions"
+        );
+        // Non-`/v1` paths never trigger the strip.
+        assert_eq!(
+            join_url("https://api.example.com/v1", "/other"),
+            "https://api.example.com/v1/other"
         );
     }
 

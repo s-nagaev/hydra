@@ -320,6 +320,32 @@ async fn trailing_slash_base_url_forwards_to_the_correct_path() {
 }
 
 #[tokio::test]
+async fn sdk_style_base_url_with_v1_tail_forwards_to_the_correct_path() {
+    let db = common::test_pool().await;
+    let recorder = Recorder::default();
+    let base = common::spawn_upstream(fixed_response_router(
+        recorder.clone(),
+        StatusCode::OK,
+        "application/json",
+        br#"{"ok":true}"#.to_vec(),
+    ))
+    .await;
+    // OpenAI-SDK style base URL: the stored URL already carries the `/v1`
+    // that the forward path adds.
+    let channel_id = common::seed_channel(&db, &format!("{base}/v1"), None).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db);
+
+    let (status, _, _) = send(app, chat_request(&key, chat_body("gpt-4o", false))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        recorder.requests()[0].path,
+        "/v1/chat/completions",
+        "a base_url ending in /v1 must not produce a doubled /v1/v1 path"
+    );
+}
+
+#[tokio::test]
 async fn chat_stream_passes_sse_events_through_unbuffered() {
     let db = common::test_pool().await;
     let recorder = Recorder::default();
