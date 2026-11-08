@@ -177,8 +177,15 @@ navigates away. When a key is issued, a modal shows the full key exactly
 once: a clipboard copy button, a ready-made curl snippet, and a required "I
 have stored the key" checkbox before the modal can be closed. Only a SHA-256
 hash of the key is stored, so after that modal there is no way to display
-the key again; losing it means issuing a new one. The logs page is still a
-stub while the request-log table is being built.
+the key again; losing it means issuing a new one.
+
+The logs page lists every proxied request with server-side pagination
+(prev/next, page numbers, page size) and filters for key, channel, model,
+status class (2xx/4xx/5xx/errors) and time period (presets or a custom
+range); the whole view state lives in the URL, so any filtered view can be
+reloaded, shared or revisited with the browser back button. Rows show
+colored status badges and a small "bodies" marker when request or response
+bodies were captured; body content itself is never rendered.
 
 ## Configuration
 
