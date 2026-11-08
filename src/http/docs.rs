@@ -237,6 +237,39 @@ mod tests {
             chat["security"][0]["bearer_auth"].is_array(),
             "chat must require the bearer scheme"
         );
+
+        // The chat request example must relate its model to the channel
+        // whitelist, so executing the example against a channel that does
+        // not admit the example model is a documented 404, not a surprise.
+        let request_body = &chat["requestBody"];
+        let description = request_body["description"].as_str().unwrap();
+        assert!(
+            description.contains("whitelist"),
+            "the request body must document the whitelist relation: {description}"
+        );
+        assert!(
+            description.contains("/v1/models"),
+            "the request body must point to the model listing: {description}"
+        );
+        let examples = &request_body["content"]["application/json"]["examples"];
+        for name in ["plain", "streaming"] {
+            assert!(
+                examples[name]["value"]["model"].as_str().is_some(),
+                "the {name} example must carry a string model"
+            );
+            assert!(
+                examples[name]["value"]["messages"][0]["role"] == "user",
+                "the {name} example must show a well-shaped message"
+            );
+        }
+        let not_found = chat["responses"]["404"]["content"]["application/json"]["example"]["error"]
+            ["message"]
+            .as_str()
+            .unwrap();
+        assert!(
+            not_found.contains("Allowed models for this channel"),
+            "the 404 example must show the allowed-models hint: {not_found}"
+        );
         let create_key = &doc["paths"]["/admin/keys"]["post"];
         assert!(
             create_key["responses"]["201"]["content"]["application/json"]["example"]["key"]

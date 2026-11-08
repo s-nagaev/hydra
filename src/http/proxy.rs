@@ -181,8 +181,12 @@ where
     request_body(
         content = Object,
         description = "Any OpenAI Chat Completions request body. `model` is \
-            required; `stream: true` switches the response to \
-            text/event-stream. Bodies above 32 MiB are rejected with 413.",
+            required and must be admitted by the channel's whitelist (a \
+            channel without a whitelist admits any model); GET /v1/models \
+            lists exactly what the key's channel admits, and the example \
+            model below only works when the channel admits it. \
+            `stream: true` switches the response to text/event-stream. \
+            Bodies above 32 MiB are rejected with 413.",
         examples(
             ("plain" = (
                 summary = "Non-streaming request",
@@ -236,9 +240,10 @@ where
             "error": { "message": "This API key has been disabled", "type": "invalid_request_error", "code": "key_disabled" }
         })),
         (status = 404, description = "The requested model is not in the \
-            channel's whitelist", body = OpenAiError, example = json!({
+            channel's whitelist; the message lists the allowed models so \
+            the caller can fix the request without an admin round-trip", body = OpenAiError, example = json!({
             "error": {
-                "message": "The model `gpt-4` does not exist or you do not have access to it.",
+                "message": "The model `gpt-4` does not exist or you do not have access to it. Allowed models for this channel: gpt-4o-mini, gpt-4o",
                 "type": "invalid_request_error",
                 "code": "model_not_found"
             }
