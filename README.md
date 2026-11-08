@@ -242,11 +242,11 @@ SQLite-only:
 docker compose --profile postgres up -d
 # postgres:   internal service, port not published
 # hydra:      SQLite instance on host port 8080 (unchanged)
-# hydra-pg:   PostgreSQL instance on host port 8081
+# hydra-postgres: PostgreSQL instance on host port 8081
 ```
 
 The compose PostgreSQL service uses a named volume and a `pg_isready`
-healthcheck; the `hydra-pg` instance waits for it to be healthy before
+healthcheck; the `hydra-postgres` instance waits for it to be healthy before
 starting. Without Docker, point `HYDRA_DATABASE_URL` at any reachable
 PostgreSQL server:
 
