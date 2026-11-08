@@ -19,6 +19,8 @@ use axum::Router;
 use crate::http::admin_auth::AdminAuth;
 use crate::http::AppState;
 
+use crate::http::admin_ui_channels;
+
 // Vendored htmx 2.0.11, self-hosted so the UI works without network access.
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 const ADMIN_CSS: &[u8] = include_bytes!("../../assets/admin.css");
@@ -28,13 +30,6 @@ const CSS_CONTENT_TYPE: &str = "text/css; charset=utf-8";
 
 /// Crate version shown in the base layout footer.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-#[derive(Template, WebTemplate)]
-#[template(path = "channels.html")]
-pub struct ChannelsPage {
-    pub version: &'static str,
-    pub section: &'static str,
-}
 
 #[derive(Template, WebTemplate)]
 #[template(path = "keys.html")]
@@ -60,13 +55,6 @@ pub struct ErrorBanner {
 
 async fn index(_auth: AdminAuth) -> Redirect {
     Redirect::to("/admin/ui/channels")
-}
-
-async fn channels(_auth: AdminAuth) -> ChannelsPage {
-    ChannelsPage {
-        version: VERSION,
-        section: "channels",
-    }
 }
 
 async fn keys(_auth: AdminAuth) -> KeysPage {
@@ -104,16 +92,16 @@ async fn admin_css(_auth: AdminAuth) -> Response {
 }
 
 /// Builds the `/admin/ui` router: pages, embedded assets, and the CSRF
-/// guard layered over everything so future POST routes are protected by
-/// default.
+/// guard layered over everything, including the merged page routers, so
+/// every POST route added here is protected by default.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(index))
-        .route("/channels", get(channels))
         .route("/keys", get(keys))
         .route("/logs", get(logs))
         .route("/static/htmx.min.js", get(htmx_js))
         .route("/static/admin.css", get(admin_css))
+        .merge(admin_ui_channels::router())
         .layer(axum::middleware::from_fn(crate::http::csrf::guard))
 }
 

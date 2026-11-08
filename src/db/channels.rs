@@ -35,6 +35,16 @@ pub struct ChannelPatch {
     pub enabled: Option<bool>,
 }
 
+/// Count of keys bound to a channel, alive or soft-deleted; the number the
+/// admin UI shows when a delete is refused. Mirrors the check `delete`
+/// runs to make that decision.
+pub async fn bound_key_count(pool: &SqlitePool, id: i64) -> sqlx::Result<i64> {
+    sqlx::query_scalar("SELECT COUNT(*) FROM api_keys WHERE channel_id = ?")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+}
+
 /// Result of a channel delete attempt.
 pub enum DeleteOutcome {
     Deleted,

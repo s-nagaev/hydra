@@ -120,7 +120,10 @@ impl From<Channel> for ChannelView {
     }
 }
 
-fn mask_api_key(key: &str) -> String {
+/// Masks an upstream key for display: first and last four characters around
+/// an ellipsis, or full asterisks when the key is too short to halve safely.
+/// Shared by the JSON views and the admin UI table.
+pub(crate) fn mask_api_key(key: &str) -> String {
     let len = key.chars().count();
     if len <= 8 {
         return "*".repeat(len);
@@ -130,7 +133,27 @@ fn mask_api_key(key: &str) -> String {
     format!("{head}...{tail}")
 }
 
-fn validate_base_url(raw: &str) -> Result<(), AdminError> {
+/// Channel name must be a non-empty-after-trim label. Shared by the JSON
+/// handlers and the admin UI form.
+pub(crate) fn validate_channel_name(name: &str) -> Result<(), AdminError> {
+    if name.trim().is_empty() {
+        return Err(AdminError::BadRequest("name must not be empty".to_string()));
+    }
+    Ok(())
+}
+
+/// Upstream key must be non-empty after trim. Shared by the JSON handlers
+/// and the admin UI form.
+pub(crate) fn validate_channel_api_key(api_key: &str) -> Result<(), AdminError> {
+    if api_key.trim().is_empty() {
+        return Err(AdminError::BadRequest(
+            "api_key must not be empty".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_base_url(raw: &str) -> Result<(), AdminError> {
     let parsed =
         Url::parse(raw).map_err(|_| AdminError::BadRequest(format!("invalid base_url: {raw}")))?;
     if parsed.cannot_be_a_base() || !matches!(parsed.scheme(), "http" | "https") {
@@ -141,8 +164,8 @@ fn validate_base_url(raw: &str) -> Result<(), AdminError> {
     Ok(())
 }
 
-fn validate_allowed_models(
-    models: Option<&Vec<String>>,
+pub(crate) fn validate_allowed_models(
+    models: Option<&[String]>,
 ) -> Result<Option<Vec<String>>, AdminError> {
     let Some(models) = models else {
         return Ok(None);
@@ -156,7 +179,7 @@ fn validate_allowed_models(
     if models.is_empty() {
         Ok(None)
     } else {
-        Ok(Some(models.clone()))
+        Ok(Some(models.to_vec()))
     }
 }
 
@@ -164,16 +187,10 @@ fn validate_common(
     name: &str,
     base_url: &str,
     api_key: &str,
-    allowed_models: Option<&Vec<String>>,
+    allowed_models: Option<&[String]>,
 ) -> Result<Option<Vec<String>>, AdminError> {
-    if name.trim().is_empty() {
-        return Err(AdminError::BadRequest("name must not be empty".to_string()));
-    }
-    if api_key.trim().is_empty() {
-        return Err(AdminError::BadRequest(
-            "api_key must not be empty".to_string(),
-        ));
-    }
+    validate_channel_name(name)?;
+    validate_channel_api_key(api_key)?;
     validate_base_url(base_url)?;
     validate_allowed_models(allowed_models)
 }
@@ -252,7 +269,7 @@ pub async fn create(
         &request.name,
         &request.base_url,
         &request.api_key,
-        request.allowed_models.as_ref(),
+        request.allowed_models.as_deref(),
     )?;
     let channel = channels::create(
         &state.db,
@@ -404,23 +421,17 @@ pub async fn patch(
     let Json(request) =
         payload.map_err(|rejection| AdminError::BadRequest(rejection.body_text()))?;
     if let Some(name) = &request.name {
-        if name.trim().is_empty() {
-            return Err(AdminError::BadRequest("name must not be empty".to_string()));
-        }
+        validate_channel_name(name)?;
     }
     if let Some(api_key) = &request.api_key {
-        if api_key.trim().is_empty() {
-            return Err(AdminError::BadRequest(
-                "api_key must not be empty".to_string(),
-            ));
-        }
+        validate_channel_api_key(api_key)?;
     }
     if let Some(base_url) = &request.base_url {
         validate_base_url(base_url)?;
     }
     let allowed_models = match &request.allowed_models {
         None => None,
-        Some(inner) => Some(validate_allowed_models(inner.as_ref())?),
+        Some(inner) => Some(validate_allowed_models(inner.as_deref())?),
     };
     let channel = channels::update(
         &state.db,

@@ -340,3 +340,89 @@ button.danger:hover {
   text-align: center;
   padding: 14px;
 }
+
+/* Forms: channel/key create + edit */
+
+form.channel-form {
+  margin-bottom: 18px;
+}
+
+.field-hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin-top: 4px;
+}
+
+.form-actions {
+  display: flex;
+  gap: 10px;
+}
+
+textarea {
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  background: var(--surface);
+  resize: vertical;
+}
+
+/* Row action forms and shared bits */
+
+form.inline {
+  display: inline;
+  margin-left: 6px;
+}
+
+.text-muted {
+  color: var(--text-muted);
+}
+
+.mono {
+  font-family: var(--mono);
+  font-size: 13px;
+}
+
+.model-badge {
+  display: inline-block;
+  background: #eaf1fe;
+  color: var(--accent-dark);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12.5px;
+  margin: 1px 2px 1px 0;
+  white-space: nowrap;
+}
+
+/* Reveal modal extras: copy button state, checkbox gating */
+
+.modal .copy-key.copied {
+  border-color: var(--ok);
+  color: var(--ok);
+}
+
+.modal .stored-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  margin-top: 14px;
+  font-weight: 500;
+}
+
+.modal .stored-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+}
+
+.modal button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.snippet-label {
+  color: var(--text-muted);
+  font-size: 13.5px;
+  margin: 14px 0 0;
+}

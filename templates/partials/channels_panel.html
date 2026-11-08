@@ -1,0 +1,110 @@
+<section class="panel" id="channels-panel">
+  <div class="panel-head">
+    <h1>Channels</h1>
+    <button type="button" class="primary"
+      hx-get="/admin/ui/channels/form"
+      hx-target="#channels-panel"
+      hx-swap="outerHTML">New channel</button>
+  </div>
+  {% if let Some(error) = error %}
+  <div class="error-banner" role="alert">
+    {{ error }}
+    {% if let Some(id) = disable_instead %}
+    <form class="inline" hx-post="/admin/ui/channels/{{ id }}/toggle"
+      hx-target="#channels-panel" hx-swap="outerHTML">
+      <input type="hidden" name="enabled" value="false">
+      <button type="submit" class="danger">Disable instead</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+  {% if let Some(form) = form %}
+  <form class="stack channel-form"
+    hx-post="{{ form.action }}"
+    hx-target="#channels-panel"
+    hx-swap="outerHTML">
+    <div>
+      <label for="channel-name">Name</label>
+      <input type="text" id="channel-name" name="name" value="{{ form.name }}">
+      {% if let Some(error) = form.errors.name %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div>
+      <label for="channel-base-url">Base URL</label>
+      <input type="text" id="channel-base-url" name="base_url" value="{{ form.base_url }}">
+      {% if let Some(error) = form.errors.base_url %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div>
+      <label for="channel-api-key">Upstream API key</label>
+      <input type="password" id="channel-api-key" name="api_key" autocomplete="new-password">
+      {% if form.editing %}<div class="field-hint">Leave empty to keep the current key.</div>{% endif %}
+      {% if let Some(error) = form.errors.api_key %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div>
+      <label for="channel-models">Allowed models</label>
+      <textarea id="channel-models" name="allowed_models" rows="3">{{ form.allowed_models_text }}</textarea>
+      <div class="field-hint">One model per line; leave empty to allow every model.</div>
+      {% if let Some(error) = form.errors.allowed_models %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="primary">Save channel</button>
+      <button type="button"
+        hx-get="/admin/ui/channels"
+        hx-target="#channels-panel"
+        hx-swap="outerHTML">Cancel</button>
+    </div>
+  </form>
+  {% endif %}
+  <table class="data-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Base URL</th>
+        <th>API key</th>
+        <th>Allowed models</th>
+        <th>Enabled</th>
+        <th class="actions-col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if rows.is_empty() %}
+      <tr>
+        <td colspan="6" class="empty-state">No channels yet. Create one to route client keys through it.</td>
+      </tr>
+      {% else %}
+      {% for row in rows %}
+      <tr>
+        <td>{{ row.name }}</td>
+        <td>{{ row.base_url }}</td>
+        <td class="mono">{{ row.api_key_masked }}</td>
+        <td>
+          {% match row.allowed_models %}
+          {% when Some with (models) %}
+          {% for model in models %}<span class="model-badge">{{ model }}</span> {% endfor %}
+          {% when None %}<span class="text-muted">all</span>{% endmatch %}
+        </td>
+        <td>
+          {% if row.enabled %}<span class="badge ok">enabled</span>
+          {% else %}<span class="badge off">disabled</span>{% endif %}
+        </td>
+        <td class="actions-col">
+          <button type="button"
+            hx-get="/admin/ui/channels/{{ row.id }}/edit"
+            hx-target="#channels-panel"
+            hx-swap="outerHTML">Edit</button>
+          <form class="inline" hx-post="/admin/ui/channels/{{ row.id }}/toggle"
+            hx-target="#channels-panel" hx-swap="outerHTML">
+            <input type="hidden" name="enabled" value="{% if row.enabled %}false{% else %}true{% endif %}">
+            <button type="submit">{% if row.enabled %}Disable{% else %}Enable{% endif %}</button>
+          </form>
+          <form class="inline" hx-post="/admin/ui/channels/{{ row.id }}/delete"
+            hx-target="#channels-panel" hx-swap="outerHTML"
+            hx-confirm="Delete this channel?">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+    </tbody>
+  </table>
+</section>
