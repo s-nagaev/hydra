@@ -513,3 +513,31 @@ async fn client_ip_column_renders_the_ip_or_a_dash() {
     // The row without a captured IP shows the muted dash placeholder.
     assert!(body.contains(r#"<td class="mono"><span class="text-muted">-</span></td>"#));
 }
+
+#[tokio::test]
+async fn rejection_rows_with_null_ids_render_placeholder_labels() {
+    let db = test_pool().await;
+    seed_channel_and_key(&db).await;
+    within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
+              duration_ms, request_body, response_body, error, created_at) \
+             VALUES (NULL, NULL, NULL, 401, NULL, NULL, 1, NULL, NULL, ?, ?)",
+        )
+        .bind("Invalid API key provided")
+        .bind("2026-11-08 10:00:00")
+        .execute(&db),
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = get_page(&db, "/admin/ui/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("unknown key"),
+        "a NULL key id must render as a placeholder, not a lookup panic: {body}"
+    );
+    assert!(body.contains("unknown channel"));
+    assert!(body.contains("Invalid API key provided"));
+}

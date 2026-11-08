@@ -25,7 +25,7 @@ use common::{fixed_response_router, spawn_upstream, within, Recorder};
 use hydra::config::DbTarget;
 use hydra::db::channels::NewChannel;
 use hydra::db::keys::NewKey;
-use hydra::db::request_logs::{self, LogFilters};
+use hydra::db::request_logs::{self, LogFilters, StatusClass};
 use hydra::db::{channels, keys, Db};
 use hydra::http::{router, AppState};
 
@@ -352,4 +352,55 @@ async fn pg_proxy_call_logs_and_lists() {
     assert!(rows[0].error.is_none());
     assert_eq!(rows[0].created_at.len(), 19);
     assert_eq!(rows[0].created_at.as_bytes()[10], b' ');
+}
+
+/// A rejection row (unknown key 401) carries no key or channel reference:
+/// the PG schema must accept the NULLs and read them back as such.
+#[tokio::test]
+async fn pg_rejection_row_with_null_ids_round_trips() {
+    let Some(db) = pg_db().await else {
+        skip_note();
+        return;
+    };
+
+    request_logs::insert(
+        &db,
+        &request_logs::NewRequestLog {
+            api_key_id: None,
+            channel_id: None,
+            model: None,
+            status: Some(401),
+            prompt_tokens: None,
+            completion_tokens: None,
+            duration_ms: 1,
+            request_body: Some(r#"{"model":"gpt-4o"}"#.to_string()),
+            response_body: None,
+            error: Some("Invalid API key provided".to_string()),
+            client_ip: Some("203.0.113.7".to_string()),
+        },
+    )
+    .await
+    .unwrap();
+
+    let filters = LogFilters {
+        key_id: None,
+        channel_id: None,
+        model: None,
+        status_class: Some(StatusClass::Client4xx),
+        from: None,
+        to: None,
+        page: 1,
+        page_size: 10,
+    };
+    let (items, _) = request_logs::list(&db, &filters).await.unwrap();
+    let row = items
+        .iter()
+        .find(|row| {
+            row.status == Some(401) && row.error.as_deref() == Some("Invalid API key provided")
+        })
+        .expect("the rejection row must be listed");
+    assert_eq!(row.api_key_id, None);
+    assert_eq!(row.channel_id, None);
+    assert_eq!(row.client_ip.as_deref(), Some("203.0.113.7"));
+    assert_eq!(row.request_body.as_deref(), Some(r#"{"model":"gpt-4o"}"#));
 }

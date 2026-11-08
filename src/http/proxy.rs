@@ -15,8 +15,11 @@
 //! ([`upstream_to_response`]), which is also where the background request
 //! logging tee hooks in: every chat completion produces exactly one
 //! `request_logs` row written by a detached task that can never block or
-//! fail the client flow. `/v1/models` is a lightweight discovery endpoint
-//! and is not logged.
+//! fail the client flow. Rejections are logged too, auth-layer ones
+//! included (they resolve to no key, so their rows carry NULL ids); the
+//! only unloggable case is the 413 body-limit rejection, which happens in
+//! the body extractor before any handler code runs. `/v1/models` is a
+//! lightweight discovery endpoint and is not logged.
 
 use std::time::{Duration, Instant};
 
@@ -32,7 +35,7 @@ use crate::db::channels::Channel;
 use crate::http::client_ip;
 use crate::http::docs::OpenAiError;
 use crate::http::openai_error::openai_error;
-use crate::http::proxy_auth::ProxyAuth;
+use crate::http::proxy_auth::{ProxyAuth, ProxyAuthError};
 use crate::http::AppState;
 use crate::logging::{self, ChatLogContext, ChatLogInit};
 
@@ -162,8 +165,8 @@ where
 
 /// `POST /v1/chat/completions`: peek `model`/`stream`, check the whitelist,
 /// forward the original bytes with the upstream key, pass the response
-/// through byte-for-byte, and leave exactly one background log row behind
-/// whatever the outcome.
+/// through byte-for-byte, and leave a background log row behind whatever
+/// the outcome (only the 413 body-limit rejection stays unlogged).
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -176,8 +179,9 @@ where
         so anything the upstream accepts works here; the two fields Hydra \
         itself reads are `model` (whitelist check) and `stream` (streaming \
         path). Upstream responses, errors included, come back with the \
-        upstream status and body unchanged. Every call leaves exactly one \
-        row in the request log.",
+        upstream status and body unchanged. Every call, rejected ones \
+        included, leaves a row in the request log; the one exception is a \
+        413 over-limit body, which cannot be logged.",
     security(("bearer_auth" = [])),
     request_body(
         content = Object,
@@ -280,7 +284,10 @@ where
 )]
 pub async fn chat_completions(
     State(state): State<AppState>,
-    auth: ProxyAuth,
+    // Extracted as a Result so an auth failure reaches this handler with
+    // the request body already buffered: the rejection row needs the same
+    // body capture a successful call gets.
+    auth: Result<ProxyAuth, ProxyAuthError>,
     headers: HeaderMap,
     // Absent ConnectInfo (in-process oneshot requests) simply logs no IP.
     peer: client_ip::PeerAddr,
@@ -288,6 +295,13 @@ pub async fn chat_completions(
 ) -> Result<Response, ProxyError> {
     let start = Instant::now();
     let client_ip = client_ip::resolve(&headers, peer.0, &state.trusted_proxies);
+    let auth = match auth {
+        Ok(auth) => auth,
+        Err(e) => {
+            log_auth_rejection(&state, start, &body, client_ip, &e);
+            return Ok(e.into_response());
+        }
+    };
     let (model, stream_requested) = match peek_request(&body) {
         Ok(peeked) => peeked,
         Err(e) => {
@@ -624,8 +638,8 @@ fn chat_log_context(
         db: &state.db,
         tracker: &state.log_tracker,
         log_bodies: state.log_bodies,
-        api_key_id: auth.key.id,
-        channel_id: auth.key.channel_id,
+        api_key_id: Some(auth.key.id),
+        channel_id: Some(auth.key.channel_id),
         model,
         start,
         request_body: body,
@@ -633,10 +647,41 @@ fn chat_log_context(
     })
 }
 
+/// Writes the audit row for a request rejected by the auth layer (401
+/// unknown key, 403 disabled key, key lookup failure). The caller never
+/// resolved to a key row, so the row carries no key or channel ids; the
+/// failure text mirrors the response body the client received.
+fn log_auth_rejection(
+    state: &AppState,
+    start: Instant,
+    body: &Bytes,
+    client_ip: Option<String>,
+    error: &ProxyAuthError,
+) {
+    let ctx = ChatLogContext::new(ChatLogInit {
+        db: &state.db,
+        tracker: &state.log_tracker,
+        log_bodies: state.log_bodies,
+        api_key_id: None,
+        channel_id: None,
+        model: None,
+        start,
+        request_body: body,
+        client_ip,
+    });
+    let (status, message) = match error {
+        ProxyAuthError::InvalidKey => (Some(401), "Invalid API key provided".to_string()),
+        ProxyAuthError::DisabledKey => (Some(403), "This API key has been disabled".to_string()),
+        // A storage failure answers 500 without reaching the upstream.
+        ProxyAuthError::Database(e) => (None, format!("proxy key lookup failed: {e}")),
+    };
+    ctx.finish(status, None, None, None, Some(message));
+}
+
 /// Writes the audit row for an authenticated chat request rejected before
-/// the upstream was contacted. Rejections from the auth layer (401/403) and
-/// from the body extractor (413) happen before the handler and are not
-/// logged: they have no key row or no readable body to reference.
+/// the upstream was contacted: the row keeps the caller's key id. The 413
+/// body-limit rejection happens in the extractor instead and stays
+/// unlogged; auth-layer rejections are logged by [`log_auth_rejection`].
 fn log_rejection(
     state: &AppState,
     auth: &ProxyAuth,

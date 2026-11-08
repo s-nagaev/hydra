@@ -18,8 +18,8 @@ use common::{fixed_response_router, sse_router, within, Recorder};
 
 /// One `request_logs` row, as read back through a runtime sqlx query.
 struct LogRow {
-    api_key_id: i64,
-    channel_id: i64,
+    api_key_id: Option<i64>,
+    channel_id: Option<i64>,
     model: Option<String>,
     status: Option<i64>,
     prompt_tokens: Option<i64>,
@@ -147,8 +147,8 @@ async fn non_stream_chat_logs_one_row_with_tokens_and_null_bodies() {
     let logs = wait_for_logs(&db, 1).await;
     assert_eq!(logs.len(), 1, "exactly one row per request");
     let row = &logs[0];
-    assert_eq!(row.api_key_id, key_id(&db, channel_id).await);
-    assert_eq!(row.channel_id, channel_id);
+    assert_eq!(row.api_key_id, Some(key_id(&db, channel_id).await));
+    assert_eq!(row.channel_id, Some(channel_id));
     assert_eq!(row.model.as_deref(), Some("gpt-4o"));
     assert_eq!(row.status, Some(200));
     assert_eq!(row.prompt_tokens, Some(12));
@@ -172,7 +172,7 @@ async fn non_stream_chat_with_body_logging_captures_request_and_response() {
 
     let logs = wait_for_logs(&db, 1).await;
     let row = &logs[0];
-    assert_eq!(row.api_key_id, key_id(&db, channel_id).await);
+    assert_eq!(row.api_key_id, Some(key_id(&db, channel_id).await));
     assert_eq!(
         row.request_body.as_deref(),
         Some(String::from_utf8(request_body).unwrap().as_str()),
@@ -284,7 +284,7 @@ async fn upstream_connection_failure_logs_row_with_null_status_and_error() {
 
     let logs = wait_for_logs(&db, 1).await;
     let row = &logs[0];
-    assert_eq!(row.api_key_id, key_id(&db, channel_id).await);
+    assert_eq!(row.api_key_id, Some(key_id(&db, channel_id).await));
     assert_eq!(row.status, None, "the request never reached the upstream");
     let error = row
         .error
@@ -313,6 +313,10 @@ async fn whitelisted_out_model_rejection_is_logged_without_upstream_status() {
     let row = &logs[0];
     assert_eq!(row.model.as_deref(), Some("gpt-3.5-turbo"));
     assert_eq!(row.status, None);
+    // The key resolved, so the row keeps its id even though the channel
+    // never served anything.
+    assert_eq!(row.api_key_id, Some(key_id(&db, channel_id).await));
+    assert_eq!(row.channel_id, Some(channel_id));
     assert!(
         row.error
             .as_deref()
@@ -322,6 +326,73 @@ async fn whitelisted_out_model_rejection_is_logged_without_upstream_status() {
         "rejection reason must be recorded: {:?}",
         row.error
     );
+}
+
+#[tokio::test]
+async fn unknown_key_rejection_is_logged_with_null_ids_and_captured_body() {
+    let db = common::test_pool().await;
+    let app = common::test_app_logging(db.clone());
+
+    let request_body = chat_body("gpt-4o", false);
+    let (status, body) = send_chat(app, "hyd-does-not-exist", request_body.clone()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let error: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(error["error"]["code"], "invalid_api_key");
+
+    let logs = wait_for_logs(&db, 1).await;
+    let row = &logs[0];
+    assert_eq!(
+        row.api_key_id, None,
+        "no key row exists to reference, the column must stay null"
+    );
+    assert_eq!(row.channel_id, None);
+    assert_eq!(row.status, Some(401));
+    let error = row
+        .error
+        .as_deref()
+        .expect("rejections carry the failure reason");
+    assert!(error.contains("Invalid API key"), "{error}");
+    assert_eq!(
+        row.request_body.as_deref(),
+        Some(String::from_utf8(request_body).unwrap().as_str()),
+        "body capture was on, so the rejected request body is stored too"
+    );
+}
+
+#[tokio::test]
+async fn unknown_key_rejection_without_body_logging_stores_no_body() {
+    let db = common::test_pool().await;
+    let app = common::test_app(db.clone());
+
+    let (status, _) = send_chat(app, "hyd-does-not-exist", chat_body("gpt-4o", false)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let logs = wait_for_logs(&db, 1).await;
+    let row = &logs[0];
+    assert_eq!(row.status, Some(401));
+    assert_eq!(row.api_key_id, None);
+    assert!(row.request_body.is_none(), "bodies off: no capture");
+}
+
+#[tokio::test]
+async fn missing_authorization_header_rejection_is_logged_like_an_unknown_key() {
+    let db = common::test_pool().await;
+    let app = common::test_app(db.clone());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(chat_body("gpt-4o", false)))
+        .unwrap();
+    let response = within(router(app).oneshot(request)).await.unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let logs = wait_for_logs(&db, 1).await;
+    let row = &logs[0];
+    assert_eq!(row.status, Some(401));
+    assert_eq!(row.api_key_id, None);
+    assert_eq!(row.channel_id, None);
 }
 
 #[tokio::test]
@@ -348,7 +419,7 @@ async fn log_rows_survive_key_soft_delete() {
 
     let logs = fetch_logs(&db).await;
     assert_eq!(logs.len(), 1);
-    assert_eq!(logs[0].api_key_id, key_row_id);
+    assert_eq!(logs[0].api_key_id, Some(key_row_id));
     let deleted_at: Option<String> = within(
         sqlx::query_scalar("SELECT deleted_at FROM api_keys WHERE id = ?")
             .bind(key_row_id)
@@ -416,8 +487,8 @@ async fn upstream_500_response_logs_row_with_upstream_status() {
 
     let logs = wait_for_logs(&db, 1).await;
     let row = &logs[0];
-    assert_eq!(row.api_key_id, key_id(&db, channel_id).await);
-    assert_eq!(row.channel_id, channel_id);
+    assert_eq!(row.api_key_id, Some(key_id(&db, channel_id).await));
+    assert_eq!(row.channel_id, Some(channel_id));
     assert_eq!(row.model.as_deref(), Some("gpt-4o"));
     assert_eq!(
         row.status,
@@ -475,7 +546,7 @@ async fn concurrent_streaming_requests_complete_uncorrupted_and_log_once_each() 
         "exactly one row per request, no double logging"
     );
     for row in &logs {
-        assert_eq!(row.api_key_id, key_id(&db, channel_id).await);
+        assert_eq!(row.api_key_id, Some(key_id(&db, channel_id).await));
         assert_eq!(row.status, Some(200));
         assert_eq!(row.model.as_deref(), Some("gpt-4o"));
         assert!(row.error.is_none());

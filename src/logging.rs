@@ -1,11 +1,17 @@
 //! Background request logging for the chat proxy flow.
 //!
-//! Every authenticated `/v1/chat/completions` request gets exactly one
-//! `request_logs` row, written by a detached task so the client flow never
-//! waits on, or fails from, logging. Rejections that happen before the
-//! handler runs (401/403 auth, 413 from the body extractor) cannot be
-//! logged: they have no key row or no readable body to reference. `GET
-//! /v1/models` is a lightweight discovery endpoint and is not logged.
+//! Every `/v1/chat/completions` request gets exactly one `request_logs`
+//! row, written by a detached task so the client flow never waits on, or
+//! fails from, logging — accepted calls and rejected ones alike. A
+//! rejected call stores its failure in `error` and its HTTP status where
+//! one was produced: auth-layer rejections (401 unknown key, 403 disabled
+//! key) resolve to no key row, so their rows carry NULL `api_key_id` and
+//! `channel_id`; handler rejections (unknown model, gone or disabled
+//! channel) keep the caller's key id. The one exception is the 413
+//! body-limit rejection: it happens inside the body extractor, before any
+//! handler code runs, and there is no readable body to reference, so it
+//! stays unloggable. `GET /v1/models` is a lightweight discovery endpoint
+//! and is not logged.
 //!
 //! Duration is measured from handler start to response completion: for
 //! non-streaming requests the moment the full upstream body has been read,
@@ -73,8 +79,11 @@ pub struct ChatLogInit<'a> {
     pub db: &'a Db,
     pub tracker: &'a LogTracker,
     pub log_bodies: bool,
-    pub api_key_id: i64,
-    pub channel_id: i64,
+    /// NULL for rows about requests whose key never resolved (unknown key
+    /// 401, disabled key 403, lookup failure).
+    pub api_key_id: Option<i64>,
+    /// NULL exactly when `api_key_id` is NULL.
+    pub channel_id: Option<i64>,
     pub model: Option<String>,
     pub start: Instant,
     pub request_body: &'a [u8],
@@ -88,8 +97,8 @@ pub struct ChatLogContext {
     db: Db,
     tracker: LogTracker,
     log_bodies: bool,
-    api_key_id: i64,
-    channel_id: i64,
+    api_key_id: Option<i64>,
+    channel_id: Option<i64>,
     model: Option<String>,
     start: Instant,
     request_body: Option<String>,
@@ -418,8 +427,8 @@ mod tests {
             Db::from(pool.clone()),
             tracker.clone(),
             NewRequestLog {
-                api_key_id: 1,
-                channel_id: 1,
+                api_key_id: Some(1),
+                channel_id: Some(1),
                 model: Some("gpt-4o".to_string()),
                 status: Some(200),
                 prompt_tokens: Some(3),
@@ -463,8 +472,8 @@ mod tests {
             Db::from(pool.clone()),
             tracker.clone(),
             NewRequestLog {
-                api_key_id: 99,
-                channel_id: 1,
+                api_key_id: Some(99),
+                channel_id: Some(1),
                 model: None,
                 status: None,
                 prompt_tokens: None,

@@ -102,8 +102,11 @@ pub struct LogListQuery {
 #[derive(Serialize, ToSchema)]
 pub struct RequestLogView {
     pub id: i64,
-    pub api_key_id: i64,
-    pub channel_id: i64,
+    /// Null when the request was rejected before its key resolved (an
+    /// unknown key 401 or a key lookup failure); otherwise the key row id.
+    pub api_key_id: Option<i64>,
+    /// Null exactly when `api_key_id` is null.
+    pub channel_id: Option<i64>,
     pub model: Option<String>,
     pub status: Option<i64>,
     pub prompt_tokens: Option<i64>,
@@ -213,8 +216,11 @@ fn sqlite_timestamp(raw: &str, label: &str) -> Result<String, LogsError> {
 #[derive(Serialize, ToSchema)]
 pub struct RequestLogDetailView {
     pub id: i64,
-    pub api_key_id: i64,
-    pub channel_id: i64,
+    /// Null when the request was rejected before its key resolved (an
+    /// unknown key 401 or a key lookup failure); otherwise the key row id.
+    pub api_key_id: Option<i64>,
+    /// Null exactly when `api_key_id` is null.
+    pub channel_id: Option<i64>,
     pub model: Option<String>,
     pub status: Option<i64>,
     pub prompt_tokens: Option<i64>,

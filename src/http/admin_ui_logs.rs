@@ -517,14 +517,22 @@ fn build_page(query: &LogsQuery, data: LogsData, error: Option<String>) -> LogsP
             };
             LogRow {
                 created_at: log.created_at.clone(),
-                key_prefix: key_names
-                    .get(&log.api_key_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("#{}", log.api_key_id)),
-                channel_name: channel_names
-                    .get(&log.channel_id)
-                    .cloned()
-                    .unwrap_or_else(|| format!("#{}", log.channel_id)),
+                key_prefix: match log.api_key_id {
+                    Some(id) => key_names
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{id}")),
+                    // The request was rejected before its key resolved
+                    // (unknown key 401, lookup failure): no key to name.
+                    None => "unknown key".to_string(),
+                },
+                channel_name: match log.channel_id {
+                    Some(id) => channel_names
+                        .get(&id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("#{id}")),
+                    None => "unknown channel".to_string(),
+                },
                 model: log.model.clone(),
                 status_text,
                 status_css,

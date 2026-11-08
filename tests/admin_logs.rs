@@ -685,3 +685,72 @@ async fn log_detail_without_credentials_returns_401_with_challenge() {
         r#"Basic realm="hydra""#
     );
 }
+
+/// Inserts one rejection row with no key or channel reference, the shape
+/// an unknown-key 401 produces.
+async fn insert_rejection_log(db: &SqlitePool, error: &str, created_at: &str) -> i64 {
+    within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
+              duration_ms, request_body, response_body, error, created_at) \
+             VALUES (NULL, NULL, NULL, 401, NULL, NULL, 1, ?, NULL, ?, ?)",
+        )
+        .bind(r#"{"model":"gpt-4o","messages":[]}"#)
+        .bind(error)
+        .bind(created_at)
+        .execute(db),
+    )
+    .await
+    .unwrap()
+    .last_insert_rowid()
+}
+
+#[tokio::test]
+async fn rejection_rows_with_null_ids_are_listed_with_null_key_and_channel() {
+    let db = test_pool().await;
+    let (channel_id, key_id) = seed_channel_and_key(&db).await;
+    insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        None,
+        None,
+        None,
+        "2026-11-08 10:00:00",
+    )
+    .await;
+    let rejection_id =
+        insert_rejection_log(&db, "Invalid API key provided", "2026-11-08 10:01:00").await;
+
+    let (status, body) = send_get_on(&db, "/admin/logs", Some(&auth_header())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total"], 2);
+    let items = body["items"].as_array().unwrap();
+    assert_eq!(items[0]["id"], rejection_id, "newest first");
+    assert_eq!(items[0]["api_key_id"], Value::Null);
+    assert_eq!(items[0]["channel_id"], Value::Null);
+    assert_eq!(items[0]["status"], 401);
+    assert_eq!(items[0]["error"], "Invalid API key provided");
+    assert_eq!(items[1]["api_key_id"], key_id);
+    assert_eq!(items[1]["channel_id"], channel_id);
+}
+
+#[tokio::test]
+async fn log_detail_of_a_rejection_row_returns_null_ids() {
+    let db = test_pool().await;
+    let id = insert_rejection_log(&db, "Invalid API key provided", "2026-11-08 10:01:00").await;
+
+    let (status, body) = send_get_on(&db, &format!("/admin/logs/{id}"), Some(&auth_header())).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["id"], id);
+    assert_eq!(body["api_key_id"], Value::Null);
+    assert_eq!(body["channel_id"], Value::Null);
+    assert_eq!(body["status"], 401);
+    assert_eq!(body["error"], "Invalid API key provided");
+    assert_eq!(
+        body["request_body"],
+        json!(r#"{"model":"gpt-4o","messages":[]}"#)
+    );
+}
