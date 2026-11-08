@@ -11,11 +11,14 @@ RUN mkdir src \
     && echo '' > src/lib.rs \
     && cargo build --release \
     && rm -rf src
-# sqlx::migrate! embeds the migration files into the binary at compile time,
-# so the directory must be present in the builder (the runtime image needs
-# only the executable).
+# sqlx::migrate! embeds the migration files and askama/include_bytes!
+# embed the templates and static assets into the binary at compile time, so
+# all three directories must be present in the builder (the runtime image
+# needs only the executable).
 COPY src ./src
 COPY migrations ./migrations
+COPY templates ./templates
+COPY assets ./assets
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release
 
