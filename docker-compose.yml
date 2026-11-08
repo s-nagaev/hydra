@@ -2,6 +2,14 @@
 # HYDRA_ADMIN_PASSWORD before bringing this up. The bind address and DB path
 # are set here (not in .env) because the container must listen on all
 # interfaces and keep its database on the volume.
+#
+# SQLite is the default backend: a plain `docker compose up -d` starts only
+# the hydra service with HYDRA_DB_PATH. To run against PostgreSQL instead:
+#
+#   docker compose --profile postgres up -d
+#
+# which additionally starts the postgres service and a second hydra instance
+# (hydra-postgres) on host port 8081, wired to it via HYDRA_DATABASE_URL.
 services:
   hydra:
     build: .
@@ -17,5 +25,43 @@ services:
     volumes:
       - hydra-data:/data
 
+  # Optional PostgreSQL backend, started only with --profile postgres. The
+  # inline password is fine for a local demo; put a real secret in an env
+  # file before exposing anything beyond localhost.
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: hydra
+      POSTGRES_PASSWORD: hydra
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hydra"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  # The same image against the PostgreSQL service above, reachable on host
+  # port 8081 so the default SQLite instance can keep 8080. Migrations for
+  # the PostgreSQL schema apply automatically at startup.
+  hydra-postgres:
+    build: .
+    image: hydra:local
+    profiles: ["postgres"]
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8081:8080"
+    env_file:
+      - .env
+    environment:
+      HYDRA_BIND_ADDR: 0.0.0.0:8080
+      HYDRA_DATABASE_URL: postgres://postgres:hydra@postgres:5432/hydra
+
 volumes:
   hydra-data:
+  postgres-data:
