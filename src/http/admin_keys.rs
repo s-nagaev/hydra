@@ -178,7 +178,8 @@ const CREATION_ATTEMPTS: usize = 5;
             the channel first", body = AdminErrorBody, example = json!({
             "error": "channel is disabled"
         })),
-        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body"),
         (status = 404, description = "No channel with this id", body = AdminErrorBody, example = json!({
             "error": "channel not found"
         }))
@@ -242,7 +243,7 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
     operation_id = "list_keys",
     summary = "List client keys",
     description = "Returns every key with its channel binding and state. \
-        Soft-deleted keys appear with a `deleted_at` timestamp; the full key
+        Soft-deleted keys appear with a `deleted_at` timestamp; the full key \
         material is never in this response.",
     security(("basic_auth" = [])),
     responses(
@@ -266,7 +267,8 @@ fn is_unique_violation(error: &sqlx::Error) -> bool {
                 "created_at": "2026-11-05 09:00:00"
             }
         ])),
-        (status = 401, description = "Missing or wrong admin credentials")
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body")
     )
 )]
 pub async fn list(
@@ -284,7 +286,7 @@ pub async fn list(
     operation_id = "patch_key",
     summary = "Edit a client key",
     description = "Enables or disables the key and changes its label. This \
-        never deletes: a disabled key can be re-enabled; deleting is DELETE,
+        never deletes: a disabled key can be re-enabled; deleting is DELETE, \
         and a deleted key cannot be edited.",
     security(("basic_auth" = [])),
     params(("id" = i64, Path, description = "Key id", example = 1)),
@@ -318,7 +320,8 @@ pub async fn list(
         (status = 400, description = "Empty label string", body = AdminErrorBody, example = json!({
             "error": "name must not be empty"
         })),
-        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body"),
         (status = 404, description = "No key with this id", body = AdminErrorBody, example = json!({
             "error": "key not found"
         })),
@@ -373,7 +376,8 @@ pub async fn patch(
     params(("id" = i64, Path, description = "Key id", example = 1)),
     responses(
         (status = 204, description = "Key deleted, no body"),
-        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body"),
         (status = 404, description = "No key with this id", body = AdminErrorBody, example = json!({
             "error": "key not found"
         })),

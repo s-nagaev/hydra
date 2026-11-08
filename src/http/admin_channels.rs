@@ -273,7 +273,7 @@ pub async fn create(
     tag = "Admin",
     operation_id = "list_channels",
     summary = "List channels",
-    description = "Returns every channel, including disabled ones, with the
+    description = "Returns every channel, including disabled ones, with the \
         upstream key masked in each row.",
     security(("basic_auth" = [])),
     responses(
@@ -289,7 +289,8 @@ pub async fn create(
                 "created_at": "2026-11-07 23:59:59"
             }
         ])),
-        (status = 401, description = "Missing or wrong admin credentials")
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body")
     )
 )]
 pub async fn list(
@@ -320,7 +321,8 @@ pub async fn list(
             "enabled": true,
             "created_at": "2026-11-07 23:59:59"
         })),
-        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body"),
         (status = 404, description = "No channel with this id", body = AdminErrorBody, example = json!({
             "error": "channel not found"
         }))
@@ -343,9 +345,9 @@ pub async fn get_one(
     tag = "Admin",
     operation_id = "patch_channel",
     summary = "Edit a channel",
-    description = "Updates only the fields present in the body. Sending JSON
-        null as `allowed_models` clears the whitelist back to allow-all;
-        an empty array does the same. This is also how a channel is enabled
+    description = "Updates only the fields present in the body. Sending JSON \
+        null as `allowed_models` clears the whitelist back to allow-all; \
+        an empty array does the same. This is also how a channel is enabled \
         or disabled.",
     security(("basic_auth" = [])),
     params(("id" = i64, Path, description = "Channel id", example = 1)),
@@ -386,7 +388,8 @@ pub async fn get_one(
             create", body = AdminErrorBody, example = json!({
             "error": "base_url must be an absolute http(s) URL: ftp://api.example.com"
         })),
-        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body"),
         (status = 404, description = "No channel with this id", body = AdminErrorBody, example = json!({
             "error": "channel not found"
         }))
@@ -441,13 +444,14 @@ pub async fn patch(
     tag = "Admin",
     operation_id = "delete_channel",
     summary = "Delete a channel",
-    description = "Removes the channel. A channel that still has client keys
+    description = "Removes the channel. A channel that still has client keys \
         bound to it refuses deletion with 409; disable it instead.",
     security(("basic_auth" = [])),
     params(("id" = i64, Path, description = "Channel id", example = 1)),
     responses(
         (status = 204, description = "Channel deleted, no body"),
-        (status = 401, description = "Missing or wrong admin credentials"),
+        (status = 401, description = "Missing or wrong admin credentials; \
+            the response carries a Basic challenge header and no body"),
         (status = 404, description = "No channel with this id", body = AdminErrorBody, example = json!({
             "error": "channel not found"
         })),

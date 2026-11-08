@@ -244,9 +244,20 @@ where
         })),
         (status = 502, description = "The bound channel is gone, or the \
             upstream could not be reached; other upstream statuses pass \
-            through unchanged", body = OpenAiError, example = json!({
-            "error": { "message": "Failed to connect to the upstream provider", "type": "api_error", "code": null }
-        })),
+            through unchanged", body = OpenAiError, examples(
+            ("upstream_unavailable" = (
+                summary = "The upstream request failed",
+                value = json!({
+                    "error": { "message": "Failed to connect to the upstream provider", "type": "api_error", "code": null }
+                })
+            )),
+            ("channel_gone" = (
+                summary = "The channel bound to the key no longer exists",
+                value = json!({
+                    "error": { "message": "The channel bound to this API key is unavailable", "type": "api_error", "code": null }
+                })
+            ))
+        )),
         (status = 503, description = "The channel bound to the key is \
             disabled; the key itself stays valid", body = OpenAiError, example = json!({
             "error": {
@@ -357,9 +368,20 @@ pub async fn chat_completions(
             "error": { "message": "This API key has been disabled", "type": "invalid_request_error", "code": "key_disabled" }
         })),
         (status = 502, description = "The upstream models listing could not \
-            be fetched, or the bound channel is gone", body = OpenAiError, example = json!({
-            "error": { "message": "Failed to connect to the upstream provider", "type": "api_error", "code": null }
-        })),
+            be fetched, or the bound channel is gone", body = OpenAiError, examples(
+            ("upstream_unavailable" = (
+                summary = "The upstream request failed",
+                value = json!({
+                    "error": { "message": "Failed to connect to the upstream provider", "type": "api_error", "code": null }
+                })
+            )),
+            ("channel_gone" = (
+                summary = "The channel bound to the key no longer exists",
+                value = json!({
+                    "error": { "message": "The channel bound to this API key is unavailable", "type": "api_error", "code": null }
+                })
+            ))
+        )),
         (status = 503, description = "The channel bound to the key is \
             disabled", body = OpenAiError, example = json!({
             "error": {
