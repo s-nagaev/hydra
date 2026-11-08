@@ -165,6 +165,8 @@ by design. Every mutating UI request is checked against same-origin browser
 metadata (`Sec-Fetch-Site` and `Origin`) and rejected with 403 when it is
 cross-site.
 
+![Channels page](docs/screenshots/channels.png)
+
 The channels and keys pages are fully usable: create and edit channels with
 the same validation messages the JSON API produces, enable or disable them,
 and delete them (a channel with bound keys refuses deletion with the count
@@ -186,6 +188,10 @@ range); the whole view state lives in the URL, so any filtered view can be
 reloaded, shared or revisited with the browser back button. Rows show
 colored status badges and a small "bodies" marker when request or response
 bodies were captured; body content itself is never rendered.
+
+![Keys page](docs/screenshots/keys.png)
+
+![Logs page](docs/screenshots/logs.png)
 
 ## Configuration
 
