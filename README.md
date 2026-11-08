@@ -9,7 +9,7 @@ forwards the request, and passes the response through unchanged, streaming
 included.
 
 Status: proof of concept. Chat Completions and `/v1/models` only, one admin
-user, no failover, quotas or UI.
+user, no failover or quotas.
 
 ## Features
 
@@ -154,6 +154,18 @@ routes) or a `hyd-` client key (`bearer_auth`, for the `/v1/*` routes), then
 "Try it out" works directly against the running instance. `GET /admin/health`
 needs no auth, neither in the UI nor from a client.
 
+## Admin UI
+
+A server-rendered admin UI lives at `/admin/ui`: open
+[http://127.0.0.1:8080/admin/ui](http://127.0.0.1:8080/admin/ui) and
+authenticate with the same Basic Auth credentials as the JSON API. Pages are
+compiled from askama templates with vendored htmx 2.0.11 (self-hosted, no
+CDN, no JavaScript build step) and a small custom stylesheet, desktop-first
+by design; the channels, keys and logs pages are still stubs while the
+management flows are being built on top of this layout. Every mutating UI
+request is checked against same-origin browser metadata (`Sec-Fetch-Site`
+and `Origin`) and rejected with 403 when it is cross-site.
+
 ## Configuration
 
 Configuration comes from environment variables. At startup the binary also
@@ -228,6 +240,11 @@ CI (`.github/workflows/ci.yml`) runs these three gates on Rust stable plus a
 Docker image build; it never pushes. `AGENTS.md` at the repo root documents the
 conventions that govern changes to this code, including commit format.
 
+The admin UI embeds `assets/htmx.min.js` (vendored htmx 2.0.11) and
+`assets/admin.css` into the binary via `include_bytes!`; to upgrade htmx,
+replace the file in `assets/` and update the version comment in
+`src/http/admin_ui.rs`.
+
 ## Roadmap
 
 None of this is implemented yet; it is where Hydra is meant to grow.
@@ -236,6 +253,5 @@ None of this is implemented yet; it is where Hydra is meant to grow.
 - Google request and response formats
 - Multi-channel keys: one key bound to several channels with failover
 - Quotas and budgets per key
-- Admin UI
 
 License: TBD.

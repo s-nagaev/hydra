@@ -9,6 +9,7 @@ mod admin_channels;
 mod admin_keys;
 mod admin_logs;
 mod admin_ui;
+mod csrf;
 mod docs;
 mod openai_error;
 mod proxy;

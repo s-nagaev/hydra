@@ -114,6 +114,7 @@ pub fn router() -> Router<AppState> {
         .route("/logs", get(logs))
         .route("/static/htmx.min.js", get(htmx_js))
         .route("/static/admin.css", get(admin_css))
+        .layer(axum::middleware::from_fn(crate::http::csrf::guard))
 }
 
 #[cfg(test)]
