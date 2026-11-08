@@ -73,13 +73,14 @@ fn map_key(row: &sqlx::sqlite::SqliteRow) -> sqlx::Result<ApiKey> {
 pub async fn create(pool: &SqlitePool, key: &NewKey) -> sqlx::Result<ApiKey> {
     let row = sqlx::query(&format!(
         "INSERT INTO api_keys (key_hash, display_prefix, name, channel_id, enabled, created_at) \
-         VALUES (?, ?, ?, ?, 1, datetime('now')) \
+         VALUES (?, ?, ?, ?, 1, ?) \
          RETURNING {SELECT_COLUMNS}"
     ))
     .bind(&key.key_hash)
     .bind(&key.display_prefix)
     .bind(&key.name)
     .bind(key.channel_id)
+    .bind(super::timestamp::now_utc())
     .fetch_one(pool)
     .await?;
     map_key(&row)
@@ -179,10 +180,11 @@ pub async fn patch(pool: &SqlitePool, id: i64, key_patch: &KeyPatch) -> sqlx::Re
 /// Soft delete: stamps `deleted_at` and leaves the row in place.
 pub async fn delete(pool: &SqlitePool, id: i64) -> sqlx::Result<DeleteOutcome> {
     let deleted_at: Option<Option<String>> = sqlx::query(
-        "UPDATE api_keys SET deleted_at = datetime('now') \
+        "UPDATE api_keys SET deleted_at = ? \
          WHERE id = ? AND deleted_at IS NULL \
          RETURNING deleted_at",
     )
+    .bind(super::timestamp::now_utc())
     .bind(id)
     .fetch_optional(pool)
     .await?

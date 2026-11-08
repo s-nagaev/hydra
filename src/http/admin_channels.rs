@@ -690,11 +690,12 @@ mod tests {
         let channel_id = created["id"].as_i64().unwrap();
         sqlx::query(
             "INSERT INTO api_keys (key_hash, display_prefix, channel_id, created_at) \
-             VALUES (?, ?, ?, datetime('now'))",
+             VALUES (?, ?, ?, ?)",
         )
         .bind("deadbeefhash")
         .bind("hyd-abcd")
         .bind(channel_id)
+        .bind(crate::db::timestamp::now_utc())
         .execute(&state.db)
         .await
         .unwrap();

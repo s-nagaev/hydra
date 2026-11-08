@@ -193,15 +193,8 @@ pub(crate) fn build_filters(query: RawLogQuery) -> Result<LogFilters, LogsError>
 fn sqlite_timestamp(raw: &str, label: &str) -> Result<String, LogsError> {
     let parsed = OffsetDateTime::parse(raw, &Rfc3339)
         .map_err(|_| LogsError::BadRequest(format!("{label} must be an RFC3339 timestamp")))?;
-    let utc = parsed.to_offset(UtcOffset::UTC);
-    Ok(format!(
-        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
-        utc.year(),
-        u8::from(utc.month()),
-        utc.day(),
-        utc.hour(),
-        utc.minute(),
-        utc.second()
+    Ok(crate::db::timestamp::format_utc(
+        parsed.to_offset(UtcOffset::UTC),
     ))
 }
 

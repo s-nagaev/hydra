@@ -7,7 +7,8 @@ use sqlx::sqlite::{SqlitePool, SqliteRow};
 use sqlx::{QueryBuilder, Row};
 
 /// A new request log row. `status` is the upstream HTTP status, or NULL when
-/// the request never reached the upstream; `created_at` is stamped by SQLite.
+/// the request never reached the upstream; `created_at` is stamped in the
+/// canonical UTC text format at insert time.
 pub struct NewRequestLog {
     pub api_key_id: i64,
     pub channel_id: i64,
@@ -28,7 +29,7 @@ pub async fn insert(pool: &SqlitePool, log: &NewRequestLog) -> sqlx::Result<()> 
         "INSERT INTO request_logs \
          (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
           duration_ms, request_body, response_body, error, created_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))",
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(log.api_key_id)
     .bind(log.channel_id)
@@ -40,6 +41,7 @@ pub async fn insert(pool: &SqlitePool, log: &NewRequestLog) -> sqlx::Result<()> 
     .bind(&log.request_body)
     .bind(&log.response_body)
     .bind(&log.error)
+    .bind(super::timestamp::now_utc())
     .execute(pool)
     .await?;
     Ok(())

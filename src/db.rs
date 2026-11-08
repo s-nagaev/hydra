@@ -6,6 +6,7 @@
 pub mod channels;
 pub mod keys;
 pub mod request_logs;
+pub mod timestamp;
 
 use std::str::FromStr;
 

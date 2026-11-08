@@ -79,13 +79,14 @@ pub async fn create(pool: &SqlitePool, channel: &NewChannel) -> sqlx::Result<Cha
     let allowed_json = allowed_models_json(channel.allowed_models.as_ref());
     let row = sqlx::query(&format!(
         "INSERT INTO channels (name, base_url, api_key, allowed_models, enabled, created_at) \
-         VALUES (?, ?, ?, ?, 1, datetime('now')) \
+         VALUES (?, ?, ?, ?, 1, ?) \
          RETURNING {SELECT_COLUMNS}"
     ))
     .bind(&channel.name)
     .bind(&channel.base_url)
     .bind(&channel.api_key)
     .bind(allowed_json)
+    .bind(super::timestamp::now_utc())
     .fetch_one(pool)
     .await?;
     map_channel(&row)
