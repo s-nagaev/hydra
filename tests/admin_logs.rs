@@ -70,6 +70,38 @@ async fn insert_log(
     error: Option<&str>,
     created_at: &str,
 ) -> i64 {
+    insert_status_log(
+        db,
+        key_id,
+        channel_id,
+        model,
+        Some(200),
+        Some(10),
+        Some(5),
+        request_body,
+        response_body,
+        error,
+        created_at,
+    )
+    .await
+}
+
+/// Inserts one row with full control over status and tokens; the shared
+/// shape the other helpers build on.
+#[allow(clippy::too_many_arguments)]
+async fn insert_status_log(
+    db: &SqlitePool,
+    key_id: i64,
+    channel_id: i64,
+    model: Option<&str>,
+    status: Option<i64>,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
+    request_body: Option<&str>,
+    response_body: Option<&str>,
+    error: Option<&str>,
+    created_at: &str,
+) -> i64 {
     within(
         sqlx::query(
             "INSERT INTO request_logs \
@@ -80,9 +112,9 @@ async fn insert_log(
         .bind(key_id)
         .bind(channel_id)
         .bind(model)
-        .bind(200i64)
-        .bind(10i64)
-        .bind(5i64)
+        .bind(status)
+        .bind(prompt_tokens)
+        .bind(completion_tokens)
         .bind(42i64)
         .bind(request_body)
         .bind(response_body)
@@ -441,4 +473,96 @@ async fn malformed_numeric_query_params_return_400() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let (status, _) = send_get_on(&db, "/admin/logs?channel_id=-1.5", Some(&auth_header())).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn status_class_filter_buckets_rows_by_upstream_status() {
+    let db = test_pool().await;
+    let (channel_id, key_id) = seed_channel_and_key(&db).await;
+    let ok_row = insert_status_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(1),
+        Some(1),
+        None,
+        None,
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+    let client_error_row = insert_status_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(404),
+        None,
+        None,
+        None,
+        None,
+        Some("upstream returned 404"),
+        "2026-11-07 10:01:00",
+    )
+    .await;
+    let server_error_row = insert_status_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(502),
+        None,
+        None,
+        None,
+        None,
+        Some("upstream returned 502"),
+        "2026-11-07 10:02:00",
+    )
+    .await;
+    // A transport failure: the request never reached the upstream, so the
+    // status is null but the row is still an error.
+    let transport_error_row = insert_status_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("upstream connection refused"),
+        "2026-11-07 10:03:00",
+    )
+    .await;
+
+    let (_, body) = send_get_on(&db, "/admin/logs?status_class=2xx", Some(&auth_header())).await;
+    assert_eq!(ids_of(&body), vec![ok_row]);
+
+    let (_, body) = send_get_on(&db, "/admin/logs?status_class=4xx", Some(&auth_header())).await;
+    assert_eq!(ids_of(&body), vec![client_error_row]);
+
+    let (_, body) = send_get_on(&db, "/admin/logs?status_class=5xx", Some(&auth_header())).await;
+    assert_eq!(ids_of(&body), vec![server_error_row]);
+
+    let (_, body) = send_get_on(&db, "/admin/logs?status_class=errors", Some(&auth_header())).await;
+    assert_eq!(
+        ids_of(&body),
+        vec![transport_error_row, server_error_row, client_error_row]
+    );
+
+    // Without the filter every row comes back.
+    let (_, body) = send_get_on(&db, "/admin/logs", Some(&auth_header())).await;
+    assert_eq!(body["total"], 4);
+}
+
+#[tokio::test]
+async fn invalid_status_class_returns_400() {
+    let db = test_pool().await;
+    let (status, body) =
+        send_get_on(&db, "/admin/logs?status_class=3xx", Some(&auth_header())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("status_class"));
 }

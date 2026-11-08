@@ -62,6 +62,30 @@ pub struct RequestLog {
     pub created_at: String,
 }
 
+/// Coarse bucket over the upstream HTTP status, used by the `status_class`
+/// filter of the admin listing. A row whose request never reached the
+/// upstream (null status) counts as an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusClass {
+    Ok2xx,
+    Client4xx,
+    Server5xx,
+    Errors,
+}
+
+impl StatusClass {
+    /// Parses the URL value; `None` means the value is not a known bucket.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "2xx" => Some(Self::Ok2xx),
+            "4xx" => Some(Self::Client4xx),
+            "5xx" => Some(Self::Server5xx),
+            "errors" => Some(Self::Errors),
+            _ => None,
+        }
+    }
+}
+
 /// Filters for the admin listing; every field is optional. `from` and `to`
 /// are inclusive bounds already normalized to the `YYYY-MM-DD HH:MM:SS` UTC
 /// text format the `created_at` column stores, so string comparison against
@@ -70,6 +94,7 @@ pub struct LogFilters {
     pub key_id: Option<i64>,
     pub channel_id: Option<i64>,
     pub model: Option<String>,
+    pub status_class: Option<StatusClass>,
     pub from: Option<String>,
     pub to: Option<String>,
     pub page: u64,
@@ -88,6 +113,29 @@ fn push_conditions(builder: &mut QueryBuilder<'_, sqlx::Sqlite>, filters: &LogFi
     }
     if let Some(model) = &filters.model {
         builder.push(" AND model = ").push_bind(model.clone());
+    }
+    if let Some(status_class) = filters.status_class {
+        match status_class {
+            StatusClass::Ok2xx => {
+                builder.push(" AND status >= ").push_bind(200i64);
+                builder.push(" AND status < ").push_bind(300i64);
+            }
+            StatusClass::Client4xx => {
+                builder.push(" AND status >= ").push_bind(400i64);
+                builder.push(" AND status < ").push_bind(500i64);
+            }
+            StatusClass::Server5xx => {
+                builder.push(" AND status >= ").push_bind(500i64);
+                builder.push(" AND status < ").push_bind(600i64);
+            }
+            // Failed transports have a null status and still count.
+            StatusClass::Errors => {
+                builder
+                    .push(" AND (status IS NULL OR status >= ")
+                    .push_bind(400i64);
+                builder.push(")");
+            }
+        }
     }
     if let Some(from) = &filters.from {
         builder.push(" AND created_at >= ").push_bind(from.clone());

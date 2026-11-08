@@ -255,7 +255,7 @@ mod tests {
         // optionality are exactly what the route is about.
         let logs = &doc["paths"]["/admin/logs"]["get"];
         let params = logs["parameters"].as_array().unwrap();
-        assert_eq!(params.len(), 7, "all seven log filters must be documented");
+        assert_eq!(params.len(), 8, "all eight log filters must be documented");
         for param in params {
             assert_eq!(
                 param["in"], "query",

@@ -16,13 +16,16 @@ use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 use utoipa::{IntoParams, ToSchema};
 
-use crate::db::request_logs::{self, LogFilters, RequestLog};
+use crate::db::request_logs::{self, LogFilters, RequestLog, StatusClass};
 use crate::http::admin_auth::AdminAuth;
 use crate::http::docs::AdminErrorBody;
 use crate::http::AppState;
 
 const DEFAULT_PAGE_SIZE: u64 = 50;
 const MAX_PAGE_SIZE: u64 = 500;
+
+/// Valid values of the status-class filter, phrased for error messages.
+pub(crate) const STATUS_CLASS_VALUES: &str = "`2xx`, `4xx`, `5xx`, `errors`";
 
 #[derive(Debug, thiserror::Error)]
 pub enum LogsError {
@@ -74,6 +77,11 @@ pub struct LogListQuery {
     #[serde(default)]
     #[param(example = "gpt-4o")]
     model: Option<String>,
+    /// Coarse status bucket: `2xx`, `4xx`, `5xx` or `errors` (which also
+    /// includes rows that never reached the upstream, i.e. null status).
+    #[serde(default)]
+    #[param(example = "2xx")]
+    status_class: Option<String>,
     /// Inclusive lower bound, RFC3339; compared as UTC.
     #[serde(default)]
     #[param(example = "2026-11-01T00:00:00Z")]
@@ -130,6 +138,54 @@ pub struct LogListResponse {
     pub total: i64,
 }
 
+/// Raw query values of the listing, shared by the JSON endpoint and the
+/// admin UI logs page so both validate and normalize identically.
+pub(crate) struct RawLogQuery {
+    pub page: Option<u64>,
+    pub page_size: Option<u64>,
+    pub key_id: Option<i64>,
+    pub channel_id: Option<i64>,
+    pub model: Option<String>,
+    pub status_class: Option<String>,
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// Validates the raw values and turns them into db-layer filters: time
+/// bounds are normalized to the stored UTC text format, the status class
+/// must be a known bucket, and page/page_size get defaults and caps.
+pub(crate) fn build_filters(query: RawLogQuery) -> Result<LogFilters, LogsError> {
+    let status_class = match query.status_class.as_deref() {
+        None | Some("") => None,
+        Some(raw) => Some(StatusClass::parse(raw).ok_or_else(|| {
+            LogsError::BadRequest(format!("status_class must be one of {STATUS_CLASS_VALUES}"))
+        })?),
+    };
+    let from = query
+        .from
+        .as_deref()
+        .map(|raw| sqlite_timestamp(raw, "from"))
+        .transpose()?;
+    let to = query
+        .to
+        .as_deref()
+        .map(|raw| sqlite_timestamp(raw, "to"))
+        .transpose()?;
+    Ok(LogFilters {
+        key_id: query.key_id,
+        channel_id: query.channel_id,
+        model: query.model,
+        status_class,
+        from,
+        to,
+        page: query.page.unwrap_or(1).max(1),
+        page_size: query
+            .page_size
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE),
+    })
+}
+
 /// Normalizes an RFC3339 timestamp to the `YYYY-MM-DD HH:MM:SS` UTC text
 /// format `created_at` stores, so the filter compares correctly and keeps
 /// the time-ordered index usable.
@@ -158,7 +214,9 @@ fn sqlite_timestamp(raw: &str, label: &str) -> Result<String, LogsError> {
         pagination and optional filters. `request_body` and `response_body` \
         are present on a row only when body capture (HYDRA_LOG_BODIES) was \
         on for that request; a row that never reached the upstream has a \
-        null `status` and its failure in `error`.",
+        null `status` and its failure in `error`. `status_class` buckets \
+        rows by upstream status (`2xx`, `4xx`, `5xx`, or `errors`, which \
+        also includes the rows with a null status).",
     security(("basic_auth" = [])),
     params(LogListQuery),
     responses(
@@ -195,28 +253,16 @@ pub async fn list(
     query: Result<Query<LogListQuery>, QueryRejection>,
 ) -> Result<Json<LogListResponse>, LogsError> {
     let Query(query) = query.map_err(|rejection| LogsError::BadRequest(rejection.body_text()))?;
-    let from = query
-        .from
-        .as_deref()
-        .map(|raw| sqlite_timestamp(raw, "from"))
-        .transpose()?;
-    let to = query
-        .to
-        .as_deref()
-        .map(|raw| sqlite_timestamp(raw, "to"))
-        .transpose()?;
-    let filters = LogFilters {
+    let filters = build_filters(RawLogQuery {
+        page: query.page,
+        page_size: query.page_size,
         key_id: query.key_id,
         channel_id: query.channel_id,
         model: query.model,
-        from,
-        to,
-        page: query.page.unwrap_or(1).max(1),
-        page_size: query
-            .page_size
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .clamp(1, MAX_PAGE_SIZE),
-    };
+        status_class: query.status_class,
+        from: query.from,
+        to: query.to,
+    })?;
 
     let (items, total) = request_logs::list(&state.db, &filters).await?;
     Ok(Json(LogListResponse {
