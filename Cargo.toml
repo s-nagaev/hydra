@@ -33,6 +33,8 @@ dotenvy = "0.15"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 utoipa = "6"
 utoipa-swagger-ui = { version = "10", features = ["axum", "vendored"] }
+askama = "0.16"
+askama_web = { version = "0.16", features = ["axum-0.8"] }
 
 [dev-dependencies]
 tokio-stream = "0.1"
