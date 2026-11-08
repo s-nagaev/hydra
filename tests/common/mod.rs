@@ -71,6 +71,7 @@ pub fn test_app(db: SqlitePool) -> AppState {
         client: http::upstream_client(),
         log_bodies: false,
         log_tracker: hydra::logging::LogTracker::default(),
+        cache: hydra::cache::ResolutionCache::default(),
     }
 }
 
@@ -87,6 +88,7 @@ pub fn test_app_logging(db: SqlitePool) -> AppState {
         client: http::upstream_client(),
         log_bodies: true,
         log_tracker: hydra::logging::LogTracker::default(),
+        cache: hydra::cache::ResolutionCache::default(),
     }
 }
 

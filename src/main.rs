@@ -27,6 +27,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         client: http::upstream_client(),
         log_bodies: cfg.log_bodies,
         log_tracker: LogTracker::default(),
+        cache: hydra::cache::ResolutionCache::default(),
     };
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;

@@ -43,6 +43,8 @@ pub struct AppState {
     pub log_bodies: bool,
     /// In-flight background log insert counter, drained on shutdown.
     pub log_tracker: crate::logging::LogTracker,
+    /// In-memory key→channel resolution cache; see `crate::cache`.
+    pub cache: crate::cache::ResolutionCache,
 }
 
 /// Builds the shared upstream client. Only the connect timeout lives here:
@@ -137,6 +139,7 @@ mod tests {
             client: upstream_client(),
             log_bodies: false,
             log_tracker: crate::logging::LogTracker::default(),
+            cache: crate::cache::ResolutionCache::default(),
         }
     }
 

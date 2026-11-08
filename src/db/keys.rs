@@ -13,6 +13,7 @@ use super::{Arg, Db, Fields, Row, Sql};
 
 /// A stored client API key row. `key_hash` is the SHA-256 hex of the full
 /// key string; the plaintext never reaches this layer.
+#[derive(Clone)]
 pub struct ApiKey {
     pub id: i64,
     // Consumed by the proxy bearer-key lookup (proxy task); admins never

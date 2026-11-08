@@ -56,6 +56,9 @@ pub struct Config {
     #[allow(dead_code)]
     pub admin_password: String,
     pub log_bodies: bool,
+    /// Lifetime of a key→channel cache entry, in seconds; 0 disables the
+    /// cache. Semantics live in [`crate::cache`].
+    pub cache_ttl_secs: u64,
 }
 
 impl fmt::Debug for Config {
@@ -68,6 +71,7 @@ impl fmt::Debug for Config {
             .field("admin_login", &self.admin_login)
             .field("admin_password", &"<redacted>")
             .field("log_bodies", &self.log_bodies)
+            .field("cache_ttl_secs", &self.cache_ttl_secs)
             .finish()
     }
 }
@@ -101,6 +105,13 @@ impl Config {
                 .map_err(|e| ConfigError::Invalid("HYDRA_LOG_BODIES", e.to_string()))?,
             Err(_) => false,
         };
+        let cache_ttl_secs = match env::var("HYDRA_CACHE_TTL_SECS") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| ConfigError::Invalid("HYDRA_CACHE_TTL_SECS", e.to_string()))?,
+            Err(_) => crate::cache::DEFAULT_TTL_SECS,
+        };
 
         Ok(Self {
             bind_addr,
@@ -108,6 +119,7 @@ impl Config {
             admin_login,
             admin_password,
             log_bodies,
+            cache_ttl_secs,
         })
     }
 }
@@ -175,6 +187,7 @@ mod tests {
         env::remove_var("HYDRA_DB_PATH");
         env::remove_var("HYDRA_DATABASE_URL");
         env::remove_var("HYDRA_LOG_BODIES");
+        env::remove_var("HYDRA_CACHE_TTL_SECS");
         env::set_var("HYDRA_ADMIN_LOGIN", "admin");
         env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
         let cfg = Config::from_env().unwrap();
@@ -184,6 +197,34 @@ mod tests {
         );
         assert_eq!(cfg.db, DbTarget::Sqlite("./hydra.db".to_string()));
         assert!(!cfg.log_bodies);
+        assert_eq!(cfg.cache_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn invalid_cache_ttl_is_rejected_with_reason() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+        env::remove_var("HYDRA_DATABASE_URL");
+        env::set_var("HYDRA_CACHE_TTL_SECS", "soon");
+        let err = Config::from_env().unwrap_err();
+        assert!(err.to_string().contains("HYDRA_CACHE_TTL_SECS"));
+
+        env::set_var("HYDRA_CACHE_TTL_SECS", "-1");
+        assert!(Config::from_env().is_err());
+        env::remove_var("HYDRA_CACHE_TTL_SECS");
+    }
+
+    #[test]
+    fn zero_cache_ttl_is_accepted_and_disables_the_cache() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+        env::remove_var("HYDRA_DATABASE_URL");
+        env::set_var("HYDRA_CACHE_TTL_SECS", "0");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.cache_ttl_secs, 0);
+        env::remove_var("HYDRA_CACHE_TTL_SECS");
     }
 
     #[test]
@@ -293,6 +334,7 @@ mod tests {
             admin_login: "admin".to_string(),
             admin_password: "sekret".to_string(),
             log_bodies: false,
+            cache_ttl_secs: 3600,
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("sekret"));

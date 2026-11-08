@@ -56,6 +56,7 @@ fn app_state(db: &Db) -> AppState {
         client: hydra::http::upstream_client(),
         log_bodies: false,
         log_tracker: hydra::logging::LogTracker::default(),
+        cache: hydra::cache::ResolutionCache::default(),
     }
 }
 

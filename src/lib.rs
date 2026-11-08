@@ -3,6 +3,7 @@
 //! a thin startup shell so `tests/` can drive the real router against an
 //! in-process mock upstream.
 
+pub mod cache;
 pub mod config;
 pub mod db;
 pub mod http;

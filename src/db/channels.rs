@@ -8,6 +8,7 @@ use super::{Arg, Db, Fields, Row, Sql};
 
 /// A stored channel row. `api_key` is the upstream secret and must never
 /// cross the HTTP boundary unmasked.
+#[derive(Clone)]
 pub struct Channel {
     pub id: i64,
     pub name: String,
