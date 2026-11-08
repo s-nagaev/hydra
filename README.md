@@ -45,6 +45,11 @@ cargo run
 The whitelist is optional; omit `allowed_models` to allow every model the
 upstream serves.
 
+The `base_url` may or may not end in `/v1`: Hydra forwards to
+`<base_url>/v1/chat/completions` and drops a redundant `/v1` tail on the
+stored URL, so both `https://api.openai.com` and the OpenAI-SDK style
+`https://api.openai.com/v1` reach the same upstream path.
+
 ```bash
 curl -u admin:change-me -X POST http://127.0.0.1:8080/admin/channels \
   -H 'Content-Type: application/json' \
