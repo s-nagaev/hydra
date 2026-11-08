@@ -19,7 +19,23 @@
 //! malformed header and for an unknown key, 403 for a disabled key, 500 for
 //! storage failures. The plaintext key never appears in a response or log
 //! line.
+//!
+//! Before any key lookup, requests carrying a resolvable client IP pass
+//! through the per-IP flood cap ([`crate::flood`]): admission reserves one
+//! budget slot in a single atomic step, so a parallel burst of requests
+//! from one IP can never all pass the gate against a stale counter — at
+//! most `HYDRA_FLOOD_LIMIT` requests per window are past the gate at the
+//! same time, and once the budget is spent every request from that IP,
+//! valid keys included, is answered [`ProxyAuthError::FloodCapped`] without
+//! touching the cache or the database. A reservation is released unless the
+//! request fails with an invalid key, so successes, disabled keys and
+//! storage failures leave the settled counter untouched. The capped
+//! response is byte-identical to the unknown-key 401, so the cap is not an
+//! oracle for key validity.
 
+use std::net::{IpAddr, SocketAddr};
+
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
@@ -28,6 +44,8 @@ use axum::response::{IntoResponse, Response};
 
 use crate::db::channels::{self, Channel};
 use crate::db::keys::{self, ApiKey};
+use crate::flood::{Admission, FloodTicket};
+use crate::http::client_ip;
 use crate::http::openai_error::openai_error;
 use crate::http::AppState;
 use crate::keys::sha256_hex;
@@ -43,6 +61,11 @@ pub struct ProxyAuth {
 #[error("proxy authentication failed")]
 pub enum ProxyAuthError {
     InvalidKey,
+    /// The client IP exhausted its failed-authentication budget; the
+    /// response is the same 401 an unknown key gets. The ticket binds the
+    /// rejection to the window the cap decision was made in, for the
+    /// single per-window log row.
+    FloodCapped(FloodTicket),
     DisabledKey,
     Database(#[from] sqlx::Error),
 }
@@ -50,7 +73,9 @@ pub enum ProxyAuthError {
 impl IntoResponse for ProxyAuthError {
     fn into_response(self) -> Response {
         match self {
-            ProxyAuthError::InvalidKey => openai_error(
+            // The flood-capped response is deliberately indistinguishable
+            // from the unknown-key one.
+            ProxyAuthError::InvalidKey | ProxyAuthError::FloodCapped(_) => openai_error(
                 StatusCode::UNAUTHORIZED,
                 "Invalid API key provided",
                 "invalid_request_error",
@@ -82,6 +107,50 @@ impl FromRequestParts<AppState> for ProxyAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        // Flood gate first: admission reserves one budget slot in a single
+        // atomic step, before any cache probe or database read. A parallel
+        // burst therefore cannot all pass the gate against a stale counter,
+        // and a capped IP costs neither a cache probe nor a database read.
+        // The gate needs the same client-IP resolution the log rows use, so
+        // it shares the trusted-proxy logic.
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|info| info.0);
+        let flood_ip: Option<IpAddr> = if state.flood.is_enabled() {
+            client_ip::resolve_ip(&parts.headers, peer, &state.trusted_proxies)
+        } else {
+            None
+        };
+        let flood_ticket = match flood_ip {
+            Some(ip) => match state.flood.admit(ip) {
+                Admission::Allowed(ticket) => Some(ticket),
+                Admission::Capped(ticket) => return Err(ProxyAuthError::FloodCapped(ticket)),
+            },
+            None => None,
+        };
+
+        let resolution = Self::resolve_key(parts, state).await;
+        match resolution {
+            // An invalid key is exactly the failure the budget counts: its
+            // admission slot settles into a recorded failure.
+            Err(ProxyAuthError::InvalidKey) => Err(ProxyAuthError::InvalidKey),
+            // Every other outcome releases the slot: successes, a disabled
+            // key (403) and storage failures must not feed the counter.
+            other => {
+                if let Some(ticket) = &flood_ticket {
+                    state.flood.release(ticket);
+                }
+                other
+            }
+        }
+    }
+}
+
+impl ProxyAuth {
+    /// Header parsing, cache probe and database resolution for one request,
+    /// after the flood gate has admitted it.
+    async fn resolve_key(parts: &mut Parts, state: &AppState) -> Result<Self, ProxyAuthError> {
         let header_value = parts
             .headers
             .get(AUTHORIZATION)

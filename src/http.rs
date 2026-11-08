@@ -49,6 +49,8 @@ pub struct AppState {
     /// Reverse-proxy networks trusted for `X-Forwarded-For` resolution;
     /// empty means every client is its direct peer address.
     pub trusted_proxies: crate::config::TrustedProxies,
+    /// Per-IP flood cap on failed authentications; see `crate::flood`.
+    pub flood: crate::flood::FloodCap,
 }
 
 /// Builds the shared upstream client. Only the connect timeout lives here:
@@ -146,6 +148,7 @@ mod tests {
             log_tracker: crate::logging::LogTracker::default(),
             cache: crate::cache::ResolutionCache::default(),
             trusted_proxies: crate::config::TrustedProxies::default(),
+            flood: crate::flood::FloodCap::default(),
         }
     }
 

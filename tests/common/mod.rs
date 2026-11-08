@@ -73,6 +73,7 @@ pub fn test_app(db: SqlitePool) -> AppState {
         log_tracker: hydra::logging::LogTracker::default(),
         cache: hydra::cache::ResolutionCache::default(),
         trusted_proxies: hydra::config::TrustedProxies::default(),
+        flood: hydra::flood::FloodCap::default(),
     }
 }
 
@@ -91,6 +92,7 @@ pub fn test_app_logging(db: SqlitePool) -> AppState {
         log_tracker: hydra::logging::LogTracker::default(),
         cache: hydra::cache::ResolutionCache::default(),
         trusted_proxies: hydra::config::TrustedProxies::default(),
+        flood: hydra::flood::FloodCap::default(),
     }
 }
 
@@ -112,6 +114,52 @@ pub fn test_app_with_trusted_proxies(
         log_tracker: hydra::logging::LogTracker::default(),
         cache: hydra::cache::ResolutionCache::default(),
         trusted_proxies,
+        flood: hydra::flood::FloodCap::default(),
+    }
+}
+
+/// Application state with an explicit flood cap, for tests that exercise
+/// the per-IP failed-authentication limit (production defaults are too
+/// large to reach in a test).
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
+pub fn test_app_with_flood(db: SqlitePool, flood_limit: u64, flood_window_secs: u64) -> AppState {
+    AppState {
+        db: hydra::db::Db::from(db),
+        admin_login: "admin".to_string(),
+        admin_password: "secret".to_string(),
+        client: http::upstream_client(),
+        log_bodies: false,
+        log_tracker: hydra::logging::LogTracker::default(),
+        cache: hydra::cache::ResolutionCache::default(),
+        trusted_proxies: hydra::config::TrustedProxies::default(),
+        flood: hydra::flood::FloodCap::new(flood_limit, flood_window_secs),
+    }
+}
+
+/// Application state with both an explicit flood cap and trusted-proxy
+/// networks, for flood tests that vary the resolved client IP through the
+/// `X-Forwarded-For` header behind a trusted loopback proxy.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
+pub fn test_app_with_flood_and_trusted_proxies(
+    db: SqlitePool,
+    flood_limit: u64,
+    flood_window_secs: u64,
+    trusted_proxies: hydra::config::TrustedProxies,
+) -> AppState {
+    AppState {
+        db: hydra::db::Db::from(db),
+        admin_login: "admin".to_string(),
+        admin_password: "secret".to_string(),
+        client: http::upstream_client(),
+        log_bodies: false,
+        log_tracker: hydra::logging::LogTracker::default(),
+        cache: hydra::cache::ResolutionCache::default(),
+        trusted_proxies,
+        flood: hydra::flood::FloodCap::new(flood_limit, flood_window_secs),
     }
 }
 

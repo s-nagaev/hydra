@@ -29,6 +29,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         log_tracker: LogTracker::default(),
         cache: hydra::cache::ResolutionCache::default(),
         trusted_proxies: cfg.trusted_proxies,
+        flood: hydra::flood::FloodCap::new(cfg.flood_limit, cfg.flood_window_secs),
     };
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;

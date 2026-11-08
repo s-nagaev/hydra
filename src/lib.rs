@@ -6,6 +6,7 @@
 pub mod cache;
 pub mod config;
 pub mod db;
+pub mod flood;
 pub mod http;
 pub mod keys;
 pub mod logging;

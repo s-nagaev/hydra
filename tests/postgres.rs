@@ -58,6 +58,7 @@ fn app_state(db: &Db) -> AppState {
         log_tracker: hydra::logging::LogTracker::default(),
         cache: hydra::cache::ResolutionCache::default(),
         trusted_proxies: hydra::config::TrustedProxies::default(),
+        flood: hydra::flood::FloodCap::default(),
     }
 }
 

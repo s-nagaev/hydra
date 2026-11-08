@@ -152,6 +152,12 @@ pub struct Config {
     /// Empty by default: every client is then attributed to its direct
     /// peer address.
     pub trusted_proxies: TrustedProxies,
+    /// Failed authentications per client IP per window before the flood
+    /// cap kicks in; `0` disables the cap. Semantics live in
+    /// [`crate::flood`].
+    pub flood_limit: u64,
+    /// Length of the flood-cap window, in seconds; must be at least 1.
+    pub flood_window_secs: u64,
 }
 
 impl fmt::Debug for Config {
@@ -166,6 +172,8 @@ impl fmt::Debug for Config {
             .field("log_bodies", &self.log_bodies)
             .field("cache_ttl_secs", &self.cache_ttl_secs)
             .field("trusted_proxies", &self.trusted_proxies)
+            .field("flood_limit", &self.flood_limit)
+            .field("flood_window_secs", &self.flood_window_secs)
             .finish()
     }
 }
@@ -211,6 +219,26 @@ impl Config {
                 .map_err(|reason| ConfigError::Invalid("HYDRA_TRUSTED_PROXIES", reason))?,
             Err(_) => TrustedProxies::default(),
         };
+        let flood_limit = match env::var("HYDRA_FLOOD_LIMIT") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| ConfigError::Invalid("HYDRA_FLOOD_LIMIT", e.to_string()))?,
+            Err(_) => crate::flood::DEFAULT_LIMIT,
+        };
+        let flood_window_secs = match env::var("HYDRA_FLOOD_WINDOW_SECS") {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .map_err(|e| ConfigError::Invalid("HYDRA_FLOOD_WINDOW_SECS", e.to_string()))?,
+            Err(_) => crate::flood::DEFAULT_WINDOW_SECS,
+        };
+        if flood_window_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "HYDRA_FLOOD_WINDOW_SECS",
+                "window must be at least 1 second".to_string(),
+            ));
+        }
 
         Ok(Self {
             bind_addr,
@@ -220,6 +248,8 @@ impl Config {
             log_bodies,
             cache_ttl_secs,
             trusted_proxies,
+            flood_limit,
+            flood_window_secs,
         })
     }
 }
@@ -288,6 +318,8 @@ mod tests {
         env::remove_var("HYDRA_DATABASE_URL");
         env::remove_var("HYDRA_LOG_BODIES");
         env::remove_var("HYDRA_CACHE_TTL_SECS");
+        env::remove_var("HYDRA_FLOOD_LIMIT");
+        env::remove_var("HYDRA_FLOOD_WINDOW_SECS");
         env::set_var("HYDRA_ADMIN_LOGIN", "admin");
         env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
         let cfg = Config::from_env().unwrap();
@@ -302,6 +334,8 @@ mod tests {
             cfg.trusted_proxies.is_empty(),
             "no trusted proxies by default"
         );
+        assert_eq!(cfg.flood_limit, 60);
+        assert_eq!(cfg.flood_window_secs, 60);
     }
 
     #[test]
@@ -508,11 +542,60 @@ mod tests {
             log_bodies: false,
             cache_ttl_secs: 3600,
             trusted_proxies: TrustedProxies::default(),
+            flood_limit: 60,
+            flood_window_secs: 60,
         };
         let shown = format!("{cfg:?}");
         assert!(!shown.contains("sekret"));
         assert!(!shown.contains("user@"));
         assert!(!shown.contains("postgres://user"));
         assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn flood_settings_default_and_parse_from_the_environment() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("HYDRA_BIND_ADDR");
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+        env::remove_var("HYDRA_DATABASE_URL");
+
+        env::set_var("HYDRA_FLOOD_LIMIT", "120");
+        env::set_var("HYDRA_FLOOD_WINDOW_SECS", "30");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.flood_limit, 120);
+        assert_eq!(cfg.flood_window_secs, 30);
+
+        // Zero limit disables the cap and must be accepted.
+        env::set_var("HYDRA_FLOOD_LIMIT", "0");
+        let cfg = Config::from_env().unwrap();
+        assert_eq!(cfg.flood_limit, 0);
+
+        env::remove_var("HYDRA_FLOOD_LIMIT");
+        env::remove_var("HYDRA_FLOOD_WINDOW_SECS");
+    }
+
+    #[test]
+    fn invalid_flood_settings_abort_naming_the_variable() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("HYDRA_BIND_ADDR");
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+        env::remove_var("HYDRA_DATABASE_URL");
+
+        for (var, value) in [
+            ("HYDRA_FLOOD_LIMIT", "soon"),
+            ("HYDRA_FLOOD_LIMIT", "-1"),
+            ("HYDRA_FLOOD_WINDOW_SECS", "0"),
+            ("HYDRA_FLOOD_WINDOW_SECS", "half a minute"),
+        ] {
+            env::set_var(var, value);
+            let err = Config::from_env().unwrap_err();
+            assert!(
+                err.to_string().contains(var),
+                "{var}={value} must abort with the variable named"
+            );
+            env::remove_var(var);
+        }
     }
 }

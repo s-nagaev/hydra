@@ -53,16 +53,15 @@ const X_FORWARDED_FOR: &str = "x-forwarded-for";
 /// Resolves the client IP for one request: the direct peer unless the peer
 /// is a trusted proxy, in which case the first untrusted hop of the
 /// `X-Forwarded-For` chain. `None` when the connection's peer address is
-/// unavailable. The returned value is always a single parsed address string
-/// (or a truncated direct-peer text), never raw header content.
-pub fn resolve(
+/// unavailable.
+pub fn resolve_ip(
     headers: &HeaderMap,
     peer: Option<SocketAddr>,
     trusted: &TrustedProxies,
-) -> Option<String> {
+) -> Option<IpAddr> {
     let peer = peer?;
     if !trusted.contains(peer.ip()) {
-        return Some(capped(peer.ip().to_string()));
+        return Some(peer.ip());
     }
     let untrusted = headers
         .get(X_FORWARDED_FOR)
@@ -81,7 +80,17 @@ pub fn resolve(
                     .filter(|ip| !trusted.contains(*ip))
             })
         });
-    Some(capped(untrusted.unwrap_or(peer.ip()).to_string()))
+    Some(untrusted.unwrap_or(peer.ip()))
+}
+
+/// Text form of [`resolve_ip`], capped in length. The returned value is
+/// always a single parsed address string, never raw header content.
+pub fn resolve(
+    headers: &HeaderMap,
+    peer: Option<SocketAddr>,
+    trusted: &TrustedProxies,
+) -> Option<String> {
+    resolve_ip(headers, peer, trusted).map(|ip| capped(ip.to_string()))
 }
 
 /// Caps the stored value so nothing arbitrarily long can ever land in the

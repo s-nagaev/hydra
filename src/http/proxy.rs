@@ -18,8 +18,12 @@
 //! fail the client flow. Rejections are logged too, auth-layer ones
 //! included (they resolve to no key, so their rows carry NULL ids); the
 //! only unloggable case is the 413 body-limit rejection, which happens in
-//! the body extractor before any handler code runs. `/v1/models` is a
-//! lightweight discovery endpoint and is not logged.
+//! the body extractor before any handler code runs. Anonymous 401 spam is
+//! additionally flood-capped per client IP before the key lookup
+//! ([`crate::flood`]); the capped phase answers the same 401 without
+//! touching the database and contributes at most one log row per window
+//! per IP. `/v1/models` is a lightweight discovery endpoint and is not
+//! logged.
 
 use std::time::{Duration, Instant};
 
@@ -32,6 +36,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::db::channels::Channel;
+use crate::flood::FloodTicket;
 use crate::http::client_ip;
 use crate::http::docs::OpenAiError;
 use crate::http::openai_error::openai_error;
@@ -297,6 +302,10 @@ pub async fn chat_completions(
     let client_ip = client_ip::resolve(&headers, peer.0, &state.trusted_proxies);
     let auth = match auth {
         Ok(auth) => auth,
+        Err(ProxyAuthError::FloodCapped(ticket)) => {
+            log_flood_cap_rejection(&state, start, &body, client_ip, &ticket);
+            return Ok(ProxyAuthError::FloodCapped(ticket).into_response());
+        }
         Err(e) => {
             log_auth_rejection(&state, start, &body, client_ip, &e);
             return Ok(e.into_response());
@@ -649,8 +658,12 @@ fn chat_log_context(
 
 /// Writes the audit row for a request rejected by the auth layer (401
 /// unknown key, 403 disabled key, key lookup failure). The caller never
-/// resolved to a key row, so the row carries no key or channel ids; the
-/// failure text mirrors the response body the client received.
+/// resolved to a key row, so the row carries no key or channel ids. The
+/// stored failure text mirrors the message the client body carries for the
+/// InvalidKey and DisabledKey arms; the Database arm stores the internal
+/// error detail (`proxy key lookup failed: ...`) while the client only
+/// ever sees a generic 500 body, so the log keeps the diagnostic detail
+/// the response deliberately omits.
 fn log_auth_rejection(
     state: &AppState,
     start: Instant,
@@ -670,12 +683,52 @@ fn log_auth_rejection(
         client_ip,
     });
     let (status, message) = match error {
-        ProxyAuthError::InvalidKey => (Some(401), "Invalid API key provided".to_string()),
+        ProxyAuthError::InvalidKey | ProxyAuthError::FloodCapped(_) => {
+            (Some(401), "Invalid API key provided".to_string())
+        }
         ProxyAuthError::DisabledKey => (Some(403), "This API key has been disabled".to_string()),
         // A storage failure answers 500 without reaching the upstream.
         ProxyAuthError::Database(e) => (None, format!("proxy key lookup failed: {e}")),
     };
     ctx.finish(status, None, None, None, Some(message));
+}
+
+/// Writes the audit row for a flood-capped request: at most one row per
+/// window per IP, claimed through the flood cap with the ticket the capped
+/// decision produced, so a sustained spam wave cannot produce a log row per
+/// request and a claim can never leak into the next window. The row carries
+/// the 401 the client received (identical to the unknown-key response), no
+/// key or channel ids, and the resolved client IP. The row does not reset
+/// or otherwise touch the failure counter; the window expiry is the only
+/// reset.
+fn log_flood_cap_rejection(
+    state: &AppState,
+    start: Instant,
+    body: &Bytes,
+    client_ip: Option<String>,
+    ticket: &FloodTicket,
+) {
+    if !state.flood.claim_log_slot(ticket) {
+        return;
+    }
+    let ctx = ChatLogContext::new(ChatLogInit {
+        db: &state.db,
+        tracker: &state.log_tracker,
+        log_bodies: state.log_bodies,
+        api_key_id: None,
+        channel_id: None,
+        model: None,
+        start,
+        request_body: body,
+        client_ip,
+    });
+    ctx.finish(
+        Some(401),
+        None,
+        None,
+        None,
+        Some("flood cap: too many failed authentications from this address".to_string()),
+    );
 }
 
 /// Writes the audit row for an authenticated chat request rejected before

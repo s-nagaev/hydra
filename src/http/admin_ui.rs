@@ -104,6 +104,7 @@ mod tests {
             log_tracker: crate::logging::LogTracker::default(),
             cache: crate::cache::ResolutionCache::default(),
             trusted_proxies: crate::config::TrustedProxies::default(),
+            flood: crate::flood::FloodCap::default(),
         }
     }
 
