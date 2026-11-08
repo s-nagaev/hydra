@@ -12,6 +12,7 @@ mod admin_ui;
 mod admin_ui_channels;
 mod admin_ui_keys;
 mod admin_ui_logs;
+mod client_ip;
 mod csrf;
 mod docs;
 mod openai_error;
@@ -45,6 +46,9 @@ pub struct AppState {
     pub log_tracker: crate::logging::LogTracker,
     /// In-memory key→channel resolution cache; see `crate::cache`.
     pub cache: crate::cache::ResolutionCache,
+    /// Reverse-proxy networks trusted for `X-Forwarded-For` resolution;
+    /// empty means every client is its direct peer address.
+    pub trusted_proxies: crate::config::TrustedProxies,
 }
 
 /// Builds the shared upstream client. Only the connect timeout lives here:
@@ -140,6 +144,7 @@ mod tests {
             log_bodies: false,
             log_tracker: crate::logging::LogTracker::default(),
             cache: crate::cache::ResolutionCache::default(),
+            trusted_proxies: crate::config::TrustedProxies::default(),
         }
     }
 

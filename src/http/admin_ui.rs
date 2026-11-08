@@ -103,6 +103,7 @@ mod tests {
             log_bodies: false,
             log_tracker: crate::logging::LogTracker::default(),
             cache: crate::cache::ResolutionCache::default(),
+            trusted_proxies: crate::config::TrustedProxies::default(),
         }
     }
 

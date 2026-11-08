@@ -81,6 +81,7 @@
         <th>Status</th>
         <th>Tokens</th>
         <th>Duration (ms)</th>
+        <th>Client IP</th>
         <th>Bodies</th>
         <th>Error</th>
       </tr>
@@ -88,7 +89,7 @@
     <tbody>
       {% if rows.is_empty() %}
       <tr>
-        <td colspan="9" class="empty-state">{{ empty_message }}</td>
+        <td colspan="10" class="empty-state">{{ empty_message }}</td>
       </tr>
       {% else %}
       {% for row in rows %}
@@ -100,6 +101,7 @@
         <td><span class="badge {{ row.status_css }}">{{ row.status_text }}</span></td>
         <td class="mono">{{ row.tokens }}</td>
         <td class="mono">{{ row.duration_ms }}</td>
+        <td class="mono">{% if let Some(ip) = row.client_ip %}{{ ip }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
         <td>{% if row.has_bodies %}<span class="badge bodies" title="Request and/or response bodies were captured">bodies</span>{% else %}<span class="text-muted">-</span>{% endif %}</td>
         <td class="error-cell">{% if let Some(full) = row.error_full %}<span title="{{ full }}">{% if let Some(shown) = row.error_shown %}{{ shown }}{% endif %}</span>{% else %}<span class="text-muted">-</span>{% endif %}</td>
       </tr>

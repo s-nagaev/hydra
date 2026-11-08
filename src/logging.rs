@@ -78,6 +78,8 @@ pub struct ChatLogInit<'a> {
     pub model: Option<String>,
     pub start: Instant,
     pub request_body: &'a [u8],
+    /// Resolved client IP, absent when no peer address was available.
+    pub client_ip: Option<String>,
 }
 
 /// Everything the detached log task needs about one chat request. Built in
@@ -91,6 +93,7 @@ pub struct ChatLogContext {
     model: Option<String>,
     start: Instant,
     request_body: Option<String>,
+    client_ip: Option<String>,
 }
 
 impl ChatLogContext {
@@ -106,6 +109,7 @@ impl ChatLogContext {
             request_body: init
                 .log_bodies
                 .then(|| capture_to_string(init.request_body)),
+            client_ip: init.client_ip,
         }
     }
 
@@ -139,6 +143,7 @@ impl ChatLogContext {
                 request_body: self.request_body,
                 response_body,
                 error,
+                client_ip: self.client_ip,
             },
         );
     }
@@ -423,12 +428,13 @@ mod tests {
                 request_body: None,
                 response_body: None,
                 error: None,
+                client_ip: Some("198.51.100.5".to_string()),
             },
         );
         wait_until_drained(&tracker).await;
         assert_eq!(tracker.inflight(), 0);
 
-        let row = sqlx::query("SELECT model, status, prompt_tokens FROM request_logs")
+        let row = sqlx::query("SELECT model, status, prompt_tokens, client_ip FROM request_logs")
             .fetch_one(&pool)
             .await
             .unwrap();
@@ -440,6 +446,10 @@ mod tests {
         assert_eq!(
             row.try_get::<Option<i64>, _>("prompt_tokens").unwrap(),
             Some(3)
+        );
+        assert_eq!(
+            row.try_get::<Option<String>, _>("client_ip").unwrap(),
+            Some("198.51.100.5".to_string())
         );
     }
 
@@ -463,6 +473,7 @@ mod tests {
                 request_body: None,
                 response_body: None,
                 error: None,
+                client_ip: None,
             },
         );
         wait_until_drained(&tracker).await;

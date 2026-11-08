@@ -467,3 +467,49 @@ async fn page_beyond_the_last_one_renders_the_empty_state_with_correct_meta() {
     assert!(body.contains(">1</a>"));
     assert!(!body.contains("class=\"current\">2"));
 }
+
+#[tokio::test]
+async fn client_ip_column_renders_the_ip_or_a_dash() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, duration_ms, client_ip, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key_id)
+        .bind(channel_id)
+        .bind("gpt-4o")
+        .bind(200i64)
+        .bind(42i64)
+        .bind("198.51.100.5")
+        .bind("2026-11-07 10:00:00")
+        .execute(&db),
+    )
+    .await
+    .unwrap();
+    within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, duration_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key_id)
+        .bind(channel_id)
+        .bind("gpt-4o")
+        .bind(200i64)
+        .bind(42i64)
+        .bind("2026-11-07 10:01:00")
+        .execute(&db),
+    )
+    .await
+    .unwrap();
+
+    let (status, body) = get_page(&db, "/admin/ui/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Client IP"));
+    assert!(body.contains("198.51.100.5"));
+    // The row without a captured IP shows the muted dash placeholder.
+    assert!(body.contains(r#"<td class="mono"><span class="text-muted">-</span></td>"#));
+}

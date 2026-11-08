@@ -72,6 +72,7 @@ pub fn test_app(db: SqlitePool) -> AppState {
         log_bodies: false,
         log_tracker: hydra::logging::LogTracker::default(),
         cache: hydra::cache::ResolutionCache::default(),
+        trusted_proxies: hydra::config::TrustedProxies::default(),
     }
 }
 
@@ -89,7 +90,49 @@ pub fn test_app_logging(db: SqlitePool) -> AppState {
         log_bodies: true,
         log_tracker: hydra::logging::LogTracker::default(),
         cache: hydra::cache::ResolutionCache::default(),
+        trusted_proxies: hydra::config::TrustedProxies::default(),
     }
+}
+
+/// Application state with the given trusted-proxy networks, for tests that
+/// exercise X-Forwarded-For resolution behind a trusted proxy.
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
+pub fn test_app_with_trusted_proxies(
+    db: SqlitePool,
+    trusted_proxies: hydra::config::TrustedProxies,
+) -> AppState {
+    AppState {
+        db: hydra::db::Db::from(db),
+        admin_login: "admin".to_string(),
+        admin_password: "secret".to_string(),
+        client: http::upstream_client(),
+        log_bodies: false,
+        log_tracker: hydra::logging::LogTracker::default(),
+        cache: hydra::cache::ResolutionCache::default(),
+        trusted_proxies,
+    }
+}
+
+/// Serves the router on an ephemeral loopback port with ConnectInfo, the
+/// production wiring: handlers can then see the peer address, which the
+/// `oneshot` path cannot provide. Returns the base URL (no trailing slash).
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
+pub async fn spawn_hydra_with_connect_info(app: AppState) -> String {
+    let listener = within(TcpListener::bind("127.0.0.1:0")).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            hydra::http::router(app).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    format!("http://{addr}")
 }
 
 /// Spawns the mock upstream on an ephemeral port and returns its base URL

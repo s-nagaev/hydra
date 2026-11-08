@@ -29,6 +29,7 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::db::channels::Channel;
+use crate::http::client_ip;
 use crate::http::docs::OpenAiError;
 use crate::http::openai_error::openai_error;
 use crate::http::proxy_auth::ProxyAuth;
@@ -281,13 +282,16 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     auth: ProxyAuth,
     headers: HeaderMap,
+    // Absent ConnectInfo (in-process oneshot requests) simply logs no IP.
+    peer: client_ip::PeerAddr,
     ChatBody(body): ChatBody,
 ) -> Result<Response, ProxyError> {
     let start = Instant::now();
+    let client_ip = client_ip::resolve(&headers, peer.0, &state.trusted_proxies);
     let (model, stream_requested) = match peek_request(&body) {
         Ok(peeked) => peeked,
         Err(e) => {
-            log_rejection(&state, &auth, None, start, &body, &e);
+            log_rejection(&state, &auth, None, start, &body, client_ip, &e);
             return Err(e);
         }
     };
@@ -297,13 +301,13 @@ pub async fn chat_completions(
         // log write; ChannelGone and ChannelDisabled are client-visible
         // routing failures that still get their audit row.
         Err(e @ (ProxyError::ChannelGone | ProxyError::ChannelDisabled)) => {
-            log_rejection(&state, &auth, Some(model), start, &body, &e);
+            log_rejection(&state, &auth, Some(model), start, &body, client_ip, &e);
             return Err(e);
         }
         Err(e) => return Err(e),
     };
     if let Err(e) = ensure_model_allowed(&channel, &model) {
-        log_rejection(&state, &auth, Some(model), start, &body, &e);
+        log_rejection(&state, &auth, Some(model), start, &body, client_ip, &e);
         return Err(e);
     }
 
@@ -326,7 +330,7 @@ pub async fn chat_completions(
 
     // Built before the body is handed to the forwarder: it already holds
     // whatever request bytes body logging will ever capture.
-    let ctx = chat_log_context(&state, &auth, Some(model), start, &body);
+    let ctx = chat_log_context(&state, &auth, Some(model), start, &body, client_ip);
     let upstream = match request.body(body).send().await {
         Ok(upstream) => upstream,
         Err(e) => {
@@ -614,6 +618,7 @@ fn chat_log_context(
     model: Option<String>,
     start: Instant,
     body: &Bytes,
+    client_ip: Option<String>,
 ) -> ChatLogContext {
     ChatLogContext::new(ChatLogInit {
         db: &state.db,
@@ -624,6 +629,7 @@ fn chat_log_context(
         model,
         start,
         request_body: body,
+        client_ip,
     })
 }
 
@@ -637,9 +643,10 @@ fn log_rejection(
     model: Option<String>,
     start: Instant,
     body: &Bytes,
+    client_ip: Option<String>,
     error: &ProxyError,
 ) {
-    let ctx = chat_log_context(state, auth, model, start, body);
+    let ctx = chat_log_context(state, auth, model, start, body, client_ip);
     ctx.finish(None, None, None, None, Some(error.to_string()));
 }
 

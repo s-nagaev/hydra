@@ -23,13 +23,14 @@ pub struct NewRequestLog {
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,
+    pub client_ip: Option<String>,
 }
 
 /// Inserts one log row. The caller runs this on a detached task; failures
 /// are reported through tracing, never to the proxied client.
 pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
     let mut sql = Sql::for_db(db);
-    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, duration_ms, request_body, response_body, error, created_at) VALUES (")
+    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, duration_ms, request_body, response_body, error, client_ip, created_at) VALUES (")
         .bind(Arg::Int(log.api_key_id))
         .push(", ")
         .bind(Arg::Int(log.channel_id))
@@ -49,6 +50,8 @@ pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
         .bind(Arg::Text(log.response_body.clone()))
         .push(", ")
         .bind(Arg::Text(log.error.clone()))
+        .push(", ")
+        .bind(Arg::Text(log.client_ip.clone()))
         .push(", ")
         .bind(Arg::Text(Some(timestamp::now_utc())))
         .push(")");
@@ -70,6 +73,7 @@ pub struct RequestLog {
     pub request_body: Option<String>,
     pub response_body: Option<String>,
     pub error: Option<String>,
+    pub client_ip: Option<String>,
     pub created_at: String,
 }
 
@@ -171,6 +175,7 @@ fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
         request_body: row.opt_text("request_body")?,
         response_body: row.opt_text("response_body")?,
         error: row.opt_text("error")?,
+        client_ip: row.opt_text("client_ip")?,
         created_at: row.text("created_at")?,
     })
 }
@@ -186,7 +191,8 @@ pub async fn list(db: &Db, filters: &LogFilters) -> sqlx::Result<(Vec<RequestLog
     let mut page = Sql::for_db(db);
     page.push(
         "SELECT id, api_key_id, channel_id, model, status, prompt_tokens, \
-         completion_tokens, duration_ms, request_body, response_body, error, created_at \
+         completion_tokens, duration_ms, request_body, response_body, error, \
+         client_ip, created_at \
          FROM request_logs WHERE ",
     );
     push_conditions(&mut page, filters);

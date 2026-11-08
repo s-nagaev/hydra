@@ -106,6 +106,9 @@ pub struct RequestLogView {
     pub duration_ms: i64,
     pub error: Option<String>,
     pub created_at: String,
+    /// Resolved client IP; null when no peer address was available for the
+    /// request or the row predates IP capture.
+    pub client_ip: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub request_body: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -125,6 +128,7 @@ impl From<RequestLog> for RequestLogView {
             duration_ms: log.duration_ms,
             error: log.error,
             created_at: log.created_at,
+            client_ip: log.client_ip,
             request_body: log.request_body,
             response_body: log.response_body,
         }
@@ -226,7 +230,8 @@ fn sqlite_timestamp(raw: &str, label: &str) -> Result<String, LogsError> {
                     "completion_tokens": 34,
                     "duration_ms": 845,
                     "error": null,
-                    "created_at": "2026-11-07 23:59:59"
+                    "created_at": "2026-11-07 23:59:59",
+                    "client_ip": "203.0.113.7"
                 }
             ],
             "page": 1,
