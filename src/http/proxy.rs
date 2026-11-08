@@ -56,8 +56,8 @@ pub enum ProxyError {
     BadRequest(String),
     #[error("the chat request body exceeded the body limit")]
     PayloadTooLarge,
-    #[error("model {0} is not allowed by the channel whitelist")]
-    ModelNotAllowed(String),
+    #[error("model {model} is not allowed by the channel whitelist (allowed: {allowed})", allowed = allowed.join(", "))]
+    ModelNotAllowed { model: String, allowed: Vec<String> },
     #[error("the channel bound to this API key does not exist")]
     ChannelGone,
     #[error("the channel bound to this API key is disabled")]
@@ -86,9 +86,13 @@ impl IntoResponse for ProxyError {
                 "invalid_request_error",
                 None,
             ),
-            ProxyError::ModelNotAllowed(model) => openai_error(
+            ProxyError::ModelNotAllowed { model, allowed } => openai_error(
                 StatusCode::NOT_FOUND,
-                &format!("The model `{model}` does not exist or you do not have access to it."),
+                &format!(
+                    "The model `{model}` does not exist or you do not have access to it. \
+                     Allowed models for this channel: {}",
+                    allowed.join(", ")
+                ),
                 "invalid_request_error",
                 Some("model_not_found"),
             ),
@@ -473,14 +477,20 @@ fn peek_request(body: &Bytes) -> Result<(String, bool), ProxyError> {
 }
 
 /// A NULL or empty whitelist allows every model; otherwise the requested
-/// model must match a whitelist entry exactly.
+/// model must match a whitelist entry exactly. A miss carries the whitelist
+/// into the error so the client sees which models would work.
 fn ensure_model_allowed(channel: &Channel, model: &str) -> Result<(), ProxyError> {
     match channel.allowed_models.as_deref() {
-        Some(models) if !models.is_empty() => models
-            .iter()
-            .any(|allowed| allowed == model)
-            .then_some(())
-            .ok_or_else(|| ProxyError::ModelNotAllowed(model.to_string())),
+        Some(models) if !models.is_empty() => {
+            if models.iter().any(|allowed| allowed == model) {
+                Ok(())
+            } else {
+                Err(ProxyError::ModelNotAllowed {
+                    model: model.to_string(),
+                    allowed: models.to_vec(),
+                })
+            }
+        }
         _ => Ok(()),
     }
 }
@@ -695,7 +705,8 @@ mod tests {
         assert!(ensure_model_allowed(&channel, "gpt-4o").is_ok());
         assert!(matches!(
             ensure_model_allowed(&channel, "gpt-4"),
-            Err(ProxyError::ModelNotAllowed(model)) if model == "gpt-4"
+            Err(ProxyError::ModelNotAllowed { model, allowed })
+                if model == "gpt-4" && allowed == vec!["gpt-4o".to_string()]
         ));
     }
 

@@ -6,6 +6,7 @@ mod common;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
+use sqlx::Row;
 use tower::ServiceExt;
 
 use hydra::http::router;
@@ -172,7 +173,12 @@ async fn malformed_chat_body_returns_400_openai_error() {
 async fn non_whitelisted_model_returns_404_model_not_found() {
     let db = common::test_pool().await;
     let base = common::unreachable_base_url().await;
-    let channel_id = common::seed_channel(&db, &base, Some(vec!["gpt-4o".to_string()])).await;
+    let channel_id = common::seed_channel(
+        &db,
+        &base,
+        Some(vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]),
+    )
+    .await;
     let key = common::seed_key(&db, channel_id).await;
     let app = common::test_app(db);
 
@@ -181,9 +187,14 @@ async fn non_whitelisted_model_returns_404_model_not_found() {
     let error = error_json(&body)["error"].clone();
     assert_eq!(error["type"], "invalid_request_error");
     assert_eq!(error["code"], "model_not_found");
+    let message = error["message"].as_str().unwrap();
     assert!(
-        error["message"].as_str().unwrap().contains("gpt-3.5-turbo"),
+        message.contains("gpt-3.5-turbo"),
         "message must name the model: {error}"
+    );
+    assert!(
+        message.contains("Allowed models for this channel: gpt-4o, gpt-4o-mini"),
+        "message must list the channel's allowed models: {error}"
     );
 }
 
@@ -378,6 +389,34 @@ async fn upstream_500_error_passes_through_verbatim() {
     );
 }
 
+/// A whitelisted model that the upstream itself rejects with 404 must come
+/// back as the upstream's own body verbatim, not Hydra's model_not_found:
+/// the whitelist admitted the model, so the miss is the upstream's.
+#[tokio::test]
+async fn upstream_404_error_passes_through_verbatim() {
+    let db = common::test_pool().await;
+    let recorder = Recorder::default();
+    let upstream_error = br#"{"error":{"message":"The model 'gpt-4o' does not exist","type":"invalid_request_error","param":null,"code":"model_not_found"}}"#;
+    let base = common::spawn_upstream(fixed_response_router(
+        recorder.clone(),
+        StatusCode::NOT_FOUND,
+        "application/json",
+        upstream_error.to_vec(),
+    ))
+    .await;
+    let channel_id = common::seed_channel(&db, &base, Some(vec!["gpt-4o".to_string()])).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db);
+
+    let (status, _, body) = send(app, chat_request(&key, chat_body("gpt-4o", false))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        &body[..],
+        &upstream_error[..],
+        "an upstream 404 must pass through verbatim, not become Hydra's model_not_found"
+    );
+}
+
 #[tokio::test]
 async fn upstream_unreachable_returns_502_openai_error() {
     let db = common::test_pool().await;
@@ -398,6 +437,66 @@ async fn upstream_unreachable_returns_502_openai_error() {
             .contains("upstream"),
         "message must say the upstream is unavailable: {error}"
     );
+}
+
+/// Route-level miss: a trailing slash never matches the route, so axum
+/// answers a bare 404 with an empty body and no handler runs — nothing is
+/// logged. This pins the third 404 class (distinct from Hydra's
+/// model_not_found and from upstream passthrough).
+#[tokio::test]
+async fn trailing_slash_chat_uri_returns_bare_404_without_log_row() {
+    let db = common::test_pool().await;
+    let base = common::unreachable_base_url().await;
+    let channel_id = common::seed_channel(&db, &base, Some(vec!["gpt-4o".to_string()])).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db.clone());
+
+    let request = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions/")
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(chat_body("gpt-4o", false)))
+        .unwrap();
+    let (status, _, body) = send(app, request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(
+        body.is_empty(),
+        "the router-level 404 has no handler-produced body"
+    );
+    let rows: i64 = within(sqlx::query("SELECT COUNT(*) AS n FROM request_logs").fetch_one(&db))
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap();
+    assert_eq!(rows, 0, "a route miss must not leave a log row");
+}
+
+/// Wrong method: GET on the chat route is a 405 from the method router,
+/// also without a log row.
+#[tokio::test]
+async fn get_on_chat_uri_returns_405_without_log_row() {
+    let db = common::test_pool().await;
+    let base = common::unreachable_base_url().await;
+    let channel_id = common::seed_channel(&db, &base, Some(vec!["gpt-4o".to_string()])).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db.clone());
+
+    let request = Request::builder()
+        .method("GET")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {key}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, body) = send(app, request).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert!(body.is_empty());
+    let rows: i64 = within(sqlx::query("SELECT COUNT(*) AS n FROM request_logs").fetch_one(&db))
+        .await
+        .unwrap()
+        .try_get("n")
+        .unwrap();
+    assert_eq!(rows, 0, "a method miss must not leave a log row");
 }
 
 #[tokio::test]
