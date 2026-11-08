@@ -382,6 +382,9 @@ async fn update(
         };
         return panel(&state, Some(form), None, None).await;
     }
+    // Invalidate every entry bound to the channel before and after: the
+    // edit form can rotate base_url and the upstream api_key together.
+    state.cache.invalidate_channel(id);
     match channels::update(
         &state.db,
         id,
@@ -395,7 +398,10 @@ async fn update(
     )
     .await
     {
-        Ok(Some(_)) => panel(&state, None, None, None).await,
+        Ok(Some(_)) => {
+            state.cache.invalidate_channel(id);
+            panel(&state, None, None, None).await
+        }
         Ok(None) => panel(&state, None, Some("channel not found".to_string()), None).await,
         Err(e) => panel(&state, None, Some(internal_error(&e)), None).await,
     }
@@ -418,6 +424,7 @@ async fn toggle(
         )
         .await;
     };
+    state.cache.invalidate_channel(id);
     match channels::update(
         &state.db,
         id,
@@ -431,7 +438,10 @@ async fn toggle(
     )
     .await
     {
-        Ok(Some(_)) => panel(&state, None, None, None).await,
+        Ok(Some(_)) => {
+            state.cache.invalidate_channel(id);
+            panel(&state, None, None, None).await
+        }
         Ok(None) => panel(&state, None, Some("channel not found".to_string()), None).await,
         Err(e) => panel(&state, None, Some(internal_error(&e)), None).await,
     }
@@ -445,8 +455,12 @@ async fn delete(
     _auth: AdminAuth,
     Path(id): Path<i64>,
 ) -> ChannelsPanel {
+    state.cache.invalidate_channel(id);
     match channels::delete(&state.db, id).await {
-        Ok(DeleteOutcome::Deleted) => panel(&state, None, None, None).await,
+        Ok(DeleteOutcome::Deleted) => {
+            state.cache.invalidate_channel(id);
+            panel(&state, None, None, None).await
+        }
         Ok(DeleteOutcome::NotFound) => {
             panel(&state, None, Some("channel not found".to_string()), None).await
         }

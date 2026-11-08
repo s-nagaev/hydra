@@ -355,6 +355,10 @@ pub async fn patch(
             return Err(KeysError::BadRequest("name must not be empty".to_string()));
         }
     }
+    // Explicit invalidation before and after the write: the first drop
+    // keeps a stale entry from being served mid-mutation, the second clears
+    // anything a concurrent request re-filled from the pre-write database.
+    state.cache.invalidate_key(id);
     match keys::patch(
         &state.db,
         id,
@@ -365,7 +369,10 @@ pub async fn patch(
     )
     .await?
     {
-        PatchOutcome::Updated(key) => Ok(Json(key.into())),
+        PatchOutcome::Updated(key) => {
+            state.cache.invalidate_key(id);
+            Ok(Json(key.into()))
+        }
         PatchOutcome::NotFound => Err(KeysError::NotFound("key not found".to_string())),
         PatchOutcome::Deleted => Err(KeysError::Conflict(
             "key is deleted and cannot be edited".to_string(),
@@ -402,8 +409,14 @@ pub async fn delete(
     _auth: AdminAuth,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, KeysError> {
+    // Invalidate before and after, so a deleted key stops authenticating
+    // immediately even if a concurrent request re-filled its entry.
+    state.cache.invalidate_key(id);
     match keys::delete(&state.db, id).await? {
-        DeleteOutcome::Deleted => Ok(StatusCode::NO_CONTENT),
+        DeleteOutcome::Deleted => {
+            state.cache.invalidate_key(id);
+            Ok(StatusCode::NO_CONTENT)
+        }
         DeleteOutcome::AlreadyDeleted => {
             Err(KeysError::Conflict("key is already deleted".to_string()))
         }

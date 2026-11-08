@@ -1,12 +1,19 @@
 //! Bearer-key authentication for the proxy routes.
 //!
 //! [`ProxyAuth`] extracts `Authorization: Bearer <key>`, hashes the full
-//! key string (prefix included) and resolves it to an alive row through
-//! `find_alive_by_hash`; soft-deleted keys never authenticate. Rejections
-//! use the OpenAI error shape shared by all proxy routes: 401 for a
-//! missing or malformed header and for an unknown key, 403 for a disabled
-//! key, 500 for storage failures. The plaintext key never appears in a
-//! response or log line.
+//! key string (prefix included) and resolves the alive key row plus its
+//! bound channel. Soft-deleted keys never authenticate. A fresh
+//! [`ResolutionCache`](crate::cache::ResolutionCache) hit answers both
+//! lookups without touching the database; a miss (or expired entry) reads
+//! the database and, when the key is alive and its channel enabled, fills
+//! the cache. Only successful resolutions are cached: unknown or disabled
+//! keys and gone or disabled channels keep hitting the database, so admin
+//! disables — which invalidate explicitly — are the only staleness risk,
+//! and the TTL only bounds out-of-band database edits. Rejections use the
+//! OpenAI error shape shared by all proxy routes: 401 for a missing or
+//! malformed header and for an unknown key, 403 for a disabled key, 500 for
+//! storage failures. The plaintext key never appears in a response or log
+//! line.
 
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
@@ -14,14 +21,17 @@ use axum::http::request::Parts;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
+use crate::db::channels::{self, Channel};
 use crate::db::keys::{self, ApiKey};
 use crate::http::openai_error::openai_error;
 use crate::http::AppState;
 use crate::keys::sha256_hex;
 
-/// Extractor carrying the authenticated client key row.
+/// Extractor carrying the authenticated client key row plus its resolved
+/// bound channel: `channel` is `None` only when the channel row is gone.
 pub struct ProxyAuth {
     pub key: ApiKey,
+    pub channel: Option<Channel>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -73,14 +83,31 @@ impl FromRequestParts<AppState> for ProxyAuth {
             .and_then(|value| value.to_str().ok())
             .ok_or(ProxyAuthError::InvalidKey)?;
         let token = parse_bearer(header_value).ok_or(ProxyAuthError::InvalidKey)?;
-        let key = keys::find_alive_by_hash(&state.db, &sha256_hex(token.as_bytes()))
+        let key_hash = sha256_hex(token.as_bytes());
+
+        // Fresh hit: both the key and the channel come from memory and the
+        // database is not consulted at all. A cached entry exists only for
+        // an alive key on an enabled channel, so no further checks apply.
+        if let Some(cached) = state.cache.get(&key_hash) {
+            return Ok(ProxyAuth {
+                key: cached.key,
+                channel: Some(cached.channel),
+            });
+        }
+
+        let key = keys::find_alive_by_hash(&state.db, &key_hash)
             .await?
             .ok_or(ProxyAuthError::InvalidKey)?;
-        if key.enabled {
-            Ok(ProxyAuth { key })
-        } else {
-            Err(ProxyAuthError::DisabledKey)
+        if !key.enabled {
+            return Err(ProxyAuthError::DisabledKey);
         }
+        let channel = channels::find(&state.db, key.channel_id).await?;
+        if let Some(channel) = &channel {
+            if channel.enabled {
+                state.cache.insert(key_hash, key.clone(), channel.clone());
+            }
+        }
+        Ok(ProxyAuth { key, channel })
     }
 }
 

@@ -281,6 +281,9 @@ async fn toggle(
         )
         .await;
     };
+    // Same invalidation contract as the JSON API: before and after the
+    // write, so the toggle is instant for cached proxy traffic.
+    state.cache.invalidate_key(id);
     match keys::patch(
         &state.db,
         id,
@@ -291,7 +294,10 @@ async fn toggle(
     )
     .await
     {
-        Ok(PatchOutcome::Updated(_)) => panel(&state, None, None, None).await,
+        Ok(PatchOutcome::Updated(_)) => {
+            state.cache.invalidate_key(id);
+            panel(&state, None, None, None).await
+        }
         Ok(PatchOutcome::NotFound) => {
             panel(&state, None, Some("key not found".to_string()), None).await
         }
@@ -311,8 +317,12 @@ async fn toggle(
 /// Soft delete: the key stops authenticating, the row and its request logs
 /// stay. The confirm dialog on the button spells that out.
 async fn delete(State(state): State<AppState>, _auth: AdminAuth, Path(id): Path<i64>) -> KeysPanel {
+    state.cache.invalidate_key(id);
     match keys::delete(&state.db, id).await {
-        Ok(DeleteOutcome::Deleted) => panel(&state, None, None, None).await,
+        Ok(DeleteOutcome::Deleted) => {
+            state.cache.invalidate_key(id);
+            panel(&state, None, None, None).await
+        }
         Ok(DeleteOutcome::NotFound) => {
             panel(&state, None, Some("key not found".to_string()), None).await
         }

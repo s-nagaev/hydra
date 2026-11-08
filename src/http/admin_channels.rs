@@ -433,6 +433,10 @@ pub async fn patch(
         None => None,
         Some(inner) => Some(validate_allowed_models(inner.as_deref())?),
     };
+    // Invalidate every cached entry bound to this channel before and after
+    // the write: a rotated base_url or upstream api_key must take effect at
+    // once, not when the entries expire.
+    state.cache.invalidate_channel(id);
     let channel = channels::update(
         &state.db,
         id,
@@ -446,6 +450,7 @@ pub async fn patch(
     )
     .await?
     .ok_or(AdminError::NotFound)?;
+    state.cache.invalidate_channel(id);
     Ok(Json(channel.into()))
 }
 
@@ -476,8 +481,12 @@ pub async fn delete(
     _auth: AdminAuth,
     Path(id): Path<i64>,
 ) -> Result<StatusCode, AdminError> {
+    state.cache.invalidate_channel(id);
     match channels::delete(&state.db, id).await? {
-        DeleteOutcome::Deleted => Ok(StatusCode::NO_CONTENT),
+        DeleteOutcome::Deleted => {
+            state.cache.invalidate_channel(id);
+            Ok(StatusCode::NO_CONTENT)
+        }
         DeleteOutcome::NotFound => Err(AdminError::NotFound),
         DeleteOutcome::HasBoundKeys => Err(AdminError::Conflict(
             "channel has bound API keys; disable it instead".to_string(),

@@ -28,7 +28,7 @@ use axum::Json;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::db::channels::{self, Channel};
+use crate::db::channels::Channel;
 use crate::http::docs::OpenAiError;
 use crate::http::openai_error::openai_error;
 use crate::http::proxy_auth::ProxyAuth;
@@ -282,7 +282,7 @@ pub async fn chat_completions(
             return Err(e);
         }
     };
-    let channel = match resolve_channel(&state, &auth).await {
+    let channel = match resolve_channel(&auth) {
         Ok(channel) => channel,
         // When the database itself is failing there is no point attempting a
         // log write; ChannelGone and ChannelDisabled are client-visible
@@ -397,7 +397,7 @@ pub async fn models(
     auth: ProxyAuth,
     headers: HeaderMap,
 ) -> Result<Response, ProxyError> {
-    let channel = resolve_channel(&state, &auth).await?;
+    let channel = resolve_channel(&auth)?;
     match channel.allowed_models.as_deref() {
         Some(models) if !models.is_empty() => Ok(local_model_list(models)),
         _ => {
@@ -485,15 +485,14 @@ fn ensure_model_allowed(channel: &Channel, model: &str) -> Result<(), ProxyError
     }
 }
 
-/// Loads the channel bound to the authenticated key. The FK plus the
-/// bound-keys delete guard make a missing row nearly impossible; if it does
-/// happen the caller sees a 502 rather than a panic or silent fallback.
-/// A disabled channel keeps its keys and their log history but must not
-/// serve traffic; its callers see a 503 so the key itself stays valid.
-async fn resolve_channel(state: &AppState, auth: &ProxyAuth) -> Result<Channel, ProxyError> {
-    let channel = channels::find(&state.db, auth.key.channel_id)
-        .await?
-        .ok_or(ProxyError::ChannelGone)?;
+/// Returns the channel resolved during authentication (cache hit or the
+/// database read that filled the cache). The FK plus the bound-keys delete
+/// guard make a missing row nearly impossible; if it does happen the caller
+/// sees a 502 rather than a panic or silent fallback. A disabled channel
+/// keeps its keys and their log history but must not serve traffic; its
+/// callers see a 503 so the key itself stays valid.
+fn resolve_channel(auth: &ProxyAuth) -> Result<Channel, ProxyError> {
+    let channel = auth.channel.clone().ok_or(ProxyError::ChannelGone)?;
     if !channel.enabled {
         return Err(ProxyError::ChannelDisabled);
     }
