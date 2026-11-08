@@ -94,7 +94,7 @@
       {% else %}
       {% for row in rows %}
       <tr>
-        <td class="mono">{{ row.created_at }}</td>
+        <td class="mono"><a class="row-link" href="{{ row.detail_url }}" title="Open request #{{ row.id }}">{{ row.created_at }}</a></td>
         <td class="mono">{{ row.key_prefix }}</td>
         <td>{{ row.channel_name }}</td>
         <td>{% if let Some(model) = row.model %}{{ model }}{% else %}<span class="text-muted">-</span>{% endif %}</td>

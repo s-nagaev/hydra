@@ -1,5 +1,7 @@
-//! Admin UI logs page: a read-only, server-rendered table over
-//! `request_logs` with server-side pagination and filters.
+//! Admin UI logs pages: a read-only, server-rendered table over
+//! `request_logs` with server-side pagination and filters, plus a
+//! per-row drill-down page (`GET /admin/ui/logs/{id}`) that shows the
+//! full stored picture of one request.
 //!
 //! The page reuses the exact query construction of the JSON endpoint
 //! `GET /admin/logs` ([`build_filters`]), so the UI cannot drift from the
@@ -15,7 +17,8 @@ use std::collections::HashMap;
 use askama::Template;
 use askama_web::WebTemplate;
 use axum::extract::rejection::QueryRejection;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
@@ -58,8 +61,11 @@ pub struct LogsQuery {
 }
 
 /// One row of the rendered table; body content never reaches this view,
-/// only the fact that bodies were captured.
+/// only the fact that bodies were captured. `detail_url` points at the
+/// drill-down page and carries the whole list view state, so the back
+/// link on that page restores the exact page and filters.
 pub struct LogRow {
+    pub id: i64,
     pub created_at: String,
     pub key_prefix: String,
     pub channel_name: String,
@@ -72,6 +78,7 @@ pub struct LogRow {
     pub error_full: Option<String>,
     pub error_shown: Option<String>,
     pub has_bodies: bool,
+    pub detail_url: String,
 }
 
 /// One option of a filter select, with the preselection flag.
@@ -109,6 +116,31 @@ pub struct LogsPage {
     pub to_value: String,
     pub refresh_url: String,
     pub empty_message: String,
+    pub error: Option<String>,
+}
+
+/// The drill-down page for one request log. Bodies arrive already
+/// formatted (pretty JSON when parseable, raw text otherwise); Askama
+/// escapes whatever is rendered, so no markup can become live HTML.
+#[derive(Template, WebTemplate)]
+#[template(path = "log_detail.html")]
+pub struct LogDetailPage {
+    pub version: &'static str,
+    pub section: &'static str,
+    pub id: i64,
+    pub created_at: String,
+    pub key_label: String,
+    pub channel_label: String,
+    pub model: Option<String>,
+    pub status_text: String,
+    pub status_css: String,
+    pub tokens: String,
+    pub duration_ms: i64,
+    pub client_ip: Option<String>,
+    pub log_error: Option<String>,
+    pub request_body: Option<String>,
+    pub response_body: Option<String>,
+    pub back_url: String,
     pub error: Option<String>,
 }
 
@@ -255,6 +287,42 @@ fn truncate(text: &str, max_chars: usize) -> String {
     }
 }
 
+/// The display label for the key of a log row. `None` means the request
+/// was rejected before its key resolved (unknown key 401, lookup
+/// failure): no key to name. An id missing from the live key list (the
+/// key was since deleted) falls back to the bare row id.
+fn key_label(key_names: &HashMap<i64, String>, api_key_id: Option<i64>) -> String {
+    match api_key_id {
+        Some(id) => key_names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{id}")),
+        None => "unknown key".to_string(),
+    }
+}
+
+/// The display label for the channel of a log row, same conventions as
+/// [`key_label`]; `channel_id` is NULL exactly when `api_key_id` is.
+fn channel_label(channel_names: &HashMap<i64, String>, channel_id: Option<i64>) -> String {
+    match channel_id {
+        Some(id) => channel_names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{id}")),
+        None => "unknown channel".to_string(),
+    }
+}
+
+/// Prepares a stored body for display: pretty-printed when it parses as
+/// JSON, the stored text otherwise. Askama escapes the result, so hostile
+/// markup stays inert on the page.
+fn body_view(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|value| serde_json::to_string_pretty(&value).ok())
+        .unwrap_or_else(|| raw.to_string())
+}
+
 fn thousands(value: i64) -> String {
     let digits = value.abs().to_string();
     let mut out = String::new();
@@ -271,11 +339,14 @@ fn thousands(value: i64) -> String {
     }
 }
 
-/// Builds the URL for a pagination or refresh link, carrying the whole
-/// filter state plus the given page. Empty values are dropped so shared
-/// URLs stay clean.
-fn view_url(query: &LogsQuery, page: u64) -> String {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+/// Appends the whole list view state (filters plus the given page) to a
+/// URL serializer. Shared by the pagination, refresh and detail links so
+/// all of them carry the identical URL shape.
+fn push_view_state(
+    serializer: &mut url::form_urlencoded::Serializer<String>,
+    query: &LogsQuery,
+    page: u64,
+) {
     let mut push = |name: &str, value: Option<&str>| {
         if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
             serializer.append_pair(name, value);
@@ -290,8 +361,24 @@ fn view_url(query: &LogsQuery, page: u64) -> String {
     push("preset", query.preset.as_deref());
     push("from", query.from.as_deref());
     push("to", query.to.as_deref());
+}
 
+/// Builds the URL for a pagination or refresh link, carrying the whole
+/// filter state plus the given page. Empty values are dropped so shared
+/// URLs stay clean.
+fn view_url(query: &LogsQuery, page: u64) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    push_view_state(&mut serializer, query, page);
     format!("/admin/ui/logs?{}", serializer.finish())
+}
+
+/// Builds the drill-down URL for one row: the whole list view state (the
+/// effective page included) rides along, so the back link on the detail
+/// page restores the exact page and filters the user came from.
+fn detail_url(query: &LogsQuery, page: u64, id: i64) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    push_view_state(&mut serializer, query, page);
+    format!("/admin/ui/logs/{id}?{}", serializer.finish())
 }
 
 /// Everything the page needs from the database; the filters come back too,
@@ -516,23 +603,10 @@ fn build_page(query: &LogsQuery, data: LogsData, error: Option<String>) -> LogsP
                 None => (None, None),
             };
             LogRow {
+                id: log.id,
                 created_at: log.created_at.clone(),
-                key_prefix: match log.api_key_id {
-                    Some(id) => key_names
-                        .get(&id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("#{id}")),
-                    // The request was rejected before its key resolved
-                    // (unknown key 401, lookup failure): no key to name.
-                    None => "unknown key".to_string(),
-                },
-                channel_name: match log.channel_id {
-                    Some(id) => channel_names
-                        .get(&id)
-                        .cloned()
-                        .unwrap_or_else(|| format!("#{id}")),
-                    None => "unknown channel".to_string(),
-                },
+                key_prefix: key_label(&key_names, log.api_key_id),
+                channel_name: channel_label(&channel_names, log.channel_id),
                 model: log.model.clone(),
                 status_text,
                 status_css,
@@ -542,6 +616,7 @@ fn build_page(query: &LogsQuery, data: LogsData, error: Option<String>) -> LogsP
                 error_full,
                 error_shown,
                 has_bodies: log.request_body.is_some() || log.response_body.is_some(),
+                detail_url: detail_url(query, page, log.id),
             }
         })
         .collect();
@@ -670,8 +745,114 @@ pub async fn page(
     }
 }
 
+/// Builds the drill-down page for one stored log row, resolving the
+/// key/channel labels the same way the listing does.
+async fn build_detail(state: &AppState, log: RequestLog, back_url: String) -> LogDetailPage {
+    let key_list = keys::list(&state.db).await.unwrap_or_default();
+    let channel_list = channels::list(&state.db).await.unwrap_or_default();
+    let key_names: HashMap<i64, String> = key_list
+        .iter()
+        .map(|key| {
+            let label = match &key.name {
+                Some(name) => format!("{} {}", key.display_prefix, name),
+                None => key.display_prefix.clone(),
+            };
+            (key.id, label)
+        })
+        .collect();
+    let channel_names: HashMap<i64, String> = channel_list
+        .iter()
+        .map(|channel| (channel.id, channel.name.clone()))
+        .collect();
+    let (status_text, status_css) = status_view(log.status);
+    LogDetailPage {
+        version: env!("CARGO_PKG_VERSION"),
+        section: "logs",
+        id: log.id,
+        created_at: log.created_at,
+        key_label: key_label(&key_names, log.api_key_id),
+        channel_label: channel_label(&channel_names, log.channel_id),
+        model: log.model,
+        status_text,
+        status_css,
+        tokens: tokens_view(log.prompt_tokens, log.completion_tokens),
+        duration_ms: log.duration_ms,
+        client_ip: log.client_ip,
+        log_error: log.error,
+        request_body: log.request_body.as_deref().map(body_view),
+        response_body: log.response_body.as_deref().map(body_view),
+        back_url,
+        error: None,
+    }
+}
+
+/// A detail page that only carries the banner (row not found, database
+/// failure, bad query): metadata stays on dashes, bodies on placeholders.
+fn empty_detail(id: i64, back_url: String, message: String) -> LogDetailPage {
+    LogDetailPage {
+        version: env!("CARGO_PKG_VERSION"),
+        section: "logs",
+        id,
+        created_at: String::new(),
+        key_label: String::new(),
+        channel_label: String::new(),
+        model: None,
+        status_text: String::new(),
+        status_css: String::new(),
+        tokens: String::new(),
+        duration_ms: 0,
+        client_ip: None,
+        log_error: None,
+        request_body: None,
+        response_body: None,
+        back_url,
+        error: Some(message),
+    }
+}
+
+/// The effective page of a list view state, for the back link. An absent
+/// or malformed `page` falls back to the first page.
+fn back_page(query: &LogsQuery) -> u64 {
+    trimmed(query.page.as_ref())
+        .and_then(|page| page.parse::<u64>().ok())
+        .unwrap_or(1)
+}
+
+/// GET /admin/ui/logs/{id}: the drill-down page for one request log. The
+/// list view state rides in the query string so the back link restores
+/// the exact page and filters the user came from. Read-only, like the
+/// listing, so nothing sits under the CSRF guard. The query string only
+/// shapes the back link: a malformed one never hides a stored row.
+pub async fn detail(
+    State(state): State<AppState>,
+    _auth: AdminAuth,
+    Path(id): Path<i64>,
+    query: Result<Query<LogsQuery>, QueryRejection>,
+) -> (StatusCode, LogDetailPage) {
+    let back_url = match query {
+        Ok(Query(query)) => view_url(&query, back_page(&query)),
+        Err(_) => "/admin/ui/logs".to_string(),
+    };
+    match request_logs::find(&state.db, id).await {
+        Ok(Some(log)) => (StatusCode::OK, build_detail(&state, log, back_url).await),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            empty_detail(id, back_url, "request log not found".to_string()),
+        ),
+        Err(e) => {
+            tracing::error!(error = %e, "admin ui log detail query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                empty_detail(id, back_url, "internal server error".to_string()),
+            )
+        }
+    }
+}
+
 /// Read-only routes for the `/admin/ui` nest; no POSTs, so nothing new
 /// sits under the CSRF guard.
 pub fn router() -> Router<AppState> {
-    Router::new().route("/logs", get(page))
+    Router::new()
+        .route("/logs", get(page))
+        .route("/logs/{id}", get(detail))
 }

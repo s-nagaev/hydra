@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}Log #{{ id }}{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>Request log #{{ id }}</h1>
+    <a class="button" href="{{ back_url }}">Back to logs</a>
+  </div>
+
+  {% if let Some(message) = error %}
+  <div class="error-banner" role="alert">{{ message }}</div>
+  {% endif %}
+
+  <table class="data-table detail-meta">
+    <tbody>
+      <tr>
+        <th scope="row">Time (UTC)</th>
+        <td class="mono">{{ created_at }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Key</th>
+        <td class="mono">{{ key_label }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Channel</th>
+        <td>{{ channel_label }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Model</th>
+        <td>{% if let Some(model) = model %}{{ model }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+      </tr>
+      <tr>
+        <th scope="row">Status</th>
+        <td>{% if !status_text.is_empty() %}<span class="badge {{ status_css }}">{{ status_text }}</span>{% else %}<span class="text-muted">-</span>{% endif %}</td>
+      </tr>
+      <tr>
+        <th scope="row">Tokens</th>
+        <td class="mono">{{ tokens }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Duration (ms)</th>
+        <td class="mono">{{ duration_ms }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Client IP</th>
+        <td class="mono">{% if let Some(ip) = client_ip %}{{ ip }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+      </tr>
+      {% if let Some(message) = log_error %}
+      <tr>
+        <th scope="row">Error</th>
+        <td class="detail-error">{{ message }}</td>
+      </tr>
+      {% endif %}
+    </tbody>
+  </table>
+
+  <h2 class="snippet-label">Request body</h2>
+  {% if let Some(body) = request_body %}
+  <pre class="code-snippet">{{ body }}</pre>
+  {% else %}
+  <p class="text-muted">Bodies were not captured for this request. Body capture is opt-in via HYDRA_LOG_BODIES=1.</p>
+  {% endif %}
+
+  <h2 class="snippet-label">Response body</h2>
+  {% if let Some(body) = response_body %}
+  <pre class="code-snippet">{{ body }}</pre>
+  {% else %}
+  <p class="text-muted">Bodies were not captured for this request. Body capture is opt-in via HYDRA_LOG_BODIES=1.</p>
+  {% endif %}
+</section>
+{% endblock %}

@@ -541,3 +541,215 @@ async fn rejection_rows_with_null_ids_render_placeholder_labels() {
     assert!(body.contains("unknown channel"));
     assert!(body.contains("Invalid API key provided"));
 }
+
+// --- Detail drill-down ----------------------------------------------------
+
+/// Inserts a rejection-style row with NULL key and channel ids.
+async fn insert_rejection_log(db: &SqlitePool, error: &str, created_at: &str) -> i64 {
+    within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
+              duration_ms, request_body, response_body, error, created_at) \
+             VALUES (NULL, NULL, NULL, 401, NULL, NULL, 1, NULL, NULL, ?, ?)",
+        )
+        .bind(error)
+        .bind(created_at)
+        .execute(db),
+    )
+    .await
+    .unwrap()
+    .last_insert_rowid()
+}
+
+#[tokio::test]
+async fn detail_page_renders_metadata_and_pretty_json_bodies() {
+    let db = test_pool().await;
+    let (channel_id, key_id, prefix) = seed_channel_and_key(&db).await;
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(10),
+        Some(5),
+        Some(r#"{"prompt":"super-secret-prompt-42"}"#),
+        Some(r#"{"reply":"super-secret-reply-42"}"#),
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(&format!("Request log #{log_id}")));
+    assert!(body.contains(prefix.as_str()));
+    assert!(body.contains("gpt-4o"));
+    assert!(body.contains("badge status-2xx"));
+    assert!(body.contains("10 / 5"));
+    // Pretty-printed JSON: the newline, indentation and the space after
+    // the colon exist only in the rendered form, the stored text is flat.
+    assert!(body.contains("{\n  &#34;prompt&#34;: &#34;super-secret-prompt-42&#34;\n}"));
+    assert!(body.contains("&#34;reply&#34;: &#34;super-secret-reply-42&#34;"));
+    assert!(!body.contains("Bodies were not captured"));
+}
+
+#[tokio::test]
+async fn detail_page_without_bodies_shows_the_capture_placeholder() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        None,
+        None,
+        None,
+        None,
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body.matches("Bodies were not captured").count(),
+        2,
+        "both body sections must carry the placeholder: {body}"
+    );
+}
+
+#[tokio::test]
+async fn detail_page_shows_error_and_client_ip() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let log_id = within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, duration_ms, error, client_ip, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key_id)
+        .bind(channel_id)
+        .bind("gpt-4o")
+        .bind(502i64)
+        .bind(42i64)
+        .bind("upstream returned 502")
+        .bind("198.51.100.5")
+        .bind("2026-11-07 10:00:00")
+        .execute(&db),
+    )
+    .await
+    .unwrap()
+    .last_insert_rowid();
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("badge status-5xx"));
+    assert!(body.contains("upstream returned 502"));
+    assert!(body.contains("198.51.100.5"));
+}
+
+#[tokio::test]
+async fn detail_page_with_null_key_and_channel_renders_placeholders() {
+    let db = test_pool().await;
+    seed_channel_and_key(&db).await;
+    let log_id = insert_rejection_log(&db, "Invalid API key provided", "2026-11-08 10:00:00").await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("unknown key"));
+    assert!(body.contains("unknown channel"));
+    assert!(body.contains("Invalid API key provided"));
+    assert!(body.contains("badge status-4xx"));
+}
+
+#[tokio::test]
+async fn unknown_log_id_renders_the_not_found_banner() {
+    let db = test_pool().await;
+    let (status, body) = get_page(&db, "/admin/ui/logs/99999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("request log not found"));
+}
+
+#[tokio::test]
+async fn detail_page_without_credentials_returns_401() {
+    let db = test_pool().await;
+    let (status, body) = send(&db, "/admin/ui/logs/1", None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.is_empty());
+}
+
+#[tokio::test]
+async fn list_rows_link_to_detail_and_the_back_link_restores_the_view() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        None,
+        None,
+        None,
+        None,
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    // The list row carries the whole view state in the detail link.
+    let (status, body) = get_page(&db, "/admin/ui/logs?page_size=25&model=gpt-4o").await;
+    assert_eq!(status, StatusCode::OK);
+    // Askama escapes the ampersands inside the href attribute.
+    assert!(
+        body.contains(&format!(
+            "href=\"/admin/ui/logs/{log_id}?page=1&#38;page_size=25&#38;model=gpt-4o\""
+        )),
+        "row must link to the detail page with the view state: {body}"
+    );
+
+    // Round-trip: the detail page's back link restores the same view.
+    let (status, body) = get_page(
+        &db,
+        &format!("/admin/ui/logs/{log_id}?page=1&page_size=25&model=gpt-4o"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("href=\"/admin/ui/logs?page=1&#38;page_size=25&#38;model=gpt-4o\""));
+}
+
+#[tokio::test]
+async fn detail_page_escapes_markup_in_bodies() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        None,
+        None,
+        Some("<script>alert('xss-request')</script>"),
+        Some("<img src=x onerror=alert('xss-response')>"),
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !body.contains("<script>alert('xss-request')</script>"),
+        "raw script must never reach the page: {body}"
+    );
+    assert!(!body.contains("<img src=x"));
+    // The escaped text is still shown, inert.
+    assert!(body.contains("&#60;script&#62;alert(&#39;xss-request&#39;)&#60;/script&#62;"));
+}
