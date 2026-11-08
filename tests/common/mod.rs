@@ -162,6 +162,9 @@ pub async fn set_channel_enabled(db: &SqlitePool, channel_id: i64, enabled: bool
 
 /// Inserts an enabled client key bound to the channel and returns the
 /// plaintext (which is otherwise never stored).
+// Shared module: each test binary compiles its own copy and uses a subset
+// of the helpers, so per-binary dead code is expected, not a smell.
+#[allow(dead_code)]
 pub async fn seed_key(db: &SqlitePool, channel_id: i64) -> String {
     let generated = keygen::generate();
     within(key_rows::create(
