@@ -33,6 +33,12 @@ user, no failover or quotas.
 - Flood cap on anonymous 401 spam: after `HYDRA_FLOOD_LIMIT` failed
   authentications per client IP per window, bad-key requests are answered
   401 without any database access (`HYDRA_FLOOD_WINDOW_SECS`)
+- Client IP attribution per request: the direct peer address, or the first
+  untrusted `X-Forwarded-For` hop when Hydra runs behind a reverse proxy
+  declared in `HYDRA_TRUSTED_PROXIES` (Caddy, Nginx, ...)
+- Request log drill-down: `GET /admin/logs/{id}` and a detail page in the
+  admin UI with status, token usage, duration, client IP, error text and
+  the captured bodies
 
 ## Quickstart
 
@@ -149,6 +155,8 @@ which is public liveness. Admin errors use a plain `{"error": "..."}` body.
 | GET | `/admin/keys` | list keys, deleted state included |
 | PATCH | `/admin/keys/{id}` | enable or disable, rename |
 | DELETE | `/admin/keys/{id}` | soft delete; the key stops authenticating but its row and logs stay |
+| GET | `/admin/logs` | list request logs, paginated, filterable by key, channel, model, status class and time window |
+| GET | `/admin/logs/{id}` | fetch one log; includes the client IP and the stored bodies when capture was on |
 | GET | `/admin/health` | liveness, no auth |
 
 Two invariants worth knowing: disabling a key and deleting it are different
@@ -199,7 +207,11 @@ status class (2xx/4xx/5xx/errors) and time period (presets or a custom
 range); the whole view state lives in the URL, so any filtered view can be
 reloaded, shared or revisited with the browser back button. Rows show
 colored status badges and a small "bodies" marker when request or response
-bodies were captured; body content itself is never rendered.
+bodies were captured; body content itself is never rendered. Each row
+links to a drill-down page (`/admin/ui/logs/{id}`) with the full record:
+status, token usage, duration, client IP, error text and the captured
+request and response bodies, plus a back link that restores the exact
+filters and page of the list view.
 
 ![Keys page](docs/screenshots/keys.png)
 
@@ -223,6 +235,7 @@ normally get their configuration through `docker run -e` or compose instead.
 | `HYDRA_ADMIN_PASSWORD` | required | admin password, compared in constant time |
 | `HYDRA_LOG_BODIES` | `false` | store request and response bodies in logs, 1 MB cap per side |
 | `HYDRA_CACHE_TTL_SECS` | `3600` | lifetime of the key→channel resolution cache, in seconds; `0` disables the cache |
+| `HYDRA_TRUSTED_PROXIES` | unset | comma-separated IPv4/IPv6 CIDR networks of reverse proxies in front of Hydra; a request from one of them has its client IP taken from `X-Forwarded-For`. Invalid entries abort startup |
 | `HYDRA_FLOOD_LIMIT` | `60` | failed key authentications per client IP per window before the flood cap; `0` disables the cap |
 | `HYDRA_FLOOD_WINDOW_SECS` | `60` | length of the flood-cap window in seconds; must be at least 1 |
 
@@ -268,6 +281,22 @@ What the cache guarantees:
   Security flips done through the admin API are never delayed by the TTL,
   including against requests that were already in flight when the flip
   happened.
+
+## Client IP
+
+Every request log row stores the client IP the request was attributed to.
+By default this is the direct peer address of the connection. When Hydra
+runs behind a reverse proxy (Caddy, Nginx, ...), every row would otherwise
+carry the proxy's address; set `HYDRA_TRUSTED_PROXIES` to the
+comma-separated CIDR networks your proxies live in (a bare IP counts as a
+single host), for example `HYDRA_TRUSTED_PROXIES=127.0.0.1/32,10.0.0.0/8`.
+For a request whose direct peer falls inside a trusted network, the client
+IP is then taken from the `X-Forwarded-For` header: the first entry of the
+list that is not part of the trusted set. When clients reach Hydra
+directly, leave the variable unset: a client-sent `X-Forwarded-For` header
+is then ignored entirely, and the direct peer address is recorded. Invalid
+entries abort startup. The flood cap counts failures against the same
+resolved address, so clients behind one proxy are capped individually.
 
 ## Flood cap
 
