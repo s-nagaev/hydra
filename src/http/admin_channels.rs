@@ -434,8 +434,9 @@ pub async fn patch(
         Some(inner) => Some(validate_allowed_models(inner.as_deref())?),
     };
     // Invalidate every cached entry bound to this channel before and after
-    // the write: a rotated base_url or upstream api_key must take effect at
-    // once, not when the entries expire.
+    // the write, advancing the cache epoch so an in-flight request that read
+    // the pre-write row loses its refill: a rotated base_url or upstream
+    // api_key must take effect at once, not when the entries expire.
     state.cache.invalidate_channel(id);
     let channel = channels::update(
         &state.db,

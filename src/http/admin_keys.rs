@@ -355,9 +355,11 @@ pub async fn patch(
             return Err(KeysError::BadRequest("name must not be empty".to_string()));
         }
     }
-    // Explicit invalidation before and after the write: the first drop
-    // keeps a stale entry from being served mid-mutation, the second clears
-    // anything a concurrent request re-filled from the pre-write database.
+    // Invalidate before and after the write, advancing the cache epoch:
+    // the drops keep a stale entry from being served mid-mutation, and the
+    // epoch makes an in-flight request that read the pre-write state lose
+    // its refill, so it cannot re-insert a stale entry after the second
+    // invalidation.
     state.cache.invalidate_key(id);
     match keys::patch(
         &state.db,

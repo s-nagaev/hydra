@@ -93,7 +93,10 @@ migration, never hand-edited DBs.
 - Admin mutations invalidate explicitly BEFORE and AFTER the write: key
   PATCH/DELETE by key id, channel PATCH/DELETE by channel id (scanning the
   entries). Rotating a channel's `base_url`/`api_key` must invalidate every
-  entry bound to that channel.
+  entry bound to that channel. Every invalidation advances a cache epoch,
+  and a refill is stored only when the epoch observed before the database
+  read is still current — an in-flight request cannot re-insert pre-write
+  state after a mutation.
 - The TTL is only a drift bound for out-of-band database edits; never rely
   on it for security flips — those go through explicit invalidation.
 - DB-skip in tests is proven by pool swap (a closed pool makes any query

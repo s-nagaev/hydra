@@ -9,7 +9,12 @@
 //! the cache. Only successful resolutions are cached: unknown or disabled
 //! keys and gone or disabled channels keep hitting the database, so admin
 //! disables — which invalidate explicitly — are the only staleness risk,
-//! and the TTL only bounds out-of-band database edits. Rejections use the
+//! and the TTL only bounds out-of-band database edits. A refill is stored
+//! only when the cache epoch observed before the read is still current: an
+//! admin mutation that completed while the read was in flight invalidates
+//! the cache and advances the epoch, so the stale pre-write entry is
+//! dropped rather than re-inserted after the mutation's invalidation.
+//! Rejections use the
 //! OpenAI error shape shared by all proxy routes: 401 for a missing or
 //! malformed header and for an unknown key, 403 for a disabled key, 500 for
 //! storage failures. The plaintext key never appears in a response or log
@@ -95,6 +100,11 @@ impl FromRequestParts<AppState> for ProxyAuth {
             });
         }
 
+        // Capture the epoch before reading: if an admin mutation completes
+        // while the reads below are in flight, its invalidation advances the
+        // epoch and the insert at the end is rejected, so a pre-write entry
+        // can never land in the cache after the mutation.
+        let seen_epoch = state.cache.epoch();
         let key = keys::find_alive_by_hash(&state.db, &key_hash)
             .await?
             .ok_or(ProxyAuthError::InvalidKey)?;
@@ -104,7 +114,9 @@ impl FromRequestParts<AppState> for ProxyAuth {
         let channel = channels::find(&state.db, key.channel_id).await?;
         if let Some(channel) = &channel {
             if channel.enabled {
-                state.cache.insert(key_hash, key.clone(), channel.clone());
+                state
+                    .cache
+                    .insert_if_current(seen_epoch, key_hash, key.clone(), channel.clone());
             }
         }
         Ok(ProxyAuth { key, channel })

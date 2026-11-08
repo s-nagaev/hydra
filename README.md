@@ -246,13 +246,18 @@ What the cache guarantees:
   channels are never cached and keep consulting the database.
 - Admin mutations invalidate explicitly, before and after the write: key
   PATCH/DELETE drops that key's entries, channel PATCH/DELETE drops every
-  entry bound to the channel. Rotating a channel's `base_url` or upstream
-  `api_key` therefore takes effect on the very next call, never at TTL
-  expiry.
+  entry bound to the channel. Each invalidation also advances a cache
+  epoch, and a refill is only stored when the epoch observed before the
+  resolution was read is still current — a proxy request that was in
+  flight across a mutation cannot re-insert the pre-write state. Rotating
+  a channel's `base_url` or upstream `api_key` therefore takes effect on
+  the very next call, never at TTL expiry.
 - The TTL is a safety net for out-of-band edits (direct database writes that
   bypass the admin API, such as another process sharing the database): such
   a change becomes visible at most `HYDRA_CACHE_TTL_SECS` seconds late.
-  Security flips done through the admin API are never delayed by the TTL.
+  Security flips done through the admin API are never delayed by the TTL,
+  including against requests that were already in flight when the flip
+  happened.
 
 ## PostgreSQL
 
