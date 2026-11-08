@@ -5,6 +5,7 @@
 //! explicitly, never silently on parse errors.
 
 use std::env;
+use std::fmt;
 use std::net::SocketAddr;
 
 /// Which database backend to connect to, resolved from the environment.
@@ -17,7 +18,7 @@ use std::net::SocketAddr;
 /// The PostgreSQL URL carries credentials: never log it, never put it in an
 /// error message. Use [`DbTarget::redacted`] anywhere a human might see the
 /// database target.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DbTarget {
     Sqlite(String),
     Postgres(String),
@@ -25,16 +26,26 @@ pub enum DbTarget {
 
 impl DbTarget {
     /// Log-safe display: the PostgreSQL URL is masked, only the scheme shows.
+    /// A `sqlite:` URL is shown without doubling the scheme prefix.
     pub fn redacted(&self) -> String {
         match self {
-            DbTarget::Sqlite(path) => format!("sqlite:{path}"),
+            DbTarget::Sqlite(url) => {
+                format!("sqlite:{}", url.strip_prefix("sqlite:").unwrap_or(url))
+            }
             DbTarget::Postgres(_) => "postgres://<redacted>".to_string(),
         }
     }
 }
 
+impl fmt::Debug for DbTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Never expose the plaintext URL, credentials included.
+        write!(f, "DbTarget({})", self.redacted())
+    }
+}
+
 /// Runtime configuration parsed from environment variables.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
     pub db: DbTarget,
@@ -45,6 +56,20 @@ pub struct Config {
     #[allow(dead_code)]
     pub admin_password: String,
     pub log_bodies: bool,
+}
+
+impl fmt::Debug for Config {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // The database URL (via DbTarget's own redacted Debug) and the admin
+        // password must never appear in Debug output.
+        f.debug_struct("Config")
+            .field("bind_addr", &self.bind_addr)
+            .field("db", &self.db)
+            .field("admin_login", &self.admin_login)
+            .field("admin_password", &"<redacted>")
+            .field("log_bodies", &self.log_bodies)
+            .finish()
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -255,5 +280,24 @@ mod tests {
 
         let sqlite = DbTarget::Sqlite("./hydra.db".to_string());
         assert_eq!(sqlite.redacted(), "sqlite:./hydra.db");
+
+        let sqlite_url = DbTarget::Sqlite("sqlite:/tmp/hydra.db".to_string());
+        assert_eq!(sqlite_url.redacted(), "sqlite:/tmp/hydra.db");
+    }
+
+    #[test]
+    fn debug_output_never_contains_the_plaintext_url_or_password() {
+        let cfg = Config {
+            bind_addr: "127.0.0.1:8080".parse::<SocketAddr>().unwrap(),
+            db: DbTarget::Postgres("postgres://user:sekret@host:5432/db".to_string()),
+            admin_login: "admin".to_string(),
+            admin_password: "sekret".to_string(),
+            log_bodies: false,
+        };
+        let shown = format!("{cfg:?}");
+        assert!(!shown.contains("sekret"));
+        assert!(!shown.contains("user@"));
+        assert!(!shown.contains("postgres://user"));
+        assert!(shown.contains("<redacted>"));
     }
 }
