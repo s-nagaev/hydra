@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 
 use hydra::db::channels::{self as channel_rows, ChannelPatch, NewChannel};
 use hydra::db::keys::{self as key_rows, NewKey};
-use hydra::http::{self, AppState};
+use hydra::http::AppState;
 use hydra::keys as keygen;
 
 /// The upstream key seeded into every test channel; proxying must
@@ -64,17 +64,14 @@ pub async fn test_pool() -> SqlitePool {
 // of the helpers, so per-binary dead code is expected, not a smell.
 #[allow(dead_code)]
 pub fn test_app(db: SqlitePool) -> AppState {
-    AppState {
-        db: hydra::db::Db::from(db),
-        admin_login: "admin".to_string(),
-        admin_password: "secret".to_string(),
-        client: http::upstream_client(),
-        log_bodies: false,
-        log_tracker: hydra::logging::LogTracker::default(),
-        cache: hydra::cache::ResolutionCache::default(),
-        trusted_proxies: hydra::config::TrustedProxies::default(),
-        flood: hydra::flood::FloodCap::default(),
-    }
+    AppState::new(
+        hydra::db::Db::from(db),
+        "admin".to_string(),
+        "secret".to_string(),
+        false,
+        hydra::config::TrustedProxies::default(),
+        hydra::flood::FloodCap::default(),
+    )
 }
 
 /// Application state with `HYDRA_LOG_BODIES` enabled, for tests that assert
@@ -83,17 +80,14 @@ pub fn test_app(db: SqlitePool) -> AppState {
 // of the helpers, so per-binary dead code is expected, not a smell.
 #[allow(dead_code)]
 pub fn test_app_logging(db: SqlitePool) -> AppState {
-    AppState {
-        db: hydra::db::Db::from(db),
-        admin_login: "admin".to_string(),
-        admin_password: "secret".to_string(),
-        client: http::upstream_client(),
-        log_bodies: true,
-        log_tracker: hydra::logging::LogTracker::default(),
-        cache: hydra::cache::ResolutionCache::default(),
-        trusted_proxies: hydra::config::TrustedProxies::default(),
-        flood: hydra::flood::FloodCap::default(),
-    }
+    AppState::new(
+        hydra::db::Db::from(db),
+        "admin".to_string(),
+        "secret".to_string(),
+        true,
+        hydra::config::TrustedProxies::default(),
+        hydra::flood::FloodCap::default(),
+    )
 }
 
 /// Application state with the given trusted-proxy networks, for tests that
@@ -105,17 +99,14 @@ pub fn test_app_with_trusted_proxies(
     db: SqlitePool,
     trusted_proxies: hydra::config::TrustedProxies,
 ) -> AppState {
-    AppState {
-        db: hydra::db::Db::from(db),
-        admin_login: "admin".to_string(),
-        admin_password: "secret".to_string(),
-        client: http::upstream_client(),
-        log_bodies: false,
-        log_tracker: hydra::logging::LogTracker::default(),
-        cache: hydra::cache::ResolutionCache::default(),
+    AppState::new(
+        hydra::db::Db::from(db),
+        "admin".to_string(),
+        "secret".to_string(),
+        false,
         trusted_proxies,
-        flood: hydra::flood::FloodCap::default(),
-    }
+        hydra::flood::FloodCap::default(),
+    )
 }
 
 /// Application state with an explicit flood cap, for tests that exercise
@@ -125,17 +116,14 @@ pub fn test_app_with_trusted_proxies(
 // of the helpers, so per-binary dead code is expected, not a smell.
 #[allow(dead_code)]
 pub fn test_app_with_flood(db: SqlitePool, flood_limit: u64, flood_window_secs: u64) -> AppState {
-    AppState {
-        db: hydra::db::Db::from(db),
-        admin_login: "admin".to_string(),
-        admin_password: "secret".to_string(),
-        client: http::upstream_client(),
-        log_bodies: false,
-        log_tracker: hydra::logging::LogTracker::default(),
-        cache: hydra::cache::ResolutionCache::default(),
-        trusted_proxies: hydra::config::TrustedProxies::default(),
-        flood: hydra::flood::FloodCap::new(flood_limit, flood_window_secs),
-    }
+    AppState::new(
+        hydra::db::Db::from(db),
+        "admin".to_string(),
+        "secret".to_string(),
+        false,
+        hydra::config::TrustedProxies::default(),
+        hydra::flood::FloodCap::new(flood_limit, flood_window_secs),
+    )
 }
 
 /// Application state with both an explicit flood cap and trusted-proxy
@@ -150,17 +138,14 @@ pub fn test_app_with_flood_and_trusted_proxies(
     flood_window_secs: u64,
     trusted_proxies: hydra::config::TrustedProxies,
 ) -> AppState {
-    AppState {
-        db: hydra::db::Db::from(db),
-        admin_login: "admin".to_string(),
-        admin_password: "secret".to_string(),
-        client: http::upstream_client(),
-        log_bodies: false,
-        log_tracker: hydra::logging::LogTracker::default(),
-        cache: hydra::cache::ResolutionCache::default(),
+    AppState::new(
+        hydra::db::Db::from(db),
+        "admin".to_string(),
+        "secret".to_string(),
+        false,
         trusted_proxies,
-        flood: hydra::flood::FloodCap::new(flood_limit, flood_window_secs),
-    }
+        hydra::flood::FloodCap::new(flood_limit, flood_window_secs),
+    )
 }
 
 /// Serves the router on an ephemeral loopback port with ConnectInfo, the

@@ -752,17 +752,14 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        AppState {
-            db: pool.into(),
-            admin_login: "admin".to_string(),
-            admin_password: "secret".to_string(),
-            client: crate::http::upstream_client(),
-            log_bodies: false,
-            log_tracker: crate::logging::LogTracker::default(),
-            cache: crate::cache::ResolutionCache::default(),
-            trusted_proxies: crate::config::TrustedProxies::default(),
-            flood: crate::flood::FloodCap::default(),
-        }
+        AppState::new(
+            pool.into(),
+            "admin".to_string(),
+            "secret".to_string(),
+            false,
+            crate::config::TrustedProxies::default(),
+            crate::flood::FloodCap::default(),
+        )
     }
 
     fn auth_header() -> String {

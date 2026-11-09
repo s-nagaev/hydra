@@ -251,9 +251,14 @@ pub(crate) async fn mutate_key(
     key_patch: &KeyPatch,
 ) -> Result<PatchOutcome, KeysError> {
     state.cache.invalidate_key(id);
+    // The monthly-limit verdict of the key is just as stale as its resolved
+    // channel after any patch: a new limit, a cleared one or a flipped
+    // enabled flag all change what the gate should decide.
+    state.limit_flags.invalidate(id);
     let outcome = keys::patch(&state.db, id, key_patch).await?;
     if matches!(outcome, PatchOutcome::Updated(_)) {
         state.cache.invalidate_key(id);
+        state.limit_flags.invalidate(id);
     }
     Ok(outcome)
 }
@@ -521,11 +526,14 @@ pub async fn delete(
     Path(id): Path<i64>,
 ) -> Result<StatusCode, KeysError> {
     // Invalidate before and after, so a deleted key stops authenticating
-    // immediately even if a concurrent request re-filled its entry.
+    // immediately even if a concurrent request re-filled its entry, and its
+    // monthly-limit verdict goes with the cache entry.
     state.cache.invalidate_key(id);
+    state.limit_flags.invalidate(id);
     match keys::delete(&state.db, id).await? {
         DeleteOutcome::Deleted => {
             state.cache.invalidate_key(id);
+            state.limit_flags.invalidate(id);
             Ok(StatusCode::NO_CONTENT)
         }
         DeleteOutcome::AlreadyDeleted => {
@@ -565,17 +573,14 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        AppState {
-            db: pool.into(),
-            admin_login: "admin".to_string(),
-            admin_password: "secret".to_string(),
-            client: crate::http::upstream_client(),
-            log_bodies: false,
-            log_tracker: crate::logging::LogTracker::default(),
-            cache: crate::cache::ResolutionCache::default(),
-            trusted_proxies: crate::config::TrustedProxies::default(),
-            flood: crate::flood::FloodCap::default(),
-        }
+        AppState::new(
+            pool.into(),
+            "admin".to_string(),
+            "secret".to_string(),
+            false,
+            crate::config::TrustedProxies::default(),
+            crate::flood::FloodCap::default(),
+        )
     }
 
     fn auth_header() -> String {

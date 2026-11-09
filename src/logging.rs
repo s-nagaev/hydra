@@ -32,6 +32,12 @@
 //! past the 1 MiB body cap; a buffered response has its usage read straight
 //! from the body. Stream rows therefore carry tokens with body logging off,
 //! only the bodies stay NULL.
+//!
+//! A logged row that names a key is followed, in the same detached flow, by
+//! a month-to-date recompute of that key's monthly-limit verdict
+//! ([`crate::usage::recompute`]). The recompute only reads: it writes no log
+//! row and therefore cannot re-enter this path, and a row without a key
+//! (a rejection whose key never resolved) skips it.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -101,6 +107,9 @@ pub struct ChatLogInit<'a> {
     pub request_body: &'a [u8],
     /// Resolved client IP, absent when no peer address was available.
     pub client_ip: Option<String>,
+    /// The monthly-limit verdict store, so the detached insert can hand the
+    /// finished row to the recompute that follows it.
+    pub flags: &'a crate::limit_flags::LimitFlags,
 }
 
 /// Everything the detached log task needs about one chat request. Built in
@@ -115,6 +124,7 @@ pub struct ChatLogContext {
     start: Instant,
     request_body: Option<String>,
     client_ip: Option<String>,
+    flags: crate::limit_flags::LimitFlags,
 }
 
 impl ChatLogContext {
@@ -131,6 +141,7 @@ impl ChatLogContext {
                 .log_bodies
                 .then(|| capture_to_string(init.request_body)),
             client_ip: init.client_ip,
+            flags: init.flags.clone(),
         }
     }
 
@@ -167,18 +178,45 @@ impl ChatLogContext {
                 error,
                 client_ip: self.client_ip,
             },
+            self.flags,
         );
     }
 }
 
-/// Detached single-row insert. Failures are logged at WARN and dropped: the
-/// client flow has already moved on.
-fn spawn_insert(db: Db, tracker: LogTracker, record: NewRequestLog) {
+/// Detached single-row insert, followed by the monthly-limit recompute of
+/// the row's key. Failures are logged at WARN and dropped: the client flow
+/// has already moved on.
+fn spawn_insert(
+    db: Db,
+    tracker: LogTracker,
+    record: NewRequestLog,
+    flags: crate::limit_flags::LimitFlags,
+) {
     let guard = tracker.guard();
     tokio::spawn(async move {
         let _inflight = guard;
-        if let Err(e) = crate::db::request_logs::insert(&db, &record).await {
-            tracing::warn!(error = %e, "request log insert failed");
+        match crate::db::request_logs::insert(&db, &record).await {
+            // Only a row that landed is worth aggregating; a row without a
+            // key (a rejection whose key never resolved) belongs to nobody.
+            Ok(()) => {
+                if let Some(key_id) = record.api_key_id {
+                    spawn_limit_recompute(db, flags, key_id);
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "request log insert failed"),
+        }
+    });
+}
+
+/// Detached month-to-date aggregate for one key, spawned after the row that
+/// triggered it was inserted, so the fresh row is part of the sum. The
+/// recompute writes no log row, so it cannot re-enter this path. A failure
+/// leaves the stored verdict untouched (see [`crate::usage`]) and is
+/// reported through tracing, there being no client left to tell.
+fn spawn_limit_recompute(db: Db, flags: crate::limit_flags::LimitFlags, key_id: i64) {
+    tokio::spawn(async move {
+        if let Err(e) = crate::usage::recompute(&db, &flags, key_id).await {
+            tracing::warn!(error = %e, key_id, "monthly limit recompute failed");
         }
     });
 }
@@ -602,6 +640,7 @@ mod tests {
                 error: None,
                 client_ip: Some("198.51.100.5".to_string()),
             },
+            crate::limit_flags::LimitFlags::default(),
         );
         wait_until_drained(&tracker).await;
         assert_eq!(tracker.inflight(), 0);
@@ -663,6 +702,7 @@ mod tests {
                 error: None,
                 client_ip: None,
             },
+            crate::limit_flags::LimitFlags::default(),
         );
         wait_until_drained(&tracker).await;
         assert_eq!(tracker.inflight(), 0);

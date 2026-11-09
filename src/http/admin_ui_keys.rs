@@ -597,10 +597,14 @@ async fn toggle(
 /// Soft delete: the key stops authenticating, the row and its request logs
 /// stay. The confirm dialog on the button spells that out.
 async fn delete(State(state): State<AppState>, _auth: AdminAuth, Path(id): Path<i64>) -> KeysPanel {
+    // Before and after, like the resolution cache: a deleted key must neither
+    // authenticate nor keep a monthly-limit verdict alive.
     state.cache.invalidate_key(id);
+    state.limit_flags.invalidate(id);
     match keys::delete(&state.db, id).await {
         Ok(DeleteOutcome::Deleted) => {
             state.cache.invalidate_key(id);
+            state.limit_flags.invalidate(id);
             panel(&state, None, None, None).await
         }
         Ok(DeleteOutcome::NotFound) => {
