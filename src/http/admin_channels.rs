@@ -8,6 +8,13 @@
 //! Security invariant: the upstream `api_key` never appears in a response.
 //! Handlers return `ChannelView`, which carries only a masked preview and a
 //! `has_api_key` flag.
+//!
+//! Prices: the request shape carries decimal USD per 1M tokens (strings or
+//! numbers, up to six decimal places), the stored and returned shape carries
+//! integer micro-USD per 1M tokens. See [`crate::prices`] for the
+//! conversion rules; nothing here rounds an amount.
+
+use std::collections::BTreeMap;
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -15,13 +22,15 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use url::Url;
 use utoipa::ToSchema;
 
-use crate::db::channels::{self, Channel, ChannelPatch, DeleteOutcome, NewChannel};
+use crate::db::channels::{self, Channel, ChannelPatch, DeleteOutcome, NewChannel, PricedChannel};
 use crate::http::admin_auth::AdminAuth;
 use crate::http::docs::AdminErrorBody;
 use crate::http::AppState;
+use crate::prices::{ModelPrice, ModelPrices};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AdminError {
@@ -70,6 +79,28 @@ pub struct CreateChannelRequest {
     #[serde(default)]
     #[schema(example = json!(["gpt-4o", "gpt-4o-mini"]))]
     pub allowed_models: Option<Vec<String>>,
+    /// Prices for this channel, object keyed by model name. Each model needs
+    /// all four dimensions: `input`, `output`, `cached_input` and
+    /// `cached_output`, given in USD per 1M tokens as decimal strings (or
+    /// numbers) with at most six decimal places. Amounts that cannot be
+    /// stored exactly as a whole number of micro-USD are rejected with 400,
+    /// never rounded. Omitted or null stores no prices, and an empty object
+    /// does the same. When `allowed_models` is set, every priced model must
+    /// be part of it. Responses return the same object with the amounts
+    /// converted to integer micro-USD per 1M tokens.
+    #[serde(default)]
+    #[schema(
+        value_type = Object,
+        example = json!({
+            "gpt-4o": {
+                "input": "2.50",
+                "output": "10.00",
+                "cached_input": "1.25",
+                "cached_output": "5.00"
+            }
+        })
+    )]
+    pub model_prices: Option<Value>,
 }
 
 /// Body for editing a channel; only the sent fields change.
@@ -88,8 +119,57 @@ pub struct PatchChannelRequest {
     /// being absent leaves it unchanged.
     #[serde(default, deserialize_with = "double_option")]
     pub allowed_models: Option<Option<Vec<String>>>,
+    /// Same shape and rules as on create. Being absent leaves the stored
+    /// prices untouched; `null` (JSON null) or an empty object clears them;
+    /// an object replaces the whole table rather than merging into it. The
+    /// resulting prices are validated against the whitelist the patch
+    /// leaves in force, so shrinking `allowed_models` below the priced
+    /// models is rejected with 400.
+    #[serde(default, deserialize_with = "double_option")]
+    #[schema(
+        value_type = Object,
+        nullable = true,
+        example = json!({
+            "gpt-4o-mini": {
+                "input": "0.15",
+                "output": "0.60",
+                "cached_input": "0.075",
+                "cached_output": "0.30"
+            }
+        })
+    )]
+    pub model_prices: Option<Option<Value>>,
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// One model's prices in the JSON API: integer micro-USD per 1M tokens, so
+/// `2500000` means 2.50 USD per 1M tokens.
+#[derive(Serialize, ToSchema)]
+pub struct ModelPriceView {
+    /// Prompt tokens billed at the full input rate.
+    #[schema(example = 2_500_000)]
+    pub input: u64,
+    /// Completion tokens.
+    #[schema(example = 10_000_000)]
+    pub output: u64,
+    /// Prompt tokens served from the upstream cache.
+    #[schema(example = 1_250_000)]
+    pub cached_input: u64,
+    /// Cached prompt tokens written back to the upstream cache.
+    #[schema(example = 5_000_000)]
+    pub cached_output: u64,
+}
+
+impl From<&ModelPrice> for ModelPriceView {
+    fn from(price: &ModelPrice) -> Self {
+        Self {
+            input: price.input,
+            output: price.output,
+            cached_input: price.cached_input,
+            cached_output: price.cached_output,
+        }
+    }
 }
 
 /// Public view of a channel; the upstream key is masked.
@@ -101,22 +181,70 @@ pub struct ChannelView {
     pub api_key_masked: String,
     pub has_api_key: bool,
     pub allowed_models: Option<Vec<String>>,
+    /// Stored prices, integer micro-USD per 1M tokens; null when the
+    /// channel has none.
+    pub model_prices: Option<BTreeMap<String, ModelPriceView>>,
     pub enabled: bool,
     pub created_at: String,
 }
 
-impl From<Channel> for ChannelView {
-    fn from(channel: Channel) -> Self {
+impl From<PricedChannel> for ChannelView {
+    fn from(priced: PricedChannel) -> Self {
+        let Channel {
+            id,
+            name,
+            base_url,
+            api_key,
+            allowed_models,
+            enabled,
+            created_at,
+        } = priced.channel;
         Self {
-            id: channel.id,
-            name: channel.name,
-            base_url: channel.base_url,
-            api_key_masked: mask_api_key(&channel.api_key),
+            id,
+            name,
+            base_url,
+            api_key_masked: mask_api_key(&api_key),
             has_api_key: true,
-            allowed_models: channel.allowed_models,
-            enabled: channel.enabled,
-            created_at: channel.created_at,
+            allowed_models,
+            model_prices: priced.model_prices.as_ref().map(price_views),
+            enabled,
+            created_at,
         }
+    }
+}
+
+fn price_views(prices: &ModelPrices) -> BTreeMap<String, ModelPriceView> {
+    prices
+        .iter()
+        .map(|(model, price)| (model.clone(), ModelPriceView::from(price)))
+        .collect()
+}
+
+/// Converts the external USD shape of a request into the stored integer
+/// shape; an empty object means the channel carries no prices, exactly like
+/// an omitted field or an explicit null.
+pub(crate) fn parse_model_prices(value: &Value) -> Result<Option<ModelPrices>, AdminError> {
+    let prices = ModelPrices::from_usd_json(value)
+        .map_err(|error| AdminError::BadRequest(error.to_string()))?;
+    Ok(if prices.is_empty() {
+        None
+    } else {
+        Some(prices)
+    })
+}
+
+/// Rejects a price table that names models outside the channel's whitelist.
+/// A channel without a whitelist serves every upstream model, so its prices
+/// need no such check.
+pub(crate) fn validate_model_prices(
+    prices: Option<&ModelPrices>,
+    allowed_models: Option<&[String]>,
+) -> Result<(), AdminError> {
+    match prices {
+        Some(prices) => prices
+            .validate_against_allowed(allowed_models)
+            .map_err(|error| AdminError::BadRequest(error.to_string())),
+        None => Ok(()),
     }
 }
 
@@ -209,7 +337,10 @@ fn validate_common(
     request_body(
         content = CreateChannelRequest,
         description = "Channel definition. Omit `allowed_models` to allow \
-            every model the upstream serves.",
+            every model the upstream serves. `model_prices` carries USD per \
+            1M tokens as decimal strings or numbers and is stored as integer \
+            micro-USD; every priced model must be part of `allowed_models` \
+            when that list is set.",
         examples(
             ("whitelist" = (
                 summary = "Channel restricted to two models",
@@ -218,6 +349,29 @@ fn validate_common(
                     "base_url": "https://api.openai.com",
                     "api_key": "sk-upstream-secret-1234567890",
                     "allowed_models": ["gpt-4o", "gpt-4o-mini"]
+                })
+            )),
+            ("priced" = (
+                summary = "Channel with prices for both whitelisted models",
+                value = json!({
+                    "name": "openai",
+                    "base_url": "https://api.openai.com",
+                    "api_key": "sk-upstream-secret-1234567890",
+                    "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+                    "model_prices": {
+                        "gpt-4o": {
+                            "input": "2.50",
+                            "output": "10.00",
+                            "cached_input": "1.25",
+                            "cached_output": "5.00"
+                        },
+                        "gpt-4o-mini": {
+                            "input": "0.15",
+                            "output": "0.60",
+                            "cached_input": "0.075",
+                            "cached_output": "0.30"
+                        }
+                    }
                 })
             )),
             ("allow_all" = (
@@ -246,12 +400,21 @@ fn validate_common(
             "api_key_masked": "sk-u...7890",
             "has_api_key": true,
             "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+            "model_prices": {
+                "gpt-4o": {
+                    "input": 2500000,
+                    "output": 10000000,
+                    "cached_input": 1250000,
+                    "cached_output": 5000000
+                }
+            },
             "enabled": true,
             "created_at": "2026-11-07 23:59:59"
         })),
         (status = 400, description = "Invalid input: empty name or api_key, \
-            a non-absolute or non-http base_url, or an empty string inside \
-            allowed_models", body = AdminErrorBody, example = json!({
+            a non-absolute or non-http base_url, an empty string inside \
+            allowed_models, or a price table that is malformed, finer than \
+            1e-6 USD or names a model outside allowed_models", body = AdminErrorBody, example = json!({
             "error": "invalid base_url: not a url"
         })),
         (status = 401, description = "Missing or wrong admin credentials; \
@@ -271,7 +434,12 @@ pub async fn create(
         &request.api_key,
         request.allowed_models.as_deref(),
     )?;
-    let channel = channels::create(
+    let model_prices = match &request.model_prices {
+        Some(value) => parse_model_prices(value)?,
+        None => None,
+    };
+    validate_model_prices(model_prices.as_ref(), allowed_models.as_deref())?;
+    let channel = channels::create_with_prices(
         &state.db,
         &NewChannel {
             name: request.name,
@@ -279,6 +447,7 @@ pub async fn create(
             api_key: request.api_key,
             allowed_models,
         },
+        model_prices.as_ref(),
     )
     .await?;
     Ok((StatusCode::CREATED, Json(channel.into())))
@@ -302,6 +471,7 @@ pub async fn create(
                 "api_key_masked": "sk-u...7890",
                 "has_api_key": true,
                 "allowed_models": null,
+                "model_prices": null,
                 "enabled": true,
                 "created_at": "2026-11-07 23:59:59"
             }
@@ -314,7 +484,7 @@ pub async fn list(
     State(state): State<AppState>,
     _auth: AdminAuth,
 ) -> Result<Json<Vec<ChannelView>>, AdminError> {
-    let channel_list = channels::list(&state.db).await?;
+    let channel_list = channels::list_priced(&state.db).await?;
     Ok(Json(channel_list.into_iter().map(Into::into).collect()))
 }
 
@@ -335,6 +505,14 @@ pub async fn list(
             "api_key_masked": "sk-u...7890",
             "has_api_key": true,
             "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+            "model_prices": {
+                "gpt-4o": {
+                    "input": 2500000,
+                    "output": 10000000,
+                    "cached_input": 1250000,
+                    "cached_output": 5000000
+                }
+            },
             "enabled": true,
             "created_at": "2026-11-07 23:59:59"
         })),
@@ -350,7 +528,7 @@ pub async fn get_one(
     _auth: AdminAuth,
     Path(id): Path<i64>,
 ) -> Result<Json<ChannelView>, AdminError> {
-    let channel = channels::find(&state.db, id)
+    let channel = channels::find_priced(&state.db, id)
         .await?
         .ok_or(AdminError::NotFound)?;
     Ok(Json(channel.into()))
@@ -364,8 +542,9 @@ pub async fn get_one(
     summary = "Edit a channel",
     description = "Updates only the fields present in the body. Sending JSON \
         null as `allowed_models` clears the whitelist back to allow-all; \
-        an empty array does the same. This is also how a channel is enabled \
-        or disabled.",
+        an empty array does the same. `model_prices` replaces the whole \
+        table when present and is cleared by an explicit null or an empty \
+        object. This is also how a channel is enabled or disabled.",
     security(("basic_auth" = [])),
     params(("id" = i64, Path, description = "Channel id", example = 1)),
     request_body(
@@ -380,9 +559,26 @@ pub async fn get_one(
                     "enabled": false
                 })
             )),
+            ("set_prices" = (
+                summary = "Replace the price table",
+                value = json!({
+                    "model_prices": {
+                        "gpt-4o": {
+                            "input": "2.50",
+                            "output": "10.00",
+                            "cached_input": "1.25",
+                            "cached_output": "5.00"
+                        }
+                    }
+                })
+            )),
             ("clear_whitelist" = (
                 summary = "Clear the whitelist with an explicit null",
                 value = json!({ "allowed_models": null })
+            )),
+            ("clear_prices" = (
+                summary = "Clear the price table with an explicit null",
+                value = json!({ "model_prices": null })
             )),
             ("invalid" = (
                 summary = "Rejected with 400: ftp scheme",
@@ -398,11 +594,20 @@ pub async fn get_one(
             "api_key_masked": "sk-u...7890",
             "has_api_key": true,
             "allowed_models": ["gpt-4o"],
+            "model_prices": {
+                "gpt-4o": {
+                    "input": 2500000,
+                    "output": 10000000,
+                    "cached_input": 1250000,
+                    "cached_output": 5000000
+                }
+            },
             "enabled": false,
             "created_at": "2026-11-07 23:59:59"
         })),
         (status = 400, description = "Invalid field value, same rules as on \
-            create", body = AdminErrorBody, example = json!({
+            create; a price table that the patched whitelist no longer \
+            covers is rejected too", body = AdminErrorBody, example = json!({
             "error": "base_url must be an absolute http(s) URL: ftp://api.example.com"
         })),
         (status = 401, description = "Missing or wrong admin credentials; \
@@ -433,12 +638,32 @@ pub async fn patch(
         None => None,
         Some(inner) => Some(validate_allowed_models(inner.as_deref())?),
     };
+    // The price table is checked against the whitelist the patch leaves in
+    // force, so a stored table cannot end up naming models the channel no
+    // longer serves.
+    let current = channels::find_priced(&state.db, id)
+        .await?
+        .ok_or(AdminError::NotFound)?;
+    let prices_patch = match &request.model_prices {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(value)) => Some(parse_model_prices(value)?),
+    };
+    let effective_allowed = match &allowed_models {
+        Some(allowed) => allowed.clone(),
+        None => current.channel.allowed_models.clone(),
+    };
+    let effective_prices = match &prices_patch {
+        Some(prices) => prices.as_ref(),
+        None => current.model_prices.as_ref(),
+    };
+    validate_model_prices(effective_prices, effective_allowed.as_deref())?;
     // Invalidate every cached entry bound to this channel before and after
     // the write, advancing the cache epoch so an in-flight request that read
     // the pre-write row loses its refill: a rotated base_url or upstream
     // api_key must take effect at once, not when the entries expire.
     state.cache.invalidate_channel(id);
-    let channel = channels::update(
+    let channel = channels::update_with_prices(
         &state.db,
         id,
         &ChannelPatch {
@@ -448,6 +673,7 @@ pub async fn patch(
             allowed_models,
             enabled: request.enabled,
         },
+        prices_patch.as_ref().map(|prices| prices.as_ref()),
     )
     .await?
     .ok_or(AdminError::NotFound)?;
@@ -774,5 +1000,238 @@ mod tests {
         let (_, fetched) =
             send_json(&state, "GET", &format!("/admin/channels/{id}"), Value::Null).await;
         assert!(!fetched.to_string().contains(UPSTREAM_KEY));
+    }
+
+    /// A channel with prices stored as integer micro-USD, exactly as the
+    /// API returns them.
+    fn priced_body() -> Value {
+        json!({
+            "name": "primary",
+            "base_url": "https://api.example.com",
+            "api_key": UPSTREAM_KEY,
+            "allowed_models": ["gpt-4o", "gpt-4o-mini"],
+            "model_prices": {
+                "gpt-4o": {
+                    "input": "2.50",
+                    "output": "10.00",
+                    "cached_input": "1.25",
+                    "cached_output": "5.00"
+                }
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn create_stores_prices_as_integer_micro_usd_and_returns_them() {
+        let state = test_state().await;
+        let (status, created) = send_json(&state, "POST", "/admin/channels", priced_body()).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(
+            created["model_prices"],
+            json!({
+                "gpt-4o": {
+                    "input": 2_500_000,
+                    "output": 10_000_000,
+                    "cached_input": 1_250_000,
+                    "cached_output": 5_000_000
+                }
+            })
+        );
+
+        // The stored integers survive a round trip through the database.
+        let id = created["id"].as_i64().unwrap();
+        let (status, fetched) =
+            send_json(&state, "GET", &format!("/admin/channels/{id}"), Value::Null).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(fetched["model_prices"], created["model_prices"]);
+
+        let (_, listed) = send_json(&state, "GET", "/admin/channels", Value::Null).await;
+        assert_eq!(listed[0]["model_prices"], created["model_prices"]);
+    }
+
+    #[tokio::test]
+    async fn create_without_prices_stores_null() {
+        let state = test_state().await;
+        let (status, created) = send_json(&state, "POST", "/admin/channels", create_body()).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["model_prices"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn create_with_an_empty_price_object_stores_null() {
+        let state = test_state().await;
+        let mut body = create_body();
+        body["model_prices"] = json!({});
+        let (status, created) = send_json(&state, "POST", "/admin/channels", body).await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(created["model_prices"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn patch_replaces_prices_and_leaves_them_alone_when_absent() {
+        let state = test_state().await;
+        let (_, created) = send_json(&state, "POST", "/admin/channels", priced_body()).await;
+        let id = created["id"].as_i64().unwrap();
+
+        // Absent: the stored table stays as it is.
+        let (status, patched) = send_json(
+            &state,
+            "PATCH",
+            &format!("/admin/channels/{id}"),
+            json!({ "name": "renamed" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(patched["model_prices"], created["model_prices"]);
+
+        // Present: the whole table is replaced, not merged.
+        let (status, replaced) = send_json(
+            &state,
+            "PATCH",
+            &format!("/admin/channels/{id}"),
+            json!({
+                "model_prices": {
+                    "gpt-4o-mini": {
+                        "input": "0.15",
+                        "output": "0.60",
+                        "cached_input": "0.075",
+                        "cached_output": "0.30"
+                    }
+                }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replaced}");
+        assert_eq!(
+            replaced["model_prices"],
+            json!({
+                "gpt-4o-mini": {
+                    "input": 150_000,
+                    "output": 600_000,
+                    "cached_input": 75_000,
+                    "cached_output": 300_000
+                }
+            })
+        );
+
+        // Explicit null clears the table.
+        let (status, cleared) = send_json(
+            &state,
+            "PATCH",
+            &format!("/admin/channels/{id}"),
+            json!({ "model_prices": null }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(cleared["model_prices"], Value::Null);
+        assert_eq!(cleared["allowed_models"], json!(["gpt-4o", "gpt-4o-mini"]));
+    }
+
+    #[tokio::test]
+    async fn prices_finer_than_micro_usd_are_rejected_with_400() {
+        let state = test_state().await;
+        let mut body = create_body();
+        body["model_prices"] = json!({
+            "gpt-4o": {
+                "input": "0.0000005",
+                "output": "1",
+                "cached_input": "1",
+                "cached_output": "1"
+            }
+        });
+        let (status, error) = send_json(&state, "POST", "/admin/channels", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"].as_str().unwrap().contains("stored exactly"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_price_tables_are_rejected_with_400() {
+        let state = test_state().await;
+        for prices in [
+            json!(-1),
+            json!("2.50"),
+            json!([{ "input": "1" }]),
+            json!({ "gpt-4o": "2.50" }),
+            json!({ "gpt-4o": { "input": "1", "output": "1", "cached_input": "1" } }),
+            json!({ "gpt-4o": { "input": "1", "output": "1", "cached_input": "1", "cached_output": "1", "extra": "1" } }),
+            json!({ "gpt-4o": { "input": true, "output": "1", "cached_input": "1", "cached_output": "1" } }),
+        ] {
+            let mut body = create_body();
+            body["model_prices"] = prices.clone();
+            let (status, error) = send_json(&state, "POST", "/admin/channels", body).await;
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "prices {prices} must be rejected"
+            );
+            assert!(error["error"].is_string(), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn prices_outside_the_whitelist_are_rejected() {
+        let state = test_state().await;
+        let mut body = create_body();
+        body["allowed_models"] = json!(["gpt-4o"]);
+        body["model_prices"] = json!({
+            "gpt-4o-mini": {
+                "input": "1",
+                "output": "1",
+                "cached_input": "1",
+                "cached_output": "1"
+            }
+        });
+        let (status, error) = send_json(&state, "POST", "/admin/channels", body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"]
+                .as_str()
+                .unwrap()
+                .contains("outside allowed_models"),
+            "unexpected message: {error}"
+        );
+
+        // Shrinking the whitelist below the stored prices is refused too, so
+        // the stored table always stays inside the whitelist.
+        let (_, created) = send_json(&state, "POST", "/admin/channels", priced_body()).await;
+        let id = created["id"].as_i64().unwrap();
+        let (status, error) = send_json(
+            &state,
+            "PATCH",
+            &format!("/admin/channels/{id}"),
+            json!({ "allowed_models": ["gpt-4o-mini"] }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error["error"].as_str().unwrap().contains("gpt-4o"),
+            "unexpected message: {error}"
+        );
+        assert_eq!(created["model_prices"]["gpt-4o"]["input"], 2_500_000);
+    }
+
+    #[tokio::test]
+    async fn prices_need_no_whitelist_when_the_channel_serves_every_model() {
+        let state = test_state().await;
+        let body = json!({
+            "name": "open",
+            "base_url": "https://api.example.com",
+            "api_key": UPSTREAM_KEY,
+            "model_prices": {
+                "anything-goes": {
+                    "input": "1",
+                    "output": "1",
+                    "cached_input": "1",
+                    "cached_output": "1"
+                }
+            }
+        });
+        let (status, created) = send_json(&state, "POST", "/admin/channels", body).await;
+        assert_eq!(status, StatusCode::CREATED, "{created}");
+        assert_eq!(created["allowed_models"], Value::Null);
+        assert_eq!(created["model_prices"]["anything-goes"]["input"], 1_000_000);
     }
 }

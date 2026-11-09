@@ -110,6 +110,7 @@ impl Modify for SecurityAddon {
             super::admin_channels::CreateChannelRequest,
             super::admin_channels::PatchChannelRequest,
             super::admin_channels::ChannelView,
+            super::admin_channels::ModelPriceView,
             super::admin_keys::CreateKeyRequest,
             super::admin_keys::PatchKeyRequest,
             super::admin_keys::KeyView,
