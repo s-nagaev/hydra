@@ -3,7 +3,7 @@
 //! The store is a fast-path cache over the authoritative figure, which stays
 //! the month-to-date aggregate over `request_logs`: the request path must
 //! not pay a database round trip to answer "is this key out of budget", so
-//! the verdict is computed in the background ([`crate::limit_gate`]) and
+//! the verdict is computed in the background ([`crate::usage`]) and
 //! read from memory here.
 //!
 //! The shape follows [`crate::flood`]: a process-wide
@@ -90,7 +90,10 @@ impl LimitFlags {
             .remove(&key_id);
     }
 
-    /// Drops every verdict; used by tests and by nothing on the request path.
+    /// Drops every verdict. Test-only: nothing on the request path or in the
+    /// admin handlers needs a wholesale reset, so the method stays out of the
+    /// crate's public surface.
+    #[cfg(test)]
     pub fn invalidate_all(&self) {
         self.entries
             .lock()

@@ -69,17 +69,17 @@ pub struct ChannelOption {
     pub selected: bool,
 }
 
-/// Per-field validation messages, rendered under the matching input. The
-/// strings are the shared limit parser's own error texts.
+/// Validation messages, rendered under the matching input. The strings are
+/// the shared limit parser's own error texts. The optional name has nothing
+/// to validate, so it carries no error arm.
 #[derive(Default)]
 pub struct KeyFormErrors {
-    pub name: Option<String>,
     pub monthly_limit_usd: Option<String>,
 }
 
 impl KeyFormErrors {
     fn any(&self) -> bool {
-        self.name.is_some() || self.monthly_limit_usd.is_some()
+        self.monthly_limit_usd.is_some()
     }
 }
 
@@ -720,11 +720,10 @@ mod tests {
     }
 
     #[test]
-    fn form_errors_are_reported_field_by_field() {
+    fn a_field_error_marks_the_form_invalid() {
         let errors = KeyFormErrors::default();
         assert!(!errors.any());
         let errors = KeyFormErrors {
-            name: None,
             monthly_limit_usd: Some("bad".to_string()),
         };
         assert!(errors.any());

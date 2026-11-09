@@ -34,7 +34,6 @@
     <div>
       <label for="key-name">Name (optional)</label>
       <input type="text" id="key-name" name="name" value="{{ form.name }}">
-      {% if let Some(error) = form.errors.name %}<div class="field-error">{{ error }}</div>{% endif %}
     </div>
     <div>
       <label for="key-monthly-limit">Monthly limit, USD</label>

@@ -151,8 +151,9 @@ mod tests {
     }
 
     /// One month-to-date request: 1000 prompt tokens with 400 of them
-    /// cached, 200 completion tokens, at 2.50/1.25/10.00 USD per 1M tokens,
-    /// which costs 4250 micro-USD through the pinned formula.
+    /// cached, 200 completion tokens and no cached output, at
+    /// 2.50/1.25/10.00 USD per 1M tokens, which costs 4000 micro-USD
+    /// through the pinned formula.
     fn logged_request(key_id: i64, channel_id: i64) -> NewRequestLog {
         NewRequestLog {
             api_key_id: Some(key_id),
@@ -196,9 +197,9 @@ mod tests {
     #[tokio::test]
     async fn spending_the_limit_trips_the_verdict_and_clearing_the_limit_relaxes_it() {
         let db = test_db().await;
-        // One request costs 4250 micro-USD, so a 4000 micro-USD budget is
+        // One request costs 4000 micro-USD, so a 3999 micro-USD budget is
         // crossed by the first logged request.
-        let key_id = seed(&db, "cross", Some(4_000)).await;
+        let key_id = seed(&db, "cross", Some(3_999)).await;
         let flags = LimitFlags::default();
 
         recompute(&db, &flags, key_id).await.unwrap();
@@ -226,6 +227,44 @@ mod tests {
         .unwrap();
         recompute(&db, &flags, key_id).await.unwrap();
         assert_eq!(flags.get(key_id, bucket_now()), Some(false));
+    }
+
+    #[tokio::test]
+    async fn spending_exactly_the_limit_trips_the_verdict() {
+        let db = test_db().await;
+        // One logged request costs exactly 4000 micro-USD, so a limit of
+        // 4000 is the boundary case: the comparison is `>=`, equality is
+        // already over budget and does not wait for a larger spend.
+        let key_id = seed(&db, "exact", Some(4_000)).await;
+        let flags = LimitFlags::default();
+        log_request(&db, key_id, 1).await;
+
+        recompute(&db, &flags, key_id).await.unwrap();
+        assert_eq!(
+            flags.get(key_id, bucket_now()),
+            Some(true),
+            "a spend equal to the limit is already over budget"
+        );
+
+        // One micro-USD of extra headroom and the same spend stays under the
+        // limit, pinning the other side of the edge.
+        keys::patch(
+            &db,
+            key_id,
+            &keys::KeyPatch {
+                name: None,
+                enabled: None,
+                monthly_limit_micro_usd: Some(Some(4_001)),
+            },
+        )
+        .await
+        .unwrap();
+        recompute(&db, &flags, key_id).await.unwrap();
+        assert_eq!(
+            flags.get(key_id, bucket_now()),
+            Some(false),
+            "one micro-USD above the spend is not crossed"
+        );
     }
 
     #[tokio::test]

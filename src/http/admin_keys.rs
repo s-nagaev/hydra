@@ -18,9 +18,11 @@
 //! incomplete prices keeps its limit and the admin UI marks it inactive,
 //! because prices may be filled in later.
 //!
-//! Every admin key mutation funnels through [`mutate_key`], which owns the
-//! resolution-cache invalidation around the write; that is also the single
-//! place a future in-memory limit-state hook belongs.
+//! Patches funnel through [`mutate_key`], which owns the resolution-cache
+//! and monthly-limit-flag invalidation around the write. Creation needs no
+//! invalidation (a brand-new key has no cached entry), and the delete
+//! handlers drop both caches at their own call sites, before and after the
+//! soft delete; see their comments for why.
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
