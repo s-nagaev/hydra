@@ -72,16 +72,21 @@ pub async fn recompute(db: &Db, flags: &LimitFlags, key_id: i64) -> sqlx::Result
 pub fn month_cost(usage: &[ModelUsage], prices: Option<&ModelPrices>) -> i64 {
     usage
         .iter()
-        .map(|group| {
-            let totals = TokenTotals {
-                prompt: group.prompt_tokens,
-                completion: group.completion_tokens,
-                cached_input: group.cached_input_tokens,
-                cached_output: group.cached_output_tokens,
-            };
-            cost::model_cost(group.model.as_deref(), &totals, prices)
-        })
+        .map(|group| group_cost(group, prices))
         .fold(0i64, i64::saturating_add)
+}
+
+/// Cost of one aggregate group in micro-USD. This is the single place where
+/// an aggregate group becomes a [`TokenTotals`], so the enforcement verdict
+/// and the admin stats page price a group identically.
+pub fn group_cost(group: &ModelUsage, prices: Option<&ModelPrices>) -> i64 {
+    let totals = TokenTotals {
+        prompt: group.prompt_tokens,
+        completion: group.completion_tokens,
+        cached_input: group.cached_input_tokens,
+        cached_output: group.cached_output_tokens,
+    };
+    cost::model_cost(group.model.as_deref(), &totals, prices)
 }
 
 #[cfg(test)]
@@ -337,5 +342,10 @@ mod tests {
         assert_eq!(month_cost(&usage, Some(&prices)), 3000);
         assert_eq!(month_cost(&usage, None), 0);
         assert_eq!(month_cost(&[], Some(&prices)), 0);
+        // A single group prices on its own exactly as it prices inside the
+        // sum, which is what the admin stats page relies on.
+        assert_eq!(group_cost(&usage[0], Some(&prices)), 3000);
+        assert_eq!(group_cost(&usage[1], Some(&prices)), 0);
+        assert_eq!(group_cost(&usage[1], None), 0);
     }
 }

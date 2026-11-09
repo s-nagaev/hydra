@@ -341,7 +341,9 @@ fn body_view(raw: &str) -> String {
         .unwrap_or_else(|| raw.to_string())
 }
 
-fn thousands(value: i64) -> String {
+/// Groups an integer into thousands with commas. Shared with the stats page,
+/// which renders the same token and request counts.
+pub(crate) fn thousands(value: i64) -> String {
     let digits = value.abs().to_string();
     let mut out = String::new();
     for (index, digit) in digits.chars().enumerate() {

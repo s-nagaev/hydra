@@ -585,3 +585,16 @@ form.inline {
 .detail-error {
   color: var(--danger);
 }
+
+/* Stats page: a key's total line and the grand total stand apart from the
+   per-model lines above them. */
+.stats-table tr.total-row td {
+  background: #fafbfc;
+  font-weight: 600;
+}
+
+.stats-table tfoot tr.total-row td {
+  border-top: 2px solid var(--border);
+  border-bottom: none;
+  color: var(--text-muted);
+}

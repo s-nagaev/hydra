@@ -22,6 +22,7 @@ use crate::http::AppState;
 use crate::http::admin_ui_channels;
 use crate::http::admin_ui_keys;
 use crate::http::admin_ui_logs;
+use crate::http::admin_ui_stats;
 
 // Vendored htmx 2.0.11, self-hosted so the UI works without network access.
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
@@ -73,6 +74,7 @@ pub fn router() -> Router<AppState> {
         .merge(admin_ui_channels::router())
         .merge(admin_ui_keys::router())
         .merge(admin_ui_logs::router())
+        .merge(admin_ui_stats::router())
         .layer(axum::middleware::from_fn(crate::http::csrf::guard))
 }
 
@@ -155,8 +157,25 @@ mod tests {
         assert!(html.contains("/admin/ui/channels"));
         assert!(html.contains("/admin/ui/keys"));
         assert!(html.contains("/admin/ui/logs"));
+        assert!(html.contains("/admin/ui/stats"));
         assert!(html.contains("class=\"active\""));
         assert!(html.contains(concat!("hydra ", env!("CARGO_PKG_VERSION"))));
+    }
+
+    #[tokio::test]
+    async fn stats_page_renders_with_auth_and_a_complete_nav() {
+        let state = test_state().await;
+        let (status, body) = get_page(state, "/admin/ui/stats", Some(&auth_header())).await;
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8(body).unwrap();
+        assert!(html.contains("Token usage"));
+        for section in ["channels", "keys", "logs", "stats"] {
+            assert!(
+                html.contains(&format!("/admin/ui/{section}")),
+                "the nav must link {section}"
+            );
+        }
+        assert!(html.contains("href=\"/admin/ui/stats\""));
     }
 
     #[tokio::test]

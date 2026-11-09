@@ -855,3 +855,86 @@ async fn pg_monthly_limit_gate_rejects_an_over_budget_key() {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
+
+/// The admin stats page over PostgreSQL: the per-key month-to-date aggregate
+/// and the priced cost have to render through the real router on the PG
+/// schema, where the `substr` bucket and the `BIGINT` casts behave as the
+/// sqlite unit tests pin them.
+#[tokio::test]
+async fn pg_stats_page_renders_priced_month_rows() {
+    let Some(db) = pg_db().await else {
+        skip_note();
+        return;
+    };
+    use axum::body::Body;
+    use axum::http::Request;
+
+    let tag = suffix("stats");
+    let prices = ModelPrices::from_usd_json(&serde_json::json!({
+        "gpt-4o": {
+            "input": "2.50",
+            "output": "10.00",
+            "cached_input": "1.25",
+            "cached_output": "5.00"
+        }
+    }))
+    .unwrap();
+    let priced = channels::create_with_prices(
+        &db,
+        &NewChannel {
+            name: format!("pg-{tag}"),
+            base_url: "http://127.0.0.1:9".to_string(),
+            api_key: "sk-pg-secret".to_string(),
+            allowed_models: Some(vec!["gpt-4o".to_string()]),
+        },
+        Some(&prices),
+    )
+    .await
+    .unwrap();
+    assert!(priced.limitable(), "the seeded channel must be limitable");
+    let key = keys::create(
+        &db,
+        &NewKey {
+            key_hash: format!("hash-{tag}"),
+            display_prefix: "hyd-pgstats".to_string(),
+            name: None,
+            channel_id: priced.channel.id,
+            monthly_limit_micro_usd: Some(50_000_000),
+        },
+    )
+    .await
+    .unwrap();
+
+    // One January request and one in February: only January belongs to the
+    // rendered window.
+    log_usage_at(&db, key.id, priced.channel.id, "2026-01-05 10:00:00").await;
+    log_usage_at(&db, key.id, priced.channel.id, "2026-02-05 10:00:00").await;
+
+    let response = within(
+        router(app_state(&db)).oneshot(
+            Request::builder()
+                .uri("/admin/ui/stats?month=2026-01")
+                .header("authorization", auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+
+    assert!(html.contains("hyd-pgstats"), "{html}");
+    assert!(html.contains("gpt-4o"), "{html}");
+    assert!(html.contains(">1,000<"), "one January request only: {html}");
+    assert!(html.contains(">$0.004<"), "the priced January row: {html}");
+    assert!(html.contains(">All keys<"), "the grand total line: {html}");
+    assert!(
+        html.contains("/admin/ui/stats?month=2025-12")
+            && html.contains("/admin/ui/stats?month=2026-02"),
+        "the month navigation renders: {html}"
+    );
+}
