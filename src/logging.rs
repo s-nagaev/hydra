@@ -564,6 +564,7 @@ mod tests {
                 display_prefix: "hyd-".to_string(),
                 name: None,
                 channel_id: channel.id,
+                monthly_limit_micro_usd: None,
             },
         )
         .await

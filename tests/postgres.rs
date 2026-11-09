@@ -186,6 +186,7 @@ async fn pg_channel_crud_round_trip() {
             display_prefix: "hyd-pgcrud".to_string(),
             name: None,
             channel_id: created.id,
+            monthly_limit_micro_usd: None,
         },
     )
     .await
@@ -230,6 +231,7 @@ async fn pg_key_soft_delete_state_machine() {
             display_prefix: "hyd-pgkeys".to_string(),
             name: Some("before".to_string()),
             channel_id: channel.id,
+            monthly_limit_micro_usd: Some(25_000_000),
         },
     )
     .await
@@ -240,6 +242,7 @@ async fn pg_key_soft_delete_state_machine() {
         .unwrap()
         .expect("alive before delete");
     assert_eq!(alive.channel_id, channel.id);
+    assert_eq!(alive.monthly_limit_micro_usd, Some(25_000_000));
 
     let patched = keys::patch(
         &db,
@@ -247,6 +250,7 @@ async fn pg_key_soft_delete_state_machine() {
         &hydra::db::keys::KeyPatch {
             name: Some(Some("renamed".to_string())),
             enabled: Some(false),
+            monthly_limit_micro_usd: Some(Some(60_000_000)),
         },
     )
     .await
@@ -256,6 +260,47 @@ async fn pg_key_soft_delete_state_machine() {
     };
     assert!(!patched.enabled);
     assert_eq!(patched.name.as_deref(), Some("renamed"));
+    assert_eq!(patched.monthly_limit_micro_usd, Some(60_000_000));
+
+    // An absent limit leaves the stored value alone; an explicit null
+    // clears the column rather than writing a zero.
+    let keys::PatchOutcome::Updated(untouched) = keys::patch(
+        &db,
+        key.id,
+        &hydra::db::keys::KeyPatch {
+            name: Some(Some("renamed-again".to_string())),
+            enabled: None,
+            monthly_limit_micro_usd: None,
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("patch must update an alive key");
+    };
+    assert_eq!(untouched.monthly_limit_micro_usd, Some(60_000_000));
+
+    let keys::PatchOutcome::Updated(cleared) = keys::patch(
+        &db,
+        key.id,
+        &hydra::db::keys::KeyPatch {
+            name: None,
+            enabled: None,
+            monthly_limit_micro_usd: Some(None),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("patch must update an alive key");
+    };
+    assert_eq!(cleared.monthly_limit_micro_usd, None);
+    assert_eq!(
+        keys::find(&db, key.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .monthly_limit_micro_usd,
+        None
+    );
 
     let removed = keys::delete(&db, key.id).await.unwrap();
     assert!(matches!(removed, keys::DeleteOutcome::Deleted));
@@ -270,6 +315,7 @@ async fn pg_key_soft_delete_state_machine() {
         &hydra::db::keys::KeyPatch {
             name: Some(Some("x".to_string())),
             enabled: None,
+            monthly_limit_micro_usd: None,
         },
     )
     .await
@@ -277,6 +323,113 @@ async fn pg_key_soft_delete_state_machine() {
     assert!(matches!(patched_deleted, keys::PatchOutcome::Deleted));
 
     channels::delete(&db, channel.id).await.unwrap();
+}
+
+/// The monthly limit is a nullable integer column: it must store, read back
+/// and clear through the same paths as sqlite, and a NULL must stay NULL
+/// rather than turning into a zero limit.
+#[tokio::test]
+async fn pg_key_monthly_limit_round_trip() {
+    let Some(db) = pg_db().await else {
+        skip_note();
+        return;
+    };
+    let tag = suffix("limit");
+    let state = app_state(&db);
+
+    let (status, created) = admin_post(
+        &state,
+        "/admin/channels",
+        json!({
+            "name": format!("pg-{tag}"),
+            "base_url": "http://127.0.0.1:9",
+            "api_key": "sk-pg-secret"
+        }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{created}");
+    let channel_id = created["id"].as_i64().unwrap();
+
+    // Issued with a limit: stored as micro-USD, echoed in both shapes.
+    let (status, key) = admin_post(
+        &state,
+        "/admin/keys",
+        json!({ "channel_id": channel_id, "name": "pg-limit", "monthly_limit_usd": "50.00" }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{key}");
+    assert_eq!(key["monthly_limit_micro_usd"], json!(50_000_000));
+    assert_eq!(key["monthly_limit_usd"], json!("50.00"));
+    let key_id = key["id"].as_i64().unwrap();
+
+    let found = keys::find(&db, key_id).await.unwrap().unwrap();
+    assert_eq!(found.monthly_limit_micro_usd, Some(50_000_000));
+
+    // A patch replaces the stored limit, then clears it back to unlimited.
+    let keys::PatchOutcome::Updated(replaced) = keys::patch(
+        &db,
+        key_id,
+        &hydra::db::keys::KeyPatch {
+            name: None,
+            enabled: None,
+            monthly_limit_micro_usd: Some(Some(7_500_000)),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("patch must update an alive key");
+    };
+    assert_eq!(replaced.monthly_limit_micro_usd, Some(7_500_000));
+
+    let keys::PatchOutcome::Updated(cleared) = keys::patch(
+        &db,
+        key_id,
+        &hydra::db::keys::KeyPatch {
+            name: None,
+            enabled: None,
+            monthly_limit_micro_usd: Some(None),
+        },
+    )
+    .await
+    .unwrap() else {
+        panic!("patch must update an alive key");
+    };
+    assert_eq!(cleared.monthly_limit_micro_usd, None);
+    assert_eq!(
+        keys::find(&db, key_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .monthly_limit_micro_usd,
+        None,
+        "a cleared limit must read back as NULL"
+    );
+
+    // Issued without a limit: NULL, not zero.
+    let (status, unlimited) = admin_post(
+        &state,
+        "/admin/keys",
+        json!({ "channel_id": channel_id, "name": "pg-unlimited" }),
+    )
+    .await;
+    assert_eq!(status, axum::http::StatusCode::CREATED, "{unlimited}");
+    assert_eq!(unlimited["monthly_limit_micro_usd"], Value::Null);
+    assert_eq!(unlimited["monthly_limit_usd"], Value::Null);
+
+    // A limit that cannot be represented is refused before anything lands.
+    for refused in [json!("0.0000005"), json!(-1), json!("1000000001")] {
+        let (status, error) = admin_post(
+            &state,
+            "/admin/keys",
+            json!({ "channel_id": channel_id, "monthly_limit_usd": refused }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::BAD_REQUEST,
+            "{refused} must be refused: {error}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -289,6 +289,44 @@ mod tests {
             "admin routes must require the basic scheme"
         );
 
+        // The monthly limit must be documentable from the UI: the request
+        // schemas carry the USD input field, the response schemas carry both
+        // the canonical micro-USD integer and the rendered USD string, and
+        // at least one example shows the field in use.
+        let schemas = &doc["components"]["schemas"];
+        for (schema, field) in [
+            ("CreateKeyRequest", "monthly_limit_usd"),
+            ("PatchKeyRequest", "monthly_limit_usd"),
+            ("KeyView", "monthly_limit_micro_usd"),
+            ("KeyView", "monthly_limit_usd"),
+            ("CreatedKeyView", "monthly_limit_micro_usd"),
+            ("CreatedKeyView", "monthly_limit_usd"),
+        ] {
+            assert!(
+                schemas[schema]["properties"][field].is_object(),
+                "{schema}.{field} must be in the OpenAPI document"
+            );
+        }
+        assert_eq!(
+            create_key["requestBody"]["content"]["application/json"]["examples"]["limited"]
+                ["value"]["monthly_limit_usd"],
+            serde_json::json!("50.00"),
+            "the limited example must set the USD limit"
+        );
+        let patch_key = &doc["paths"]["/admin/keys/{id}"]["patch"];
+        assert_eq!(
+            patch_key["requestBody"]["content"]["application/json"]["examples"]["set_limit"]
+                ["value"]["monthly_limit_usd"],
+            serde_json::json!("50.00"),
+            "the patch example must set the USD limit"
+        );
+        assert!(
+            patch_key["requestBody"]["content"]["application/json"]["examples"]["clear_limit"]
+                ["value"]["monthly_limit_usd"]
+                .is_null(),
+            "the patch example must clear the limit with an explicit null"
+        );
+
         // The /admin/logs route template has no {param} placeholders, so a
         // filter emitted as a path parameter is unusable from Swagger UI and
         // a required one misrepresents the handler. Location and

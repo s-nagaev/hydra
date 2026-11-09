@@ -273,6 +273,7 @@ pub async fn seed_key(db: &SqlitePool, channel_id: i64) -> String {
             display_prefix: generated.display_prefix,
             name: None,
             channel_id,
+            monthly_limit_micro_usd: None,
         },
     ))
     .await
@@ -292,6 +293,7 @@ pub async fn disable_key(db: &SqlitePool, key_id: i64) {
         &KeyPatch {
             name: None,
             enabled: Some(false),
+            monthly_limit_micro_usd: None,
         },
     ))
     .await

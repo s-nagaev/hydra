@@ -9,5 +9,6 @@ pub mod db;
 pub mod flood;
 pub mod http;
 pub mod keys;
+pub mod limits;
 pub mod logging;
 pub mod prices;
