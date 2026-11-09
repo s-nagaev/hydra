@@ -24,6 +24,8 @@ struct LogRow {
     status: Option<i64>,
     prompt_tokens: Option<i64>,
     completion_tokens: Option<i64>,
+    cached_input_tokens: Option<i64>,
+    cached_output_tokens: Option<i64>,
     duration_ms: i64,
     request_body: Option<String>,
     response_body: Option<String>,
@@ -38,6 +40,8 @@ fn map_log_row(row: &sqlx::sqlite::SqliteRow) -> LogRow {
         status: row.try_get("status").unwrap(),
         prompt_tokens: row.try_get("prompt_tokens").unwrap(),
         completion_tokens: row.try_get("completion_tokens").unwrap(),
+        cached_input_tokens: row.try_get("cached_input_tokens").unwrap(),
+        cached_output_tokens: row.try_get("cached_output_tokens").unwrap(),
         duration_ms: row.try_get("duration_ms").unwrap(),
         request_body: row.try_get("request_body").unwrap(),
         response_body: row.try_get("response_body").unwrap(),
@@ -49,7 +53,8 @@ async fn fetch_logs(db: &SqlitePool) -> Vec<LogRow> {
     let rows = within(
         sqlx::query(
             "SELECT api_key_id, channel_id, model, status, prompt_tokens, \
-             completion_tokens, duration_ms, request_body, response_body, error \
+             completion_tokens, cached_input_tokens, cached_output_tokens, \
+             duration_ms, request_body, response_body, error \
              FROM request_logs ORDER BY id",
         )
         .fetch_all(db),
@@ -153,10 +158,53 @@ async fn non_stream_chat_logs_one_row_with_tokens_and_null_bodies() {
     assert_eq!(row.status, Some(200));
     assert_eq!(row.prompt_tokens, Some(12));
     assert_eq!(row.completion_tokens, Some(34));
+    assert_eq!(
+        row.cached_input_tokens, None,
+        "the upstream reported no cached prompt tokens"
+    );
+    assert_eq!(row.cached_output_tokens, None);
     assert!(row.duration_ms > 0);
     assert!(row.request_body.is_none(), "bodies off: no capture");
     assert!(row.response_body.is_none(), "bodies off: no capture");
     assert!(row.error.is_none());
+}
+
+#[tokio::test]
+async fn non_stream_chat_stores_cached_token_details() {
+    let db = common::test_pool().await;
+    let completion = serde_json::json!({
+        "id": "chatcmpl-cached",
+        "object": "chat.completion",
+        "model": "gpt-4o",
+        "usage": {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_tokens_details": { "cached_tokens": 64 },
+            "completion_tokens_details": { "cached_tokens": 8 },
+        },
+    })
+    .to_string();
+    let base = common::spawn_upstream(fixed_response_router(
+        Recorder::default(),
+        StatusCode::OK,
+        "application/json",
+        completion,
+    ))
+    .await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db.clone());
+
+    let (status, _) = send_chat(app, &key, chat_body("gpt-4o", false)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let logs = wait_for_logs(&db, 1).await;
+    let row = &logs[0];
+    assert_eq!(row.prompt_tokens, Some(100));
+    assert_eq!(row.completion_tokens, Some(20));
+    assert_eq!(row.cached_input_tokens, Some(64));
+    assert_eq!(row.cached_output_tokens, Some(8));
 }
 
 #[tokio::test]
@@ -225,7 +273,7 @@ async fn streaming_chat_with_usage_chunk_parses_tokens() {
         b"\n\n".to_vec().into(),
         br#"data: {"choices":[],"usage":null}"#.to_vec().into(),
         b"\n\n".to_vec().into(),
-        br#"data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9}}"#
+        br#"data: {"choices":[],"usage":{"prompt_tokens":7,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":5}}}"#
             .to_vec()
             .into(),
         b"\n\n".to_vec().into(),
@@ -244,10 +292,44 @@ async fn streaming_chat_with_usage_chunk_parses_tokens() {
     assert_eq!(row.status, Some(200));
     assert_eq!(row.prompt_tokens, Some(7));
     assert_eq!(row.completion_tokens, Some(9));
+    assert_eq!(row.cached_input_tokens, Some(5));
+    assert_eq!(row.cached_output_tokens, None);
+}
+
+/// Usage parsing is independent of body logging: with capture off the row
+/// still carries the tokens the upstream reported, only the bodies are null.
+#[tokio::test]
+async fn streaming_chat_without_body_logging_still_parses_usage() {
+    let db = common::test_pool().await;
+    let chunks: Vec<Bytes> = vec![
+        br#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#.to_vec().into(),
+        b"\n\n".to_vec().into(),
+        br#"data: {"choices":[],"usage":{"prompt_tokens":4,"completion_tokens":6,"prompt_cache_hit_tokens":3}}"#
+            .to_vec()
+            .into(),
+        b"\n\n".to_vec().into(),
+        b"data: [DONE]\n\n".to_vec().into(),
+    ];
+    let base = common::spawn_upstream(sse_router(Recorder::default(), chunks)).await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db.clone());
+
+    let (status, _) = send_chat(app, &key, chat_body("gpt-4o", true)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let logs = wait_for_logs(&db, 1).await;
+    let row = &logs[0];
+    assert_eq!(row.status, Some(200));
+    assert!(row.request_body.is_none());
+    assert!(row.response_body.is_none());
+    assert_eq!(row.prompt_tokens, Some(4));
+    assert_eq!(row.completion_tokens, Some(6));
+    assert_eq!(row.cached_input_tokens, Some(3));
 }
 
 #[tokio::test]
-async fn streaming_chat_without_body_logging_leaves_bodies_and_tokens_null() {
+async fn streaming_chat_without_usage_chunk_leaves_tokens_null_with_bodies_off() {
     let db = common::test_pool().await;
     let chunks: Vec<Bytes> = vec![
         br#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#.to_vec().into(),
@@ -269,6 +351,58 @@ async fn streaming_chat_without_body_logging_leaves_bodies_and_tokens_null() {
     assert!(row.response_body.is_none());
     assert!(row.prompt_tokens.is_none());
     assert!(row.completion_tokens.is_none());
+    assert!(row.cached_input_tokens.is_none());
+}
+
+/// The regression this task exists for: the usage chunk arrives after the
+/// 1 MiB body cap, so the price of parsing it must not be a retained body.
+#[tokio::test]
+async fn streaming_chat_parses_usage_that_arrives_past_the_body_capture_cap() {
+    let db = common::test_pool().await;
+    let filler = "x".repeat(256 * 1024);
+    let mut chunks: Vec<Bytes> = (0..5)
+        .map(|_| {
+            format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{filler}\"}}}}]}}\n\n")
+                .into_bytes()
+                .into()
+        })
+        .collect();
+    chunks.push(
+        br#"data: {"choices":[],"usage":{"prompt_tokens":21,"completion_tokens":42,"prompt_tokens_details":{"cached_tokens":13}}}"#
+            .to_vec()
+            .into(),
+    );
+    chunks.push(b"\n\ndata: [DONE]\n\n".to_vec().into());
+    let streamed: usize = chunks.iter().map(|chunk| chunk.len()).sum();
+    assert!(
+        streamed > BODY_CAPTURE_LIMIT,
+        "the fixture must stream past the cap"
+    );
+
+    let base = common::spawn_upstream(sse_router(Recorder::default(), chunks)).await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app_logging(db.clone());
+
+    let (status, body) = send_chat(app, &key, chat_body("gpt-4o", true)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.len(), streamed, "the client stream must be complete");
+
+    let logs = wait_for_logs(&db, 1).await;
+    let row = &logs[0];
+    assert_eq!(row.status, Some(200));
+    assert_eq!(
+        row.response_body.as_deref().map(str::len),
+        Some(BODY_CAPTURE_LIMIT),
+        "body capture still stops at the cap"
+    );
+    assert_eq!(
+        row.prompt_tokens,
+        Some(21),
+        "the tail window must keep the usage chunk that follows the cap"
+    );
+    assert_eq!(row.completion_tokens, Some(42));
+    assert_eq!(row.cached_input_tokens, Some(13));
 }
 
 #[tokio::test]

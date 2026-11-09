@@ -111,6 +111,13 @@ pub struct RequestLogView {
     pub status: Option<i64>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    /// Cached prompt tokens the upstream reported (OpenAI
+    /// `prompt_tokens_details.cached_tokens`, DeepSeek
+    /// `prompt_cache_hit_tokens`); null when it reported none.
+    pub cached_input_tokens: Option<i64>,
+    /// Cached completion tokens the upstream reported; null when it
+    /// reported none.
+    pub cached_output_tokens: Option<i64>,
     pub duration_ms: i64,
     pub error: Option<String>,
     pub created_at: String,
@@ -133,6 +140,8 @@ impl From<RequestLog> for RequestLogView {
             status: log.status,
             prompt_tokens: log.prompt_tokens,
             completion_tokens: log.completion_tokens,
+            cached_input_tokens: log.cached_input_tokens,
+            cached_output_tokens: log.cached_output_tokens,
             duration_ms: log.duration_ms,
             error: log.error,
             created_at: log.created_at,
@@ -225,6 +234,13 @@ pub struct RequestLogDetailView {
     pub status: Option<i64>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    /// Cached prompt tokens the upstream reported (OpenAI
+    /// `prompt_tokens_details.cached_tokens`, DeepSeek
+    /// `prompt_cache_hit_tokens`); null when it reported none.
+    pub cached_input_tokens: Option<i64>,
+    /// Cached completion tokens the upstream reported; null when it
+    /// reported none.
+    pub cached_output_tokens: Option<i64>,
     pub duration_ms: i64,
     pub error: Option<String>,
     pub created_at: String,
@@ -247,6 +263,8 @@ impl From<RequestLog> for RequestLogDetailView {
             status: log.status,
             prompt_tokens: log.prompt_tokens,
             completion_tokens: log.completion_tokens,
+            cached_input_tokens: log.cached_input_tokens,
+            cached_output_tokens: log.cached_output_tokens,
             duration_ms: log.duration_ms,
             error: log.error,
             created_at: log.created_at,
@@ -278,6 +296,8 @@ impl From<RequestLog> for RequestLogDetailView {
             "status": 200,
             "prompt_tokens": 12,
             "completion_tokens": 34,
+            "cached_input_tokens": 8,
+            "cached_output_tokens": null,
             "duration_ms": 845,
             "error": null,
             "created_at": "2026-11-07 23:59:59",
@@ -315,7 +335,9 @@ pub async fn get_one(
         on for that request; a row that never reached the upstream has a \
         null `status` and its failure in `error`. `status_class` buckets \
         rows by upstream status (`2xx`, `4xx`, `5xx`, or `errors`, which \
-        also includes the rows with a null status).",
+        also includes the rows with a null status). `cached_input_tokens` \
+        and `cached_output_tokens` carry the cache hits an upstream \
+        reported; null means it reported none.",
     security(("basic_auth" = [])),
     params(LogListQuery),
     responses(
@@ -329,6 +351,8 @@ pub async fn get_one(
                     "status": 200,
                     "prompt_tokens": 12,
                     "completion_tokens": 34,
+                    "cached_input_tokens": 8,
+                    "cached_output_tokens": null,
                     "duration_ms": 845,
                     "error": null,
                     "created_at": "2026-11-07 23:59:59",

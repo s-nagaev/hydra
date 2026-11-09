@@ -291,7 +291,7 @@ async fn pg_proxy_call_logs_and_lists() {
         Recorder::default(),
         axum::http::StatusCode::OK,
         "application/json",
-        br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":2,"completion_tokens":3}}"#.to_vec(),
+        br#"{"id":"x","choices":[{"message":{"content":"hi"}}],"usage":{"prompt_tokens":2,"completion_tokens":3,"prompt_tokens_details":{"cached_tokens":1}}}"#.to_vec(),
     ))
     .await;
 
@@ -350,6 +350,15 @@ async fn pg_proxy_call_logs_and_lists() {
     assert_eq!(rows[0].status, Some(200));
     assert_eq!(rows[0].prompt_tokens, Some(2));
     assert_eq!(rows[0].completion_tokens, Some(3));
+    assert_eq!(
+        rows[0].cached_input_tokens,
+        Some(1),
+        "the cached prompt tokens must round-trip through the pg schema"
+    );
+    assert_eq!(
+        rows[0].cached_output_tokens, None,
+        "the upstream reported no cached completion tokens"
+    );
     assert!(rows[0].error.is_none());
     assert_eq!(rows[0].created_at.len(), 19);
     assert_eq!(rows[0].created_at.as_bytes()[10], b' ');
@@ -373,6 +382,8 @@ async fn pg_rejection_row_with_null_ids_round_trips() {
             status: Some(401),
             prompt_tokens: None,
             completion_tokens: None,
+            cached_input_tokens: None,
+            cached_output_tokens: None,
             duration_ms: 1,
             request_body: Some(r#"{"model":"gpt-4o"}"#.to_string()),
             response_body: None,

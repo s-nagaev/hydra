@@ -74,6 +74,9 @@ pub struct LogRow {
     pub status_css: String,
     pub duration_ms: i64,
     pub tokens: String,
+    /// Cached prompt / cached completion tokens, each `-` when the
+    /// upstream reported none.
+    pub cached_tokens: String,
     pub client_ip: Option<String>,
     pub error_full: Option<String>,
     pub error_shown: Option<String>,
@@ -135,6 +138,9 @@ pub struct LogDetailPage {
     pub status_text: String,
     pub status_css: String,
     pub tokens: String,
+    /// Cached prompt / cached completion tokens, each `-` when the
+    /// upstream reported none.
+    pub cached_tokens: String,
     pub duration_ms: i64,
     pub client_ip: Option<String>,
     pub log_error: Option<String>,
@@ -274,6 +280,18 @@ fn tokens_view(prompt: Option<i64>, completion: Option<i64>) -> String {
         (Some(prompt), Some(completion)) => format!("{prompt} / {completion}"),
         (Some(prompt), None) => format!("{prompt} / -"),
         (None, Some(completion)) => format!("- / {completion}"),
+        (None, None) => "-".to_string(),
+    }
+}
+
+/// Cached prompt / cached completion tokens for the table cells. A NULL
+/// column renders as `-`, exactly like the token columns next to it; the
+/// two halves are independent, so one can be known while the other is not.
+fn cached_tokens_view(cached_input: Option<i64>, cached_output: Option<i64>) -> String {
+    match (cached_input, cached_output) {
+        (Some(input), Some(output)) => format!("{input} / {output}"),
+        (Some(input), None) => format!("{input} / -"),
+        (None, Some(output)) => format!("- / {output}"),
         (None, None) => "-".to_string(),
     }
 }
@@ -612,6 +630,10 @@ fn build_page(query: &LogsQuery, data: LogsData, error: Option<String>) -> LogsP
                 status_css,
                 duration_ms: log.duration_ms,
                 tokens: tokens_view(log.prompt_tokens, log.completion_tokens),
+                cached_tokens: cached_tokens_view(
+                    log.cached_input_tokens,
+                    log.cached_output_tokens,
+                ),
                 client_ip: log.client_ip.clone(),
                 error_full,
                 error_shown,
@@ -776,6 +798,7 @@ async fn build_detail(state: &AppState, log: RequestLog, back_url: String) -> Lo
         status_text,
         status_css,
         tokens: tokens_view(log.prompt_tokens, log.completion_tokens),
+        cached_tokens: cached_tokens_view(log.cached_input_tokens, log.cached_output_tokens),
         duration_ms: log.duration_ms,
         client_ip: log.client_ip,
         log_error: log.error,
@@ -800,6 +823,7 @@ fn empty_detail(id: i64, back_url: String, message: String) -> LogDetailPage {
         status_text: String::new(),
         status_css: String::new(),
         tokens: String::new(),
+        cached_tokens: String::new(),
         duration_ms: 0,
         client_ip: None,
         log_error: None,

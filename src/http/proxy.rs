@@ -360,8 +360,7 @@ pub async fn chat_completions(
             tracing::warn!(error = %e, "upstream chat request failed");
             ctx.finish(
                 None,
-                None,
-                None,
+                logging::Usage::default(),
                 None,
                 Some(format!("upstream request failed: {e}")),
             );
@@ -606,8 +605,7 @@ async fn upstream_to_response(
                 if let Some(ctx) = log {
                     ctx.finish(
                         Some(status_code),
-                        None,
-                        None,
+                        logging::Usage::default(),
                         None,
                         Some("upstream response body read failed".to_string()),
                     );
@@ -618,13 +616,7 @@ async fn upstream_to_response(
         if let Some(ctx) = log {
             let usage = logging::parse_usage(&bytes);
             let response_body = ctx.capture_response_body(&bytes);
-            ctx.finish(
-                Some(status_code),
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                response_body,
-                None,
-            );
+            ctx.finish(Some(status_code), usage, response_body, None);
         }
         Ok(response
             .body(Body::from(bytes))
@@ -690,7 +682,7 @@ fn log_auth_rejection(
         // A storage failure answers 500 without reaching the upstream.
         ProxyAuthError::Database(e) => (None, format!("proxy key lookup failed: {e}")),
     };
-    ctx.finish(status, None, None, None, Some(message));
+    ctx.finish(status, logging::Usage::default(), None, Some(message));
 }
 
 /// Writes the audit row for a flood-capped request: at most one row per
@@ -724,8 +716,7 @@ fn log_flood_cap_rejection(
     });
     ctx.finish(
         Some(401),
-        None,
-        None,
+        logging::Usage::default(),
         None,
         Some("flood cap: too many failed authentications from this address".to_string()),
     );
@@ -745,7 +736,12 @@ fn log_rejection(
     error: &ProxyError,
 ) {
     let ctx = chat_log_context(state, auth, model, start, body, client_ip);
-    ctx.finish(None, None, None, None, Some(error.to_string()));
+    ctx.finish(
+        None,
+        logging::Usage::default(),
+        None,
+        Some(error.to_string()),
+    );
 }
 
 #[cfg(test)]

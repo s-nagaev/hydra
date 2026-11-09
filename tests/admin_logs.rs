@@ -438,9 +438,57 @@ async fn stored_bodies_are_returned_only_when_present() {
         assert_eq!(item["status"], 200);
         assert_eq!(item["prompt_tokens"], 10);
         assert_eq!(item["completion_tokens"], 5);
+        assert!(
+            item["cached_input_tokens"].is_null(),
+            "a row without cache hits reports null, not zero"
+        );
+        assert!(item["cached_output_tokens"].is_null());
         assert_eq!(item["duration_ms"], 42);
         assert!(item["created_at"].is_string());
     }
+}
+
+#[tokio::test]
+async fn cached_token_columns_are_exposed_in_the_listing_and_the_detail() {
+    let db = test_pool().await;
+    let (channel_id, key_id) = seed_channel_and_key(&db).await;
+    let cached: i64 = within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
+              cached_input_tokens, cached_output_tokens, duration_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key_id)
+        .bind(channel_id)
+        .bind("gpt-4o")
+        .bind(200)
+        .bind(100)
+        .bind(20)
+        .bind(64)
+        .bind(8)
+        .bind(42i64)
+        .bind("2026-11-07 10:00:00")
+        .execute(&db),
+    )
+    .await
+    .unwrap()
+    .last_insert_rowid();
+
+    let (_, list) = send_get_on(&db, "/admin/logs", Some(&auth_header())).await;
+    let item = list["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"].as_i64() == Some(cached))
+        .expect("the cached row must be listed");
+    assert_eq!(item["cached_input_tokens"], 64);
+    assert_eq!(item["cached_output_tokens"], 8);
+
+    let (_, detail) =
+        send_get_on(&db, &format!("/admin/logs/{cached}"), Some(&auth_header())).await;
+    assert_eq!(detail["cached_input_tokens"], 64);
+    assert_eq!(detail["cached_output_tokens"], 8);
 }
 
 #[tokio::test]
@@ -605,6 +653,8 @@ async fn log_detail_returns_the_full_row_including_bodies_and_client_ip() {
     assert_eq!(body["status"], 200);
     assert_eq!(body["prompt_tokens"], 12);
     assert_eq!(body["completion_tokens"], 34);
+    assert_eq!(body["cached_input_tokens"], Value::Null);
+    assert_eq!(body["cached_output_tokens"], Value::Null);
     assert_eq!(body["duration_ms"], 845);
     assert_eq!(body["error"], Value::Null);
     assert_eq!(body["created_at"], "2026-11-07 23:59:59");

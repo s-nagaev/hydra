@@ -24,6 +24,15 @@ pub struct NewRequestLog {
     pub status: Option<i64>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    /// Prompt tokens the upstream served from its cache (OpenAI
+    /// `prompt_tokens_details.cached_tokens`, DeepSeek
+    /// `prompt_cache_hit_tokens`). NULL when the upstream reported no
+    /// cached tokens, never a fabricated zero.
+    pub cached_input_tokens: Option<i64>,
+    /// Completion tokens the upstream served from its cache (OpenAI
+    /// `completion_tokens_details.cached_tokens`); NULL when the vendor
+    /// reports none.
+    pub cached_output_tokens: Option<i64>,
     pub duration_ms: i64,
     pub request_body: Option<String>,
     pub response_body: Option<String>,
@@ -35,7 +44,7 @@ pub struct NewRequestLog {
 /// are reported through tracing, never to the proxied client.
 pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
     let mut sql = Sql::for_db(db);
-    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, duration_ms, request_body, response_body, error, client_ip, created_at) VALUES (")
+    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, cached_input_tokens, cached_output_tokens, duration_ms, request_body, response_body, error, client_ip, created_at) VALUES (")
         .bind(Arg::OptInt(log.api_key_id))
         .push(", ")
         .bind(Arg::OptInt(log.channel_id))
@@ -47,6 +56,10 @@ pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
         .bind(Arg::OptInt(log.prompt_tokens))
         .push(", ")
         .bind(Arg::OptInt(log.completion_tokens))
+        .push(", ")
+        .bind(Arg::OptInt(log.cached_input_tokens))
+        .push(", ")
+        .bind(Arg::OptInt(log.cached_output_tokens))
         .push(", ")
         .bind(Arg::Int(log.duration_ms))
         .push(", ")
@@ -77,6 +90,12 @@ pub struct RequestLog {
     pub status: Option<i64>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    /// Cached prompt tokens the upstream reported; NULL when it reported
+    /// none or the row predates the column.
+    pub cached_input_tokens: Option<i64>,
+    /// Cached completion tokens the upstream reported; NULL when it
+    /// reported none or the row predates the column.
+    pub cached_output_tokens: Option<i64>,
     pub duration_ms: i64,
     pub request_body: Option<String>,
     pub response_body: Option<String>,
@@ -179,6 +198,8 @@ fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
         status: row.opt_int("status")?,
         prompt_tokens: row.opt_int("prompt_tokens")?,
         completion_tokens: row.opt_int("completion_tokens")?,
+        cached_input_tokens: row.opt_int("cached_input_tokens")?,
+        cached_output_tokens: row.opt_int("cached_output_tokens")?,
         duration_ms: row.int("duration_ms")?,
         request_body: row.opt_text("request_body")?,
         response_body: row.opt_text("response_body")?,
@@ -191,8 +212,8 @@ fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
 /// Column list shared by the listing and the per-row lookup so both stay in
 /// sync with `map_row`.
 const SELECT_COLUMNS: &str = "id, api_key_id, channel_id, model, status, prompt_tokens, \
-     completion_tokens, duration_ms, request_body, response_body, error, \
-     client_ip, created_at";
+     completion_tokens, cached_input_tokens, cached_output_tokens, duration_ms, \
+     request_body, response_body, error, client_ip, created_at";
 
 /// Fetches one log row by id; `None` when no row carries this id. Backs the
 /// admin detail endpoint, which needs the stored bodies alongside the
