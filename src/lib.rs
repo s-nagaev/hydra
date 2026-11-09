@@ -9,3 +9,4 @@ pub mod db;
 pub mod http;
 pub mod keys;
 pub mod logging;
+pub mod prices;
