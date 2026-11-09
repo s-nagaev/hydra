@@ -18,7 +18,10 @@
 //! fail the client flow. Rejections are logged too, auth-layer ones
 //! included (they resolve to no key, so their rows carry NULL ids); the
 //! only unloggable case is the 413 body-limit rejection, which happens in
-//! the body extractor before any handler code runs. Anonymous 401 spam is
+//! the body extractor before any handler code runs. A request rejected by
+//! the monthly-limit gate is logged through its own path, which keeps the
+//! key that asked and the model it asked for, so per-key usage reporting
+//! stays complete. Anonymous 401 spam is
 //! additionally flood-capped per client IP before the key lookup
 //! ([`crate::flood`]); the capped phase answers the same 401 without
 //! touching the database and contributes at most one log row per window
@@ -261,6 +264,13 @@ where
         (status = 413, description = "The request body exceeds 32 MiB", body = OpenAiError, example = json!({
             "error": { "message": "Request body exceeds the maximum allowed size of 32 MiB", "type": "invalid_request_error", "code": null }
         })),
+        (status = 429, description = "The key's monthly spending limit is \
+            reached. Enforced for a key that has a limit and whose channel \
+            is priceable (every whitelisted model carries all four prices); \
+            the verdict is recomputed in the background after each logged \
+            response, so the first requests after a restart pass", body = OpenAiError, example = json!({
+            "error": { "message": "Monthly limit reached", "type": "rate_limit_error", "code": null }
+        })),
         (status = 502, description = "The bound channel is gone, or the \
             upstream could not be reached; other upstream statuses pass \
             through unchanged", body = OpenAiError, examples(
@@ -305,6 +315,12 @@ pub async fn chat_completions(
         Err(ProxyAuthError::FloodCapped(ticket)) => {
             log_flood_cap_rejection(&state, start, &body, client_ip, &ticket);
             return Ok(ProxyAuthError::FloodCapped(ticket).into_response());
+        }
+        // The limit gate runs after the key resolved, so this rejection
+        // knows who asked and gets its own row rather than the NULL-key one.
+        Err(e @ ProxyAuthError::MonthlyLimitReached { key_id, channel_id }) => {
+            log_limit_rejection(&state, start, &body, client_ip, key_id, channel_id);
+            return Ok(e.into_response());
         }
         Err(e) => {
             log_auth_rejection(&state, start, &body, client_ip, &e);
@@ -360,8 +376,7 @@ pub async fn chat_completions(
             tracing::warn!(error = %e, "upstream chat request failed");
             ctx.finish(
                 None,
-                None,
-                None,
+                logging::Usage::default(),
                 None,
                 Some(format!("upstream request failed: {e}")),
             );
@@ -383,8 +398,9 @@ pub async fn chat_completions(
     description = "Serves model discovery for the key's channel. A channel \
         with a whitelist gets a locally built OpenAI list containing exactly \
         the whitelisted ids; a channel without one proxies the upstream \
-        listing with the same key substitution as chat. This endpoint is \
-        not logged.",
+        listing with the same key substitution as chat. The monthly-limit \
+        gate runs here too, so a key over budget is answered 429. This \
+        endpoint is not logged.",
     security(("bearer_auth" = [])),
     responses(
         (status = 200, description = "OpenAI model list, either the \
@@ -402,6 +418,11 @@ pub async fn chat_completions(
         })),
         (status = 403, description = "The key exists but is disabled", body = OpenAiError, example = json!({
             "error": { "message": "This API key has been disabled", "type": "invalid_request_error", "code": "key_disabled" }
+        })),
+        (status = 429, description = "The key's monthly spending limit is \
+            reached; the gate is shared with the chat route, so a key over \
+            budget cannot list models either", body = OpenAiError, example = json!({
+            "error": { "message": "Monthly limit reached", "type": "rate_limit_error", "code": null }
         })),
         (status = 502, description = "The upstream models listing could not \
             be fetched, or the bound channel is gone", body = OpenAiError, examples(
@@ -606,8 +627,7 @@ async fn upstream_to_response(
                 if let Some(ctx) = log {
                     ctx.finish(
                         Some(status_code),
-                        None,
-                        None,
+                        logging::Usage::default(),
                         None,
                         Some("upstream response body read failed".to_string()),
                     );
@@ -618,13 +638,7 @@ async fn upstream_to_response(
         if let Some(ctx) = log {
             let usage = logging::parse_usage(&bytes);
             let response_body = ctx.capture_response_body(&bytes);
-            ctx.finish(
-                Some(status_code),
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                response_body,
-                None,
-            );
+            ctx.finish(Some(status_code), usage, response_body, None);
         }
         Ok(response
             .body(Body::from(bytes))
@@ -653,6 +667,7 @@ fn chat_log_context(
         start,
         request_body: body,
         client_ip,
+        flags: &state.limit_flags,
     })
 }
 
@@ -681,6 +696,7 @@ fn log_auth_rejection(
         start,
         request_body: body,
         client_ip,
+        flags: &state.limit_flags,
     });
     let (status, message) = match error {
         ProxyAuthError::InvalidKey | ProxyAuthError::FloodCapped(_) => {
@@ -689,8 +705,14 @@ fn log_auth_rejection(
         ProxyAuthError::DisabledKey => (Some(403), "This API key has been disabled".to_string()),
         // A storage failure answers 500 without reaching the upstream.
         ProxyAuthError::Database(e) => (None, format!("proxy key lookup failed: {e}")),
+        // Never reached: the limit rejection has its own path
+        // ([`log_limit_rejection`]) precisely so the row keeps the caller's
+        // key. This arm exists so the match stays exhaustive.
+        ProxyAuthError::MonthlyLimitReached { .. } => {
+            (Some(429), "Monthly limit reached".to_string())
+        }
     };
-    ctx.finish(status, None, None, None, Some(message));
+    ctx.finish(status, logging::Usage::default(), None, Some(message));
 }
 
 /// Writes the audit row for a flood-capped request: at most one row per
@@ -721,13 +743,49 @@ fn log_flood_cap_rejection(
         start,
         request_body: body,
         client_ip,
+        flags: &state.limit_flags,
     });
     ctx.finish(
         Some(401),
-        None,
-        None,
+        logging::Usage::default(),
         None,
         Some("flood cap: too many failed authentications from this address".to_string()),
+    );
+}
+
+/// Writes the audit row for a request rejected because the key's monthly
+/// spending limit is used up. The gate runs after the key resolved, so
+/// unlike the auth-layer rejections this row names the real key and channel
+/// and the model the caller asked for: a limit rejection is usage of that
+/// key, and the per-key reporting must see it. The row is written by the
+/// detached logging task like any other, and the model is read from the
+/// already buffered request body, which was never forwarded.
+fn log_limit_rejection(
+    state: &AppState,
+    start: Instant,
+    body: &Bytes,
+    client_ip: Option<String>,
+    key_id: i64,
+    channel_id: i64,
+) {
+    let model = peek_request(body).ok().map(|(model, _)| model);
+    let ctx = ChatLogContext::new(ChatLogInit {
+        db: &state.db,
+        tracker: &state.log_tracker,
+        log_bodies: state.log_bodies,
+        api_key_id: Some(key_id),
+        channel_id: Some(channel_id),
+        model,
+        start,
+        request_body: body,
+        client_ip,
+        flags: &state.limit_flags,
+    });
+    ctx.finish(
+        Some(429),
+        logging::Usage::default(),
+        None,
+        Some("Monthly limit reached".to_string()),
     );
 }
 
@@ -745,7 +803,12 @@ fn log_rejection(
     error: &ProxyError,
 ) {
     let ctx = chat_log_context(state, auth, model, start, body, client_ip);
-    ctx.finish(None, None, None, None, Some(error.to_string()));
+    ctx.finish(
+        None,
+        logging::Usage::default(),
+        None,
+        Some(error.to_string()),
+    );
 }
 
 #[cfg(test)]

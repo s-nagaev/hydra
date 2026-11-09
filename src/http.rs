@@ -12,6 +12,7 @@ mod admin_ui;
 mod admin_ui_channels;
 mod admin_ui_keys;
 mod admin_ui_logs;
+mod admin_ui_stats;
 mod client_ip;
 mod csrf;
 mod docs;
@@ -51,6 +52,38 @@ pub struct AppState {
     pub trusted_proxies: crate::config::TrustedProxies,
     /// Per-IP flood cap on failed authentications; see `crate::flood`.
     pub flood: crate::flood::FloodCap,
+    /// In-memory verdicts of the monthly key limits; see `crate::limit_flags`
+    /// and `crate::usage` for how they are computed.
+    pub limit_flags: crate::limit_flags::LimitFlags,
+}
+
+impl AppState {
+    /// Builds state with the production wiring for everything that is not a
+    /// parameter: one shared upstream client, a fresh resolution cache, an
+    /// empty log tracker and an empty monthly-limit flag store. Every
+    /// construction site goes through this, so a future state field lands
+    /// here once instead of at each call site.
+    pub fn new(
+        db: crate::db::Db,
+        admin_login: String,
+        admin_password: String,
+        log_bodies: bool,
+        trusted_proxies: crate::config::TrustedProxies,
+        flood: crate::flood::FloodCap,
+    ) -> Self {
+        AppState {
+            db,
+            admin_login,
+            admin_password,
+            client: upstream_client(),
+            log_bodies,
+            log_tracker: crate::logging::LogTracker::default(),
+            cache: crate::cache::ResolutionCache::default(),
+            trusted_proxies,
+            flood,
+            limit_flags: crate::limit_flags::LimitFlags::default(),
+        }
+    }
 }
 
 /// Builds the shared upstream client. Only the connect timeout lives here:
@@ -139,17 +172,14 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        AppState {
-            db: pool.into(),
-            admin_login: "admin".to_string(),
-            admin_password: "secret".to_string(),
-            client: upstream_client(),
-            log_bodies: false,
-            log_tracker: crate::logging::LogTracker::default(),
-            cache: crate::cache::ResolutionCache::default(),
-            trusted_proxies: crate::config::TrustedProxies::default(),
-            flood: crate::flood::FloodCap::default(),
-        }
+        AppState::new(
+            pool.into(),
+            "admin".to_string(),
+            "secret".to_string(),
+            false,
+            crate::config::TrustedProxies::default(),
+            crate::flood::FloodCap::default(),
+        )
     }
 
     async fn send(

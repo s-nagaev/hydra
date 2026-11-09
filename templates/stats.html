@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+
+{% block title %}Stat{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>Token usage <span class="text-muted">{{ month_label }}</span></h1>
+  </div>
+
+  {% if let Some(error) = error %}
+  <div class="error-banner" role="alert">{{ error }}</div>
+  {% endif %}
+
+  <form class="filter-bar" method="get" action="/admin/ui/stats">
+    <div class="filter-field">
+      <label for="stats-month">Month (UTC)</label>
+      <input type="month" id="stats-month" name="month" value="{{ month_value }}">
+    </div>
+    <div class="filter-field">
+      <button type="submit" class="primary">Apply</button>
+    </div>
+    <div class="filter-field">
+      <a class="button" href="{{ prev_url }}">Previous month</a>
+    </div>
+    <div class="filter-field">
+      <a class="button" href="{{ next_url }}">Next month</a>
+    </div>
+    {% if !is_current_month %}
+    <div class="filter-field">
+      <a href="{{ current_url }}">This month</a>
+    </div>
+    {% endif %}
+  </form>
+
+  <table class="data-table stats-table">
+    <thead>
+      <tr>
+        <th>Key</th>
+        <th>Model</th>
+        <th>Input tokens</th>
+        <th>Output tokens</th>
+        <th>Cached input</th>
+        <th>Cached output</th>
+        <th>Requests</th>
+        <th>Cost (USD)</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if rows.is_empty() %}
+      <tr>
+        <td colspan="8" class="empty-state">{{ empty_message }}</td>
+      </tr>
+      {% else %}
+      {% for row in rows %}
+      <tr{% if row.is_total %} class="total-row"{% endif %}>
+        <td class="mono">{{ row.key_label }}
+          {%- if row.key_deleted %} <span class="badge deleted">deleted</span>{% endif %}
+          {%- if row.limit_inactive %} <span class="badge off" title="the limit is stored but not enforced while the channel has no complete price list">limit inactive: channel prices incomplete</span>{% endif %}
+        </td>
+        <td>{% if row.is_total %}<strong>{{ row.model_label }}</strong>{% else %}{{ row.model_label }}{% endif %}</td>
+        <td class="mono">{{ row.sums.prompt_tokens }}</td>
+        <td class="mono">{{ row.sums.completion_tokens }}</td>
+        <td class="mono">{{ row.sums.cached_input_tokens }}</td>
+        <td class="mono">{{ row.sums.cached_output_tokens }}</td>
+        <td class="mono">{{ row.sums.requests }}</td>
+        <td class="mono">{{ row.sums.cost }}</td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+    </tbody>
+    {% if !rows.is_empty() %}
+    <tfoot>
+      <tr class="total-row">
+        <td colspan="2">All keys</td>
+        <td class="mono">{{ grand.prompt_tokens }}</td>
+        <td class="mono">{{ grand.completion_tokens }}</td>
+        <td class="mono">{{ grand.cached_input_tokens }}</td>
+        <td class="mono">{{ grand.cached_output_tokens }}</td>
+        <td class="mono">{{ grand.requests }}</td>
+        <td class="mono">{{ grand.cost }}</td>
+      </tr>
+    </tfoot>
+    {% endif %}
+  </table>
+
+  <p class="table-meta">
+    Requests without reported usage are not counted in the token sums: they add no
+    tokens here while still counting as requests. Requests rejected before a key
+    resolved belong to no key at all. Cost is computed from the price list of the
+    key's channel, so a model that channel does not price costs zero.
+  </p>
+</section>
+{% endblock %}

@@ -169,6 +169,7 @@ mod tests {
             display_prefix: "hyd-abcd".to_string(),
             name: None,
             channel_id,
+            monthly_limit_micro_usd: None,
             enabled: true,
             deleted_at: None,
             created_at: "2026-11-08 00:00:00".to_string(),

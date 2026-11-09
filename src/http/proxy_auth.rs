@@ -32,6 +32,19 @@
 //! storage failures leave the settled counter untouched. The capped
 //! response is byte-identical to the unknown-key 401, so the cap is not an
 //! oracle for key validity.
+//!
+//! A resolved key whose monthly spending limit is used up is answered
+//! [`ProxyAuthError::MonthlyLimitReached`], a 429 in the OpenAI error shape.
+//! The decision is one in-memory lookup ([`crate::limit_flags`]); the
+//! verdict itself is recomputed off the request path by
+//! [`crate::usage::recompute`] after every logged response. It is only ever
+//! `true` for a key that has a limit and whose channel is limitable, so a
+//! limit stored against a channel the router cannot price stays stored and
+//! unenforced, and an absent verdict (a fresh process, an invalidated entry,
+//! an evicted one) lets the request through until the next logged response
+//! repopulates it. The check runs on every bearer-authenticated proxy route,
+//! `/v1/models` included: a key over budget cannot list models either, which
+//! is deliberate.
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -61,6 +74,15 @@ pub struct ProxyAuth {
 #[error("proxy authentication failed")]
 pub enum ProxyAuthError {
     InvalidKey,
+    /// The key's monthly spending limit is used up. Carries the resolved key
+    /// and channel ids so the audit row of the rejection keeps the real key
+    /// instead of the NULL-key shape a rejection before resolution would
+    /// produce.
+    #[error("monthly limit reached")]
+    MonthlyLimitReached {
+        key_id: i64,
+        channel_id: i64,
+    },
     /// The client IP exhausted its failed-authentication budget; the
     /// response is the same 401 an unknown key gets. The ticket binds the
     /// rejection to the window the cap decision was made in, for the
@@ -86,6 +108,12 @@ impl IntoResponse for ProxyAuthError {
                 "This API key has been disabled",
                 "invalid_request_error",
                 Some("key_disabled"),
+            ),
+            ProxyAuthError::MonthlyLimitReached { .. } => openai_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Monthly limit reached",
+                "rate_limit_error",
+                None,
             ),
             ProxyAuthError::Database(e) => {
                 tracing::error!(error = %e, "proxy key lookup failed");
@@ -135,13 +163,18 @@ impl FromRequestParts<AppState> for ProxyAuth {
             // An invalid key is exactly the failure the budget counts: its
             // admission slot settles into a recorded failure.
             Err(ProxyAuthError::InvalidKey) => Err(ProxyAuthError::InvalidKey),
-            // Every other outcome releases the slot: successes, a disabled
-            // key (403) and storage failures must not feed the counter.
+            // Every other outcome releases the slot first: successes, a
+            // disabled key (403), a spent monthly limit (429) and storage
+            // failures must not feed the counter. Only then is the monthly
+            // limit checked, so a rejected request cannot starve the IP's
+            // budget for the requests that follow it.
             other => {
                 if let Some(ticket) = &flood_ticket {
                     state.flood.release(ticket);
                 }
-                other
+                let auth = other?;
+                Self::check_monthly_limit(state, &auth)?;
+                Ok(auth)
             }
         }
     }
@@ -189,6 +222,30 @@ impl ProxyAuth {
             }
         }
         Ok(ProxyAuth { key, channel })
+    }
+
+    /// Rejects a key whose monthly-limit verdict says it is over budget.
+    ///
+    /// The read is one hash lookup on the in-memory verdict store; the
+    /// aggregate it stands for is computed off the request path. A key
+    /// without a limit is never gated, and a verdict that is `false` or
+    /// absent passes. Absent is the state of a fresh process, of an entry an
+    /// admin mutation invalidated and of an evicted one, and letting those
+    /// through is the accepted consequence of a bounded in-memory store (see
+    /// [`crate::limit_flags`]). A non-limitable channel never produces a
+    /// `true` verdict, so its keys keep their limits stored and unenforced.
+    fn check_monthly_limit(state: &AppState, auth: &ProxyAuth) -> Result<(), ProxyAuthError> {
+        if auth.key.monthly_limit_micro_usd.is_none() {
+            return Ok(());
+        }
+        let month = crate::month::Month::current();
+        if state.limit_flags.get(auth.key.id, month.bucket()) != Some(true) {
+            return Ok(());
+        }
+        Err(ProxyAuthError::MonthlyLimitReached {
+            key_id: auth.key.id,
+            channel_id: auth.key.channel_id,
+        })
     }
 }
 

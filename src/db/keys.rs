@@ -23,6 +23,9 @@ pub struct ApiKey {
     pub display_prefix: String,
     pub name: Option<String>,
     pub channel_id: i64,
+    /// Monthly spending limit in integer micro-USD; NULL means unlimited.
+    /// See [`crate::limits`] for the unit and the accepted range.
+    pub monthly_limit_micro_usd: Option<i64>,
     pub enabled: bool,
     pub deleted_at: Option<String>,
     pub created_at: String,
@@ -34,13 +37,17 @@ pub struct NewKey {
     pub display_prefix: String,
     pub name: Option<String>,
     pub channel_id: i64,
+    pub monthly_limit_micro_usd: Option<i64>,
 }
 
 /// Partial update. `None` fields are left unchanged; the outer `None` of
-/// `name` leaves the column, `Some(None)` clears it to NULL.
+/// a double option leaves the column, `Some(None)` clears it to NULL.
 pub struct KeyPatch {
     pub name: Option<Option<String>>,
     pub enabled: Option<bool>,
+    /// `Some(None)` clears the limit back to unlimited, `Some(Some(micro))`
+    /// sets it and `None` leaves the stored limit alone.
+    pub monthly_limit_micro_usd: Option<Option<i64>>,
 }
 
 /// Result of a PATCH attempt against the soft-delete state machine.
@@ -57,8 +64,8 @@ pub enum DeleteOutcome {
     AlreadyDeleted,
 }
 
-const SELECT_COLUMNS: &str =
-    "id, key_hash, display_prefix, name, channel_id, enabled, deleted_at, created_at";
+const SELECT_COLUMNS: &str = "id, key_hash, display_prefix, name, channel_id, \
+     monthly_limit_micro_usd, enabled, deleted_at, created_at";
 
 fn map_key(row: &Row) -> sqlx::Result<ApiKey> {
     Ok(ApiKey {
@@ -67,6 +74,7 @@ fn map_key(row: &Row) -> sqlx::Result<ApiKey> {
         display_prefix: row.text("display_prefix")?,
         name: row.opt_text("name")?,
         channel_id: row.int("channel_id")?,
+        monthly_limit_micro_usd: row.opt_int("monthly_limit_micro_usd")?,
         enabled: row.boolean("enabled")?,
         deleted_at: row.opt_text("deleted_at")?,
         created_at: row.text("created_at")?,
@@ -74,23 +82,29 @@ fn map_key(row: &Row) -> sqlx::Result<ApiKey> {
 }
 
 /// Inserts a key row. The caller retries on a UNIQUE collision of
-/// `key_hash` by generating a fresh key.
+/// `key_hash` by generating a fresh key. The caller has already validated
+/// the limit through [`crate::limits`]; this layer stores it as given.
 pub async fn create(db: &Db, key: &NewKey) -> sqlx::Result<ApiKey> {
     let mut sql = Sql::for_db(db);
-    sql.push("INSERT INTO api_keys (key_hash, display_prefix, name, channel_id, enabled, created_at) VALUES (")
-        .bind(Arg::Text(Some(key.key_hash.clone())))
-        .push(", ")
-        .bind(Arg::Text(Some(key.display_prefix.clone())))
-        .push(", ")
-        .bind(Arg::Text(key.name.clone()))
-        .push(", ")
-        .bind(Arg::Int(key.channel_id))
-        .push(", ")
-        .bind(Arg::Bool(true))
-        .push(", ")
-        .bind(Arg::Text(Some(timestamp::now_utc())))
-        .push(") RETURNING ")
-        .push(SELECT_COLUMNS);
+    sql.push(
+        "INSERT INTO api_keys (key_hash, display_prefix, name, channel_id, \
+         monthly_limit_micro_usd, enabled, created_at) VALUES (",
+    )
+    .bind(Arg::Text(Some(key.key_hash.clone())))
+    .push(", ")
+    .bind(Arg::Text(Some(key.display_prefix.clone())))
+    .push(", ")
+    .bind(Arg::Text(key.name.clone()))
+    .push(", ")
+    .bind(Arg::Int(key.channel_id))
+    .push(", ")
+    .bind(Arg::OptInt(key.monthly_limit_micro_usd))
+    .push(", ")
+    .bind(Arg::Bool(true))
+    .push(", ")
+    .bind(Arg::Text(Some(timestamp::now_utc())))
+    .push(") RETURNING ")
+    .push(SELECT_COLUMNS);
     let row = db.fetch_one(sql).await?;
     map_key(&row)
 }
@@ -115,6 +129,19 @@ pub async fn find_alive_by_hash(db: &Db, key_hash: &str) -> sqlx::Result<Option<
         .push(" FROM api_keys WHERE key_hash = ")
         .bind(Arg::Text(Some(key_hash.to_string())))
         .push(" AND deleted_at IS NULL");
+    let row = db.fetch_optional(sql).await?;
+    row.as_ref().map(map_key).transpose()
+}
+
+/// Fetches one key row by id, soft-deleted rows included: the admin UI edit
+/// form reads the stored values through it and decides the deleted state
+/// itself, exactly as the PATCH state machine does.
+pub async fn find(db: &Db, id: i64) -> sqlx::Result<Option<ApiKey>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT ")
+        .push(SELECT_COLUMNS)
+        .push(" FROM api_keys WHERE id = ")
+        .bind(Arg::Int(id));
     let row = db.fetch_optional(sql).await?;
     row.as_ref().map(map_key).transpose()
 }
@@ -151,6 +178,14 @@ pub async fn patch(db: &Db, id: i64, key_patch: &KeyPatch) -> sqlx::Result<Patch
             sql.push(", ");
         }
         sql.push("enabled = ").bind(Arg::Bool(enabled));
+        assignments += 1;
+    }
+    if let Some(limit) = key_patch.monthly_limit_micro_usd {
+        if assignments > 0 {
+            sql.push(", ");
+        }
+        sql.push("monthly_limit_micro_usd = ")
+            .bind(Arg::OptInt(limit));
         assignments += 1;
     }
     if assignments == 0 {
@@ -206,5 +241,188 @@ pub async fn delete(db: &Db, id: i64) -> sqlx::Result<DeleteOutcome> {
         Ok(DeleteOutcome::AlreadyDeleted)
     } else {
         Ok(DeleteOutcome::NotFound)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+    use crate::db::channels::{self, NewChannel};
+
+    async fn test_db() -> Db {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        Db::from(pool)
+    }
+
+    async fn channel_id(db: &Db) -> i64 {
+        channels::create(
+            db,
+            &NewChannel {
+                name: "upstream".to_string(),
+                base_url: "https://api.example.com".to_string(),
+                api_key: "sk-upstream-secret".to_string(),
+                allowed_models: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    fn new_key(name: &str, limit: Option<i64>) -> NewKey {
+        NewKey {
+            key_hash: format!("hash-{name}"),
+            display_prefix: "hyd-abcdefgh".to_string(),
+            name: Some(name.to_string()),
+            channel_id: 0,
+            monthly_limit_micro_usd: limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_monthly_limit_round_trips_through_the_column() {
+        let db = test_db().await;
+        let channel_id = channel_id(&db).await;
+
+        let unlimited = create(
+            &db,
+            &NewKey {
+                channel_id,
+                ..new_key("unlimited", None)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(unlimited.monthly_limit_micro_usd, None);
+
+        let limited = create(
+            &db,
+            &NewKey {
+                channel_id,
+                ..new_key("limited", Some(50_000_000))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(limited.monthly_limit_micro_usd, Some(50_000_000));
+
+        // Both readers see the same stored value.
+        let found = find(&db, limited.id).await.unwrap().unwrap();
+        assert_eq!(found.monthly_limit_micro_usd, Some(50_000_000));
+        let by_hash = find_alive_by_hash(&db, "hash-limited")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(by_hash.monthly_limit_micro_usd, Some(50_000_000));
+        let listed = list(&db).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[1].monthly_limit_micro_usd, Some(50_000_000));
+    }
+
+    fn patch_only(limit: Option<Option<i64>>) -> KeyPatch {
+        KeyPatch {
+            name: None,
+            enabled: None,
+            monthly_limit_micro_usd: limit,
+        }
+    }
+
+    #[tokio::test]
+    async fn patching_replaces_leaves_alone_and_clears_the_limit() {
+        let db = test_db().await;
+        let channel_id = channel_id(&db).await;
+        let created = create(
+            &db,
+            &NewKey {
+                channel_id,
+                ..new_key("limited", Some(1_000_000))
+            },
+        )
+        .await
+        .unwrap();
+        let id = created.id;
+
+        // No assignments at all: the stored limit stays.
+        let PatchOutcome::Updated(untouched) = patch(&db, id, &patch_only(None)).await.unwrap()
+        else {
+            panic!("an alive key must report Updated");
+        };
+        assert_eq!(untouched.monthly_limit_micro_usd, Some(1_000_000));
+
+        // A name-only patch leaves the limit alone too.
+        let PatchOutcome::Updated(renamed) = patch(
+            &db,
+            id,
+            &KeyPatch {
+                name: Some(Some("renamed".to_string())),
+                ..patch_only(None)
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("an alive key must report Updated");
+        };
+        assert_eq!(renamed.name.as_deref(), Some("renamed"));
+        assert_eq!(renamed.monthly_limit_micro_usd, Some(1_000_000));
+
+        // A present limit replaces the stored one.
+        let PatchOutcome::Updated(replaced) = patch(&db, id, &patch_only(Some(Some(2_500_000))))
+            .await
+            .unwrap()
+        else {
+            panic!("an alive key must report Updated");
+        };
+        assert_eq!(replaced.monthly_limit_micro_usd, Some(2_500_000));
+
+        // An explicit null clears it back to unlimited.
+        let PatchOutcome::Updated(cleared) = patch(&db, id, &patch_only(Some(None))).await.unwrap()
+        else {
+            panic!("an alive key must report Updated");
+        };
+        assert_eq!(cleared.monthly_limit_micro_usd, None);
+        assert_eq!(
+            find(&db, id)
+                .await
+                .unwrap()
+                .unwrap()
+                .monthly_limit_micro_usd,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_stored_limit_is_null_until_a_migration_runner_sets_one() {
+        let db = test_db().await;
+        let channel_id = channel_id(&db).await;
+        // A row inserted the way the pre-migration schema would leave it:
+        // the limit column absent, which must read back as NULL.
+        let mut sql = Sql::for_db(&db);
+        sql.push(
+            "INSERT INTO api_keys (key_hash, display_prefix, name, channel_id, enabled, \
+             created_at) VALUES (",
+        )
+        .bind(Arg::Text(Some("legacy".to_string())))
+        .push(", ")
+        .bind(Arg::Text(Some("hyd-legacy".to_string())))
+        .push(", ")
+        .bind(Arg::Text(None))
+        .push(", ")
+        .bind(Arg::Int(channel_id))
+        .push(", ")
+        .bind(Arg::Bool(true))
+        .push(", ")
+        .bind(Arg::Text(Some(timestamp::now_utc())))
+        .push(")");
+        db.execute(sql).await.unwrap();
+
+        let listed = list(&db).await.unwrap();
+        assert_eq!(listed[0].monthly_limit_micro_usd, None);
     }
 }

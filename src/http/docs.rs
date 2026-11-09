@@ -111,6 +111,7 @@ impl Modify for SecurityAddon {
             super::admin_channels::CreateChannelRequest,
             super::admin_channels::PatchChannelRequest,
             super::admin_channels::ChannelView,
+            super::admin_channels::ModelPriceView,
             super::admin_keys::CreateKeyRequest,
             super::admin_keys::PatchKeyRequest,
             super::admin_keys::KeyView,
@@ -150,17 +151,14 @@ mod tests {
             .await
             .unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
-        AppState {
-            db: pool.into(),
-            admin_login: "admin".to_string(),
-            admin_password: "secret".to_string(),
-            client: crate::http::upstream_client(),
-            log_bodies: false,
-            log_tracker: crate::logging::LogTracker::default(),
-            cache: crate::cache::ResolutionCache::default(),
-            trusted_proxies: crate::config::TrustedProxies::default(),
-            flood: crate::flood::FloodCap::default(),
-        }
+        AppState::new(
+            pool.into(),
+            "admin".to_string(),
+            "secret".to_string(),
+            false,
+            crate::config::TrustedProxies::default(),
+            crate::flood::FloodCap::default(),
+        )
     }
 
     #[tokio::test]
@@ -286,6 +284,44 @@ mod tests {
         assert!(
             create_key["security"][0]["basic_auth"].is_array(),
             "admin routes must require the basic scheme"
+        );
+
+        // The monthly limit must be documentable from the UI: the request
+        // schemas carry the USD input field, the response schemas carry both
+        // the canonical micro-USD integer and the rendered USD string, and
+        // at least one example shows the field in use.
+        let schemas = &doc["components"]["schemas"];
+        for (schema, field) in [
+            ("CreateKeyRequest", "monthly_limit_usd"),
+            ("PatchKeyRequest", "monthly_limit_usd"),
+            ("KeyView", "monthly_limit_micro_usd"),
+            ("KeyView", "monthly_limit_usd"),
+            ("CreatedKeyView", "monthly_limit_micro_usd"),
+            ("CreatedKeyView", "monthly_limit_usd"),
+        ] {
+            assert!(
+                schemas[schema]["properties"][field].is_object(),
+                "{schema}.{field} must be in the OpenAPI document"
+            );
+        }
+        assert_eq!(
+            create_key["requestBody"]["content"]["application/json"]["examples"]["limited"]
+                ["value"]["monthly_limit_usd"],
+            serde_json::json!("50.00"),
+            "the limited example must set the USD limit"
+        );
+        let patch_key = &doc["paths"]["/admin/keys/{id}"]["patch"];
+        assert_eq!(
+            patch_key["requestBody"]["content"]["application/json"]["examples"]["set_limit"]
+                ["value"]["monthly_limit_usd"],
+            serde_json::json!("50.00"),
+            "the patch example must set the USD limit"
+        );
+        assert!(
+            patch_key["requestBody"]["content"]["application/json"]["examples"]["clear_limit"]
+                ["value"]["monthly_limit_usd"]
+                .is_null(),
+            "the patch example must clear the limit with an explicit null"
         );
 
         // The /admin/logs route template has no {param} placeholders, so a

@@ -9,7 +9,7 @@ forwards the request, and passes the response through unchanged, streaming
 included.
 
 Status: proof of concept. Chat Completions and `/v1/models` only, one admin
-user, no failover or quotas.
+user, no failover.
 
 ## Features
 
@@ -22,8 +22,9 @@ user, no failover or quotas.
 - Each key is bound to one channel; channels can restrict requests to an
   exact-match model whitelist (no wildcards, `null` or empty means allow all)
 - Background request logging into the configured database (SQLite or
-  PostgreSQL): status, token usage, duration, errors; bodies are opt-in via
-  `HYDRA_LOG_BODIES` and capped at 1 MB per side
+  PostgreSQL): status, token usage including cached tokens, duration,
+  errors; bodies are opt-in via `HYDRA_LOG_BODIES` and capped at 1 MB per
+  side, while token usage is parsed with or without that flag
 - Single admin over HTTP Basic Auth on `/admin/*`; upstream keys are masked in
   every response
 - SQLite in WAL mode by default, PostgreSQL via `HYDRA_DATABASE_URL`; migrations
@@ -39,6 +40,11 @@ user, no failover or quotas.
 - Request log drill-down: `GET /admin/logs/{id}` and a detail page in the
   admin UI with status, token usage, duration, client IP, error text and
   the captured bodies
+- Optional prices per model on a channel (USD per 1M tokens, stored as exact
+  integer micro-USD) and an optional monthly spending limit per client key,
+  enforced with a 429 `Monthly limit reached`
+- A **Stat** admin tab with month-to-date token usage and computed cost per
+  key, broken down by model and selectable by month
 
 ## Quickstart
 
@@ -213,6 +219,18 @@ status, token usage, duration, client IP, error text and the captured
 request and response bodies, plus a back link that restores the exact
 filters and page of the list view.
 
+Channels carry an optional price table, edited on the channels page as one
+line per model, `model: input, output, cached_input, cached_output`, each
+amount in USD per 1M tokens. The channels table marks a channel "limitable"
+when it is enabled, its model whitelist is set, and every model in that
+whitelist carries all four prices; those prices feed the per-key cost and
+monthly limit described below.
+
+The Stat tab (`/admin/ui/stats`) shows month-to-date token usage per key,
+grouped by model, with input, output, cached input, cached output, request
+count and computed cost, for a month chosen with a picker or the
+previous/next links.
+
 ![Keys page](docs/screenshots/keys.png)
 
 ![Logs page](docs/screenshots/logs.png)
@@ -271,7 +289,7 @@ What the cache guarantees:
   PATCH/DELETE drops that key's entries, channel PATCH/DELETE drops every
   entry bound to the channel. Each invalidation also advances a cache
   epoch, and a refill is only stored when the epoch observed before the
-  resolution was read is still current — a proxy request that was in
+  resolution was read is still current, so a proxy request that was in
   flight across a mutation cannot re-insert the pre-write state. Rotating
   a channel's `base_url` or upstream `api_key` therefore takes effect on
   the very next call, never at TTL expiry.
@@ -355,6 +373,104 @@ same behavior as for ordinary unknown-key rejections; the flood cap runs
 before the key lookup but after the body extractor.
 
 
+## Token usage and monthly limits
+
+Every logged request carries the token counts the upstream reported: prompt,
+completion, and the cached shares of both when the vendor publishes them
+(OpenAI's `prompt_tokens_details.cached_tokens`, DeepSeek's
+`prompt_cache_hit_tokens`). Usage is parsed whether or not `HYDRA_LOG_BODIES`
+captures bodies, for buffered and streaming responses alike: a stream is read
+through a rolling 64 KiB tail window, so the usage object that arrives in the
+final chunk is still parsed however large the response is. A dimension the
+upstream does not report stays NULL and renders as `-` in the log views rather
+than as a zero, and a request with no usage at all is left out of the token
+sums while still counting as a request.
+
+A channel can carry a price table, so a request can be expressed in money. The
+JSON API takes it as `model_prices`, decimal USD per 1M tokens per dimension
+(`input`, `output`, `cached_input`, `cached_output`); the admin UI takes the
+same data as one line per model,
+`model: input, output, cached_input, cached_output`. Prices are stored as
+integer micro-USD per 1M tokens and every cost is computed with integer
+arithmetic, so no float takes part in the numbers the router stores. The cost
+of a request follows OpenAI's convention that `prompt_tokens` already contains
+the cached tokens:
+
+```text
+cost = (prompt - cached_input) * input_price
+     + cached_input * cached_input_price
+     + completion * output_price
+     + cached_output * cached_output_price
+     (prices in micro-USD per 1M tokens, the sum divided by 1M once)
+```
+
+A model the channel does not price costs nothing, and a request whose upstream
+reported no usage contributes nothing.
+
+### Monthly limit per key
+
+`monthly_limit_usd` on a client key caps that key's spending for the calendar
+month (UTC). The value is decimal USD with at most six decimal places and at
+most $1B, and it is stored as integer micro-USD like every other amount in the
+router; omit it, or send `null`, for an unlimited key. Once the key's
+month-to-date cost reaches the limit, `/v1/chat/completions` and `/v1/models`
+both answer
+
+```json
+{"error": {"message": "Monthly limit reached", "type": "rate_limit_error", "code": null}}
+```
+
+with status 429, until the month rolls over: the new month starts against an
+empty budget with no timer and no sweep. Here is a key with a 50.00 USD limit
+in one call:
+
+```bash
+curl -u admin:change-me -X POST http://127.0.0.1:8080/admin/keys \
+  -H 'Content-Type: application/json' \
+  -d '{"channel_id": 1, "name": "ci-bot", "monthly_limit_usd": "50.00"}'
+```
+
+Enforcement reads an in-memory verdict rather than the aggregate: after every
+logged response the key's month-to-date spend is recomputed in the background
+and stored as one flag, which the proxy path reads as a hash lookup. Any admin
+change to a key, its limit or its existence drops the verdict immediately, so
+a new limit is in force from the key's next logged response.
+
+A limit is enforced only when the bound channel can be priced: the channel
+must be enabled, resolve to a fixed model list, and carry all four prices for
+every model in that list. A limit on a channel that does not qualify is stored
+and not enforced, which the admin UI marks with `limit inactive: channel prices
+incomplete` on the keys page and the Stat tab. This is deliberate: prices are
+often filled in after the key is issued.
+
+The Stat tab (`/admin/ui/stats`) is where the numbers are visible: month-to-date
+usage per key, grouped by model, with input, output, cached input, cached output
+tokens, request count and computed cost in USD, plus a total row for all keys.
+The month is selectable with a picker and previous/next links.
+
+### Known limitations
+
+All of these are deliberate, and each one favors speed or simplicity over an
+exact enforcement boundary:
+
+- Requests whose upstream reports no usage (a stream without
+  `stream_options.include_usage`, or an upstream that sends no usage object at
+  all) contribute nothing to the aggregates and therefore nothing to the
+  limit.
+- A key crossing the limit can overshoot by the one or two requests already in
+  flight while its verdict was being recomputed.
+- The verdict lives in memory only, so a restart clears it: after a restart the
+  first requests of a limited key pass until the background recompute has run
+  once.
+- Adding or editing a channel's prices does not re-evaluate an existing verdict
+  by itself; enforcement follows the next logged response of that key.
+- Streaming usage is read from a rolling 64 KiB tail window. A stream whose
+  usage object sits further than that from the end of the response is not
+  counted.
+- A key with a limit on a non-limitable channel is stored but not enforced, as
+  described above.
+
+
 ## PostgreSQL
 
 SQLite suits a single instance with modest traffic and is the default; choose
@@ -362,7 +478,7 @@ PostgreSQL when several Hydra instances must share one database, when you want
 server-side backups and monitoring already in place for a Postgres server, or
 when the write volume outgrows a single file. The schema is identical in
 shape, the tables and indexes match one-to-one, and migrations for the chosen
-backend apply automatically at startup — nothing to run by hand.
+backend apply automatically at startup, so there is nothing to run by hand.
 
 With Docker Compose, a profile-gated stack brings up PostgreSQL plus a second
 Hydra instance wired to it, while the default `docker compose up -d` stays
@@ -440,6 +556,7 @@ can parse it:
 | 403 | `key_disabled` | key exists but is disabled |
 | 404 | `model_not_found` | requested model is not in the channel whitelist |
 | 413 | null | chat body over 32 MiB |
+| 429 | null | the key reached its monthly limit (`type` is `rate_limit_error`) |
 | 502 | null | bound channel is gone, or the upstream could not be reached |
 | 503 | `channel_disabled` | the channel bound to the key is disabled |
 
@@ -499,6 +616,6 @@ None of this is implemented yet; it is where Hydra is meant to grow.
 - Anthropic Messages API and OpenAI Responses API passthrough
 - Google request and response formats
 - Multi-channel keys: one key bound to several channels with failover
-- Quotas and budgets per key
+- Shared limit state across several instances instead of per-process flags
 
 License: TBD.

@@ -759,3 +759,82 @@ async fn detail_page_escapes_markup_in_bodies() {
     // The escaped text is still shown, inert.
     assert!(body.contains("&#60;script&#62;alert(&#39;xss-request&#39;)&#60;/script&#62;"));
 }
+
+// --- Cached tokens --------------------------------------------------------
+
+/// Inserts one row with explicit cached token counts; every other column
+/// stays on a fixed value so the rendered cells are predictable.
+async fn insert_cached_log(
+    db: &SqlitePool,
+    key_id: i64,
+    channel_id: i64,
+    cached_input: Option<i64>,
+    cached_output: Option<i64>,
+    created_at: &str,
+) -> i64 {
+    within(
+        sqlx::query(
+            "INSERT INTO request_logs \
+             (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, \
+              cached_input_tokens, cached_output_tokens, duration_ms, created_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key_id)
+        .bind(channel_id)
+        .bind("gpt-4o")
+        .bind(200i64)
+        .bind(10i64)
+        .bind(5i64)
+        .bind(cached_input)
+        .bind(cached_output)
+        .bind(42i64)
+        .bind(created_at)
+        .execute(db),
+    )
+    .await
+    .unwrap()
+    .last_insert_rowid()
+}
+
+#[tokio::test]
+async fn cached_tokens_render_beside_the_plain_tokens_with_a_dash_for_nulls() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let both = insert_cached_log(
+        &db,
+        key_id,
+        channel_id,
+        Some(6),
+        Some(2),
+        "2026-11-07 10:00:00",
+    )
+    .await;
+    let mixed = insert_cached_log(
+        &db,
+        key_id,
+        channel_id,
+        Some(4),
+        None,
+        "2026-11-07 10:01:00",
+    )
+    .await;
+    let none = insert_cached_log(&db, key_id, channel_id, None, None, "2026-11-07 10:02:00").await;
+
+    let (status, body) = get_page(&db, "/admin/ui/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Cached tokens (in / out)"));
+    assert!(body.contains("6 / 2"));
+
+    let (status, detail) = get_page(&db, &format!("/admin/ui/logs/{both}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(detail.contains("Cached tokens (in / out)"));
+    assert!(detail.contains("6 / 2"));
+
+    // Half a report renders the known half and a dash for the other.
+    let (_, detail) = get_page(&db, &format!("/admin/ui/logs/{mixed}")).await;
+    assert!(detail.contains("4 / -"));
+
+    // No report at all renders the same dash the empty cells use.
+    let (_, detail) = get_page(&db, &format!("/admin/ui/logs/{none}")).await;
+    assert!(detail.contains(r#"<td class="mono">-</td>"#));
+}

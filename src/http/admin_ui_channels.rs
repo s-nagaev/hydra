@@ -18,22 +18,26 @@ use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 
-use crate::db::channels::{self, Channel, ChannelPatch, DeleteOutcome, NewChannel};
+use crate::db::channels::{self, Channel, ChannelPatch, DeleteOutcome, NewChannel, PricedChannel};
 use crate::http::admin_auth::AdminAuth;
 use crate::http::admin_channels::{
     mask_api_key, validate_allowed_models, validate_base_url, validate_channel_api_key,
-    validate_channel_name, AdminError,
+    validate_channel_name, validate_model_prices, AdminError,
 };
 use crate::http::AppState;
+use crate::prices::{self, ModelPrice, ModelPrices, UsdAmountError, DIMENSIONS};
 
 /// One table row. The upstream key is masked before it leaves the server,
-/// exactly like the JSON views.
+/// exactly like the JSON views. Prices arrive as ready-to-render lines and
+/// the limitable state is computed here, so the template stays logic-free.
 pub struct ChannelRow {
     pub id: i64,
     pub name: String,
     pub base_url: String,
     pub api_key_masked: String,
     pub allowed_models: Option<Vec<String>>,
+    pub prices_display: Vec<String>,
+    pub limitable: bool,
     pub enabled: bool,
 }
 
@@ -45,6 +49,7 @@ pub struct ChannelFormErrors {
     pub base_url: Option<String>,
     pub api_key: Option<String>,
     pub allowed_models: Option<String>,
+    pub model_prices: Option<String>,
 }
 
 impl ChannelFormErrors {
@@ -53,6 +58,7 @@ impl ChannelFormErrors {
             || self.base_url.is_some()
             || self.api_key.is_some()
             || self.allowed_models.is_some()
+            || self.model_prices.is_some()
     }
 }
 
@@ -65,6 +71,7 @@ pub struct ChannelForm {
     pub name: String,
     pub base_url: String,
     pub allowed_models_text: String,
+    pub model_prices_text: String,
     pub errors: ChannelFormErrors,
 }
 
@@ -99,6 +106,7 @@ pub struct ChannelCreateForm {
     pub base_url: String,
     pub api_key: String,
     pub allowed_models: Option<String>,
+    pub model_prices: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -108,6 +116,7 @@ pub struct ChannelEditForm {
     /// Empty or absent means "keep the current key" on the edit form.
     pub api_key: Option<String>,
     pub allowed_models: Option<String>,
+    pub model_prices: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -127,6 +136,105 @@ fn parse_allowed_models_text(raw: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// Parses the prices textarea: one model per line, in the form
+/// `model: input, output, cached_input, cached_output`, each amount USD per
+/// 1M tokens with at most six decimal places. Blank lines are skipped and
+/// an empty textarea yields an empty table, which clears the stored prices
+/// exactly like an explicit null in the JSON API. Every error names the
+/// line it came from.
+fn parse_model_prices_text(raw: Option<&str>) -> Result<ModelPrices, String> {
+    let expected = "expected \"model: input, output, cached_input, cached_output\"";
+    let mut entries: Vec<(String, ModelPrice)> = Vec::new();
+    for (index, raw_line) in raw.unwrap_or_default().lines().enumerate() {
+        let line = raw_line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let number = index + 1;
+        let Some((model, amounts)) = line.split_once(':') else {
+            return Err(format!("line {number}: {expected}"));
+        };
+        let model = model.trim();
+        if model.is_empty() {
+            return Err(format!("line {number}: the model name is empty"));
+        }
+        let amounts: Vec<&str> = amounts.split(',').map(str::trim).collect();
+        if amounts.len() != DIMENSIONS.len() {
+            return Err(format!(
+                "line {number}: {model} needs {} amounts, got {}",
+                DIMENSIONS.len(),
+                amounts.len()
+            ));
+        }
+        if entries.iter().any(|(existing, _)| existing == model) {
+            return Err(format!("line {number}: {model} is listed twice"));
+        }
+        let mut micro = [0u64; DIMENSIONS.len()];
+        for (slot, (dimension, amount)) in micro.iter_mut().zip(DIMENSIONS.iter().zip(amounts)) {
+            *slot = match prices::parse_usd(amount) {
+                Ok(micro) => micro,
+                Err(UsdAmountError::NotExact) => {
+                    return Err(format!(
+                        "line {number}: {model} {dimension} \"{amount}\" is finer than \
+                         0.000001 USD"
+                    ))
+                }
+                Err(_) => {
+                    return Err(format!(
+                        "line {number}: {model} {dimension} \"{amount}\" must be a \
+                         non-negative decimal USD amount"
+                    ))
+                }
+            };
+        }
+        entries.push((
+            model.to_string(),
+            ModelPrice {
+                input: micro[0],
+                output: micro[1],
+                cached_input: micro[2],
+                cached_output: micro[3],
+            },
+        ));
+    }
+    ModelPrices::from_entries(entries).map_err(|error| error.to_string())
+}
+
+/// Renders a stored table back into the textarea format, so the edit form
+/// opens with exactly what the parser accepts.
+fn prices_text(prices: &ModelPrices) -> String {
+    prices
+        .iter()
+        .map(|(model, price)| {
+            format!(
+                "{model}: {}, {}, {}, {}",
+                prices::format_usd(price.input),
+                prices::format_usd(price.output),
+                prices::format_usd(price.cached_input),
+                prices::format_usd(price.cached_output)
+            )
+        })
+        .collect::<Vec<String>>()
+        .join("\n")
+}
+
+/// Renders a stored table for the channels table: one compact line per
+/// model, `gpt-4o: 2.50/10.00/1.25/5.00 $/1M`.
+fn prices_display(prices: &ModelPrices) -> Vec<String> {
+    prices
+        .iter()
+        .map(|(model, price)| {
+            format!(
+                "{model}: {}/{}/{}/{} $/1M",
+                prices::format_usd(price.input),
+                prices::format_usd(price.output),
+                prices::format_usd(price.cached_input),
+                prices::format_usd(price.cached_output)
+            )
+        })
+        .collect()
+}
+
 fn create_action() -> String {
     "/admin/ui/channels".to_string()
 }
@@ -142,19 +250,38 @@ fn internal_error(error: &sqlx::Error) -> String {
     "internal server error".to_string()
 }
 
-fn row_from(channel: Channel) -> ChannelRow {
+fn row_from(priced: PricedChannel) -> ChannelRow {
+    let limitable = priced.limitable();
+    let PricedChannel {
+        channel,
+        model_prices,
+    } = priced;
+    let Channel {
+        id,
+        name,
+        base_url,
+        api_key,
+        allowed_models,
+        enabled,
+        created_at: _,
+    } = channel;
     ChannelRow {
-        id: channel.id,
-        api_key_masked: mask_api_key(&channel.api_key),
-        name: channel.name,
-        base_url: channel.base_url,
-        allowed_models: channel.allowed_models,
-        enabled: channel.enabled,
+        id,
+        api_key_masked: mask_api_key(&api_key),
+        name,
+        base_url,
+        allowed_models,
+        prices_display: model_prices
+            .as_ref()
+            .map(prices_display)
+            .unwrap_or_default(),
+        limitable,
+        enabled,
     }
 }
 
 async fn rows(state: &AppState) -> Result<Vec<ChannelRow>, sqlx::Error> {
-    Ok(channels::list(&state.db)
+    Ok(channels::list_priced(&state.db)
         .await?
         .into_iter()
         .map(row_from)
@@ -211,6 +338,7 @@ async fn new_form(State(state): State<AppState>, _auth: AdminAuth) -> ChannelsPa
             name: String::new(),
             base_url: String::new(),
             allowed_models_text: String::new(),
+            model_prices_text: String::new(),
             errors: ChannelFormErrors::default(),
         }),
         None,
@@ -221,27 +349,35 @@ async fn new_form(State(state): State<AppState>, _auth: AdminAuth) -> ChannelsPa
 
 /// "Edit" action: opens the form prefilled with the channel's current
 /// values; the upstream key field stays empty so the stored secret never
-/// crosses the wire.
+/// crosses the wire. The prices textarea carries the stored table in the
+/// line format the parser reads back.
 async fn edit_form(
     State(state): State<AppState>,
     _auth: AdminAuth,
     Path(id): Path<i64>,
 ) -> ChannelsPanel {
-    match channels::find(&state.db, id).await {
-        Ok(Some(channel)) => {
-            let allowed_models_text = channel
+    match channels::find_priced(&state.db, id).await {
+        Ok(Some(priced)) => {
+            let allowed_models_text = priced
+                .channel
                 .allowed_models
                 .clone()
                 .unwrap_or_default()
                 .join("\n");
+            let model_prices_text = priced
+                .model_prices
+                .as_ref()
+                .map(prices_text)
+                .unwrap_or_default();
             panel(
                 &state,
                 Some(ChannelForm {
                     action: edit_action(id),
                     editing: true,
-                    name: channel.name,
-                    base_url: channel.base_url,
+                    name: priced.channel.name,
+                    base_url: priced.channel.base_url,
                     allowed_models_text,
+                    model_prices_text,
                     errors: ChannelFormErrors::default(),
                 }),
                 None,
@@ -256,6 +392,28 @@ async fn edit_form(
 
 fn field_error(error: AdminError) -> String {
     error.to_string()
+}
+
+/// Parses the prices textarea and checks the result against the whitelist
+/// the form leaves in force. An empty textarea clears the prices, matching
+/// the JSON API's explicit null; the error text is what the form renders.
+fn parse_and_validate_prices(
+    raw: Option<&str>,
+    allowed_models: Option<&[String]>,
+) -> (Option<ModelPrices>, Option<String>) {
+    let parsed = match parse_model_prices_text(raw) {
+        Ok(parsed) => parsed,
+        Err(message) => return (None, Some(message)),
+    };
+    if let Err(error) = validate_model_prices(Some(&parsed), allowed_models) {
+        return (None, Some(field_error(error)));
+    }
+    let parsed = if parsed.is_empty() {
+        None
+    } else {
+        Some(parsed)
+    };
+    (parsed, None)
 }
 
 /// Runs the shared per-field validators over a submitted form and fills the
@@ -306,12 +464,17 @@ async fn create(
     };
     let submitted = submitted.0;
     let parsed_models = parse_allowed_models_text(submitted.allowed_models.as_deref());
-    let (errors, allowed) = collect_errors(
+    let (mut errors, allowed) = collect_errors(
         &submitted.name,
         &submitted.base_url,
         Some(&submitted.api_key),
         &parsed_models,
     );
+    let (prices, prices_error) =
+        parse_and_validate_prices(submitted.model_prices.as_deref(), allowed.as_deref());
+    if let Some(message) = prices_error {
+        errors.model_prices = Some(message);
+    }
     if errors.any() {
         let form = ChannelForm {
             action: create_action(),
@@ -319,11 +482,12 @@ async fn create(
             name: submitted.name,
             base_url: submitted.base_url,
             allowed_models_text: parsed_models.join("\n"),
+            model_prices_text: submitted.model_prices.unwrap_or_default(),
             errors,
         };
         return panel(&state, Some(form), None, None).await;
     }
-    match channels::create(
+    match channels::create_with_prices(
         &state.db,
         &NewChannel {
             name: submitted.name,
@@ -331,6 +495,7 @@ async fn create(
             api_key: submitted.api_key,
             allowed_models: allowed,
         },
+        prices.as_ref(),
     )
     .await
     {
@@ -365,12 +530,17 @@ async fn update(
         .map(str::trim)
         .filter(|key| !key.is_empty());
     let parsed_models = parse_allowed_models_text(submitted.allowed_models.as_deref());
-    let (errors, allowed) = collect_errors(
+    let (mut errors, allowed) = collect_errors(
         &submitted.name,
         &submitted.base_url,
         new_api_key,
         &parsed_models,
     );
+    let (prices, prices_error) =
+        parse_and_validate_prices(submitted.model_prices.as_deref(), allowed.as_deref());
+    if let Some(message) = prices_error {
+        errors.model_prices = Some(message);
+    }
     if errors.any() {
         let form = ChannelForm {
             action: edit_action(id),
@@ -378,6 +548,7 @@ async fn update(
             name: submitted.name,
             base_url: submitted.base_url,
             allowed_models_text: parsed_models.join("\n"),
+            model_prices_text: submitted.model_prices.unwrap_or_default(),
             errors,
         };
         return panel(&state, Some(form), None, None).await;
@@ -385,7 +556,7 @@ async fn update(
     // Invalidate every entry bound to the channel before and after: the
     // edit form can rotate base_url and the upstream api_key together.
     state.cache.invalidate_channel(id);
-    match channels::update(
+    match channels::update_with_prices(
         &state.db,
         id,
         &ChannelPatch {
@@ -395,6 +566,7 @@ async fn update(
             allowed_models: Some(allowed),
             enabled: None,
         },
+        Some(prices.as_ref()),
     )
     .await
     {
@@ -494,6 +666,7 @@ pub fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::channels::Channel;
 
     #[test]
     fn parse_allowed_models_text_drops_blank_lines_and_trims() {
@@ -504,5 +677,141 @@ mod tests {
         );
         assert!(parse_allowed_models_text(None).is_empty());
         assert!(parse_allowed_models_text(Some("\n  \n")).is_empty());
+    }
+
+    #[test]
+    fn parse_model_prices_text_reads_lines_into_micro_usd() {
+        let prices = parse_model_prices_text(Some(
+            "gpt-4o: 2.50, 10.00, 1.25, 5.00\n\ngpt-4o-mini: 0.15,0.6,0.075,0.30\n",
+        ))
+        .unwrap();
+        let full = prices.get("gpt-4o").unwrap();
+        assert_eq!(full.input, 2_500_000);
+        assert_eq!(full.output, 10_000_000);
+        assert_eq!(full.cached_input, 1_250_000);
+        assert_eq!(full.cached_output, 5_000_000);
+        let mini = prices.get("gpt-4o-mini").unwrap();
+        assert_eq!(mini.input, 150_000);
+        assert_eq!(mini.output, 600_000);
+        assert_eq!(mini.cached_input, 75_000);
+        assert_eq!(mini.cached_output, 300_000);
+        assert_eq!(prices.len(), 2);
+    }
+
+    #[test]
+    fn parse_model_prices_text_treats_an_empty_textarea_as_no_prices() {
+        assert!(parse_model_prices_text(None).unwrap().is_empty());
+        assert!(parse_model_prices_text(Some("\n   \n")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_model_prices_text_reports_the_offending_line() {
+        let error = parse_model_prices_text(Some("gpt-4o: 2.50, 10.00, 1.25, 5.00\nno colon\n"))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            "line 2: expected \"model: input, output, cached_input, cached_output\""
+        );
+
+        let error = parse_model_prices_text(Some("gpt-4o: 2.50, 10.00, 1.25")).unwrap_err();
+        assert_eq!(error, "line 1: gpt-4o needs 4 amounts, got 3");
+
+        let error = parse_model_prices_text(Some(": 1, 1, 1, 1")).unwrap_err();
+        assert_eq!(error, "line 1: the model name is empty");
+
+        let error =
+            parse_model_prices_text(Some("gpt-4o: 1, 1, 1, 1\ngpt-4o: 2, 2, 2, 2")).unwrap_err();
+        assert_eq!(error, "line 2: gpt-4o is listed twice");
+    }
+
+    #[test]
+    fn parse_model_prices_text_rejects_bad_amounts() {
+        let error = parse_model_prices_text(Some("gpt-4o: abc, 1, 1, 1")).unwrap_err();
+        assert!(
+            error.contains("must be a non-negative decimal USD amount"),
+            "{error}"
+        );
+
+        let error = parse_model_prices_text(Some("gpt-4o: -1, 1, 1, 1")).unwrap_err();
+        assert!(
+            error.contains("must be a non-negative decimal USD amount"),
+            "{error}"
+        );
+
+        let error = parse_model_prices_text(Some("gpt-4o: 0.0000005, 1, 1, 1")).unwrap_err();
+        assert!(error.contains("finer than 0.000001 USD"), "{error}");
+    }
+
+    #[test]
+    fn prices_text_round_trips_through_the_parser() {
+        let prices = parse_model_prices_text(Some("gpt-4o: 2.50, 10, 1.25, 5")).unwrap();
+        let text = prices_text(&prices);
+        assert_eq!(text, "gpt-4o: 2.50, 10.00, 1.25, 5.00");
+        assert_eq!(parse_model_prices_text(Some(&text)).unwrap(), prices);
+    }
+
+    #[test]
+    fn prices_display_is_compact_and_complete() {
+        let prices = parse_model_prices_text(Some("gpt-4o: 2.50, 10, 1.25, 5")).unwrap();
+        assert_eq!(
+            prices_display(&prices),
+            vec!["gpt-4o: 2.50/10.00/1.25/5.00 $/1M".to_string()]
+        );
+    }
+
+    fn priced_channel(
+        enabled: bool,
+        allowed: Option<Vec<String>>,
+        prices: Option<&str>,
+    ) -> ChannelRow {
+        let channel = Channel {
+            id: 1,
+            name: "upstream".to_string(),
+            base_url: "https://api.example.com".to_string(),
+            api_key: "sk-upstream-secret-1234567890".to_string(),
+            allowed_models: allowed,
+            enabled,
+            created_at: "2026-11-08 00:00:00".to_string(),
+        };
+        row_from(PricedChannel {
+            channel,
+            model_prices: prices.map(|text| parse_model_prices_text(Some(text)).unwrap()),
+        })
+    }
+
+    #[test]
+    fn limitable_needs_an_enabled_channel_with_every_allowed_model_priced() {
+        let complete = Some("gpt-4o: 1, 1, 1, 1");
+        assert!(priced_channel(true, Some(vec!["gpt-4o".to_string()]), complete).limitable);
+        assert!(!priced_channel(false, Some(vec!["gpt-4o".to_string()]), complete).limitable);
+        assert!(!priced_channel(true, None, complete).limitable);
+        assert!(!priced_channel(true, Some(vec!["gpt-4o".to_string()]), None).limitable);
+        let partial = Some("gpt-4o: 1, 1, 1, 1");
+        assert!(
+            !priced_channel(
+                true,
+                Some(vec!["gpt-4o".to_string(), "other".to_string()]),
+                partial
+            )
+            .limitable
+        );
+    }
+
+    #[test]
+    fn row_renders_prices_and_limitable_state_from_the_stored_table() {
+        let row = priced_channel(
+            true,
+            Some(vec!["gpt-4o".to_string()]),
+            Some("gpt-4o: 2.50, 10, 1.25, 5"),
+        );
+        assert_eq!(
+            row.prices_display,
+            vec!["gpt-4o: 2.50/10.00/1.25/5.00 $/1M".to_string()]
+        );
+        assert!(row.limitable);
+
+        let unpriced = priced_channel(true, Some(vec!["gpt-4o".to_string()]), None);
+        assert!(unpriced.prices_display.is_empty());
+        assert!(!unpriced.limitable);
     }
 }
