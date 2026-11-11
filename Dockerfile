@@ -1,6 +1,8 @@
-# Build stage: release binary. reqwest uses rustls (default-features =
-# false), so no OpenSSL enters the build.
-FROM rust:1.97.1-bookworm AS build
+# Build stage: static musl release binary. rust:alpine targets musl natively
+# and ships gcc plus musl-dev, which the bundled C code in libsqlite3-sys
+# compiles against. reqwest uses rustls (default-features = false), so no
+# OpenSSL enters the build.
+FROM rust:1.97.1-alpine AS build
 WORKDIR /build
 
 # Cache dependencies independently of the source: build the dependency tree
@@ -23,14 +25,17 @@ COPY assets ./assets
 RUN touch src/main.rs src/lib.rs \
     && cargo build --release
 
-# Runtime stage: slim Debian with curl for the HEALTHCHECK. Migrations are
-# embedded in the binary by sqlx::migrate! at compile time, so only the
-# executable needs to be copied.
-FROM debian:bookworm-slim AS runtime
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates curl \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --home-dir /data --shell /usr/sbin/nologin hydra \
+# Runtime stage: Alpine with the static binary and no extra packages.
+# Migrations are embedded in the binary by sqlx::migrate! at compile time, so
+# only the executable is copied. Upstream HTTPS calls trust the roots that
+# rustls (webpki-roots) compiled into the binary, so ca-certificates is
+# deliberately not installed, and the healthcheck uses the busybox wget that
+# Alpine already ships instead of a curl package.
+FROM alpine:3 AS runtime
+# busybox adduser does not create a same-name group for a system user, so the
+# group comes first; the login shell is disabled like the Debian variant.
+RUN addgroup -S hydra \
+    && adduser -S -D -H -h /data -s /sbin/nologin -G hydra hydra \
     && mkdir -p /data \
     && chown hydra:hydra /data
 
@@ -44,6 +49,6 @@ VOLUME /data
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/admin/health
+    CMD wget -q -O /dev/null http://127.0.0.1:8080/admin/health || exit 1
 
 ENTRYPOINT ["/usr/local/bin/hydra"]
