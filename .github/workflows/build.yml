@@ -35,13 +35,9 @@ jobs:
       - name: Select build matrix
         id: select
         run: |
-          # arm64 hosted runners are billed on private repositories, so the
-          # native arm leg runs on tag pushes only, where release images are built.
-          if [ "${{ github.ref_type }}" = "tag" ]; then
-            echo 'matrix={"include":[{"arch":"amd64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]}' >> "$GITHUB_OUTPUT"
-          else
-            echo 'matrix={"include":[{"arch":"amd64","runner":"ubuntu-latest"}]}' >> "$GITHUB_OUTPUT"
-          fi
+          # Native arm64 runners are free on public repositories, so both legs
+          # run on every trigger event instead of tag pushes only.
+          echo 'matrix={"include":[{"arch":"amd64","runner":"ubuntu-latest"},{"arch":"arm64","runner":"ubuntu-24.04-arm"}]}' >> "$GITHUB_OUTPUT"
 
   build:
     name: build ${{ matrix.arch }}
