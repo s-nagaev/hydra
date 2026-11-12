@@ -22,6 +22,11 @@ services:
     environment:
       HYDRA_BIND_ADDR: 0.0.0.0:8080
       HYDRA_DB_PATH: /data/hydra.db
+      # Reverse proxy (Caddy, Nginx, ...) trusted for X-Forwarded-For client
+      # IPs. Use the proxy's own address on the network shared with this
+      # service (the overlay subnet, e.g. 10.0.4.0/24); unset or empty when
+      # clients reach Hydra directly. See "Behind a reverse proxy" in README.
+      #HYDRA_TRUSTED_PROXIES: 10.0.4.0/24
     volumes:
       - hydra-data:/data
 

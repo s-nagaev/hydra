@@ -391,7 +391,8 @@ list that is not part of the trusted set. When clients reach Hydra
 directly, leave the variable unset: a client-sent `X-Forwarded-For` header
 is then ignored entirely, and the direct peer address is recorded. Invalid
 entries abort startup. The flood cap counts failures against the same
-resolved address, so clients behind one proxy are capped individually.
+resolved address, so clients behind one proxy are capped individually. The
+Docker section has a worked Caddy example and the trust-boundary note.
 
 ## Flood cap
 
@@ -708,6 +709,33 @@ credentials and run `docker compose up -d`; the compose file overrides the
 bind address and DB path for the container. The default compose run is
 SQLite-only; see the PostgreSQL section above for the `--profile postgres`
 variant.
+
+### Behind a reverse proxy
+
+A reverse proxy in front of Hydra (Caddy, Nginx, ...) is the direct peer of
+every request, so `request_logs.client_ip` and the flood cap would see the
+proxy's address for every client. List the network that proxy lives in:
+
+```bash
+# Caddy and Hydra in the same compose network: the subnet shown by
+# `docker network inspect <network>`, e.g. 10.0.4.0/24 on an overlay
+HYDRA_TRUSTED_PROXIES=10.0.4.0/24
+
+# Caddy installed on the same host instead of in a container
+HYDRA_TRUSTED_PROXIES=127.0.0.1/32
+```
+
+For a request whose direct peer falls inside a trusted network, the client IP
+is taken from `X-Forwarded-For`: the first entry of the chain that is not
+inside a trusted network. Caddy's `reverse_proxy` sends that header with no
+extra configuration. Requests from every other peer keep their own address,
+and their `X-Forwarded-For` is ignored entirely. The variable is unset by
+default, and an empty value behaves the same, which is the right setting for a
+Hydra that clients reach directly.
+
+Trust the narrowest network that covers your proxy, and only proxies you
+control: any caller able to open a connection from inside a trusted network
+chooses the address Hydra logs and counts against the flood cap.
 
 ## Development
 
