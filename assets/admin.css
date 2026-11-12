@@ -148,13 +148,20 @@ body {
   white-space: nowrap;
   /* Shrink to the width the controls need; the other columns absorb the rest. */
   width: 1%;
-  /* Drop the collapsed inline whitespace so the margin below is the only gap. */
-  font-size: 0;
 }
 
 .actions-col > * {
-  font-size: 14px;
   vertical-align: middle;
+}
+
+/* Collapse the inline whitespace between the controls. Body cells only: the restore
+   rule below matches elements, and the header cell holds a bare text node. */
+td.actions-col {
+  font-size: 0;
+}
+
+td.actions-col > * {
+  font-size: 14px;
 }
 
 .actions-col form.inline {
