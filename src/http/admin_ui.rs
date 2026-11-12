@@ -27,6 +27,8 @@ use crate::http::admin_ui_stats;
 // Vendored htmx 2.0.11, self-hosted so the UI works without network access.
 const HTMX_JS: &[u8] = include_bytes!("../../assets/htmx.min.js");
 const ADMIN_CSS: &[u8] = include_bytes!("../../assets/admin.css");
+// The admin UI's own vanilla-JS helpers (log body JSON highlighting).
+const ADMIN_JS: &[u8] = include_bytes!("../../assets/admin.js");
 
 const JS_CONTENT_TYPE: &str = "application/javascript; charset=utf-8";
 const CSS_CONTENT_TYPE: &str = "text/css; charset=utf-8";
@@ -63,6 +65,10 @@ async fn admin_css(_auth: AdminAuth) -> Response {
     asset(ADMIN_CSS, CSS_CONTENT_TYPE)
 }
 
+async fn admin_js(_auth: AdminAuth) -> Response {
+    asset(ADMIN_JS, JS_CONTENT_TYPE)
+}
+
 /// Builds the `/admin/ui` router: pages, embedded assets, and the CSRF
 /// guard layered over everything, including the merged page routers, so
 /// every POST route added here is protected by default.
@@ -71,6 +77,7 @@ pub fn router() -> Router<AppState> {
         .route("/", get(index))
         .route("/static/htmx.min.js", get(htmx_js))
         .route("/static/admin.css", get(admin_css))
+        .route("/static/admin.js", get(admin_js))
         .merge(admin_ui_channels::router())
         .merge(admin_ui_keys::router())
         .merge(admin_ui_logs::router())
@@ -240,5 +247,48 @@ mod tests {
         let state = test_state().await;
         let (status, _) = get_page(state, "/admin/ui/static/admin.css", None).await;
         assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn admin_js_asset_serves_with_javascript_content_type() {
+        let state = test_state().await;
+        let response = router(state)
+            .oneshot(
+                Request::get("/admin/ui/static/admin.js")
+                    .header("Authorization", auth_header())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "application/javascript; charset=utf-8"
+        );
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(bytes.to_vec(), ADMIN_JS.to_vec());
+    }
+
+    #[tokio::test]
+    async fn base_template_loads_the_admin_js_asset() {
+        let state = test_state().await;
+        let (status, body) = get_page(state, "/admin/ui/channels", Some(&auth_header())).await;
+        assert_eq!(status, StatusCode::OK);
+        let html = String::from_utf8(body).unwrap();
+        assert!(
+            html.contains("/admin/ui/static/admin.js"),
+            "every page must load the body highlighter: {html}"
+        );
+    }
+
+    #[test]
+    fn the_body_highlighter_never_builds_html_from_body_text() {
+        let source = std::str::from_utf8(ADMIN_JS).unwrap();
+        assert!(
+            !source.contains("innerHTML") && !source.contains("outerHTML"),
+            "log bodies are attacker-influenced: they must be handled as text"
+        );
+        assert!(source.contains("textContent"));
     }
 }

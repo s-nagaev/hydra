@@ -622,6 +622,78 @@ async fn detail_page_without_bodies_shows_the_capture_placeholder() {
 }
 
 #[tokio::test]
+async fn detail_page_wraps_each_captured_body_in_a_collapsible_section() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        None,
+        None,
+        Some(r#"{"prompt":"hi"}"#),
+        Some("data: {\"choices\":[]}\n\ndata: [DONE]\n\n"),
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("<details class=\"body-block\" open>"),
+        "the request body opens by default: {body}"
+    );
+    assert!(
+        body.contains("<details class=\"body-block\">"),
+        "the response body starts collapsed: {body}"
+    );
+    assert!(body.contains("<summary class=\"snippet-label\">Request body</summary>"));
+    assert!(body.contains("<summary class=\"snippet-label\">Response body</summary>"));
+    // The SSE capture arrives frame by frame, each data payload pretty-printed.
+    assert!(
+        body.contains("data: {\n  &#34;choices&#34;: []\n}\n\ndata: [DONE]"),
+        "the streamed body must be rendered frame by frame: {body}"
+    );
+    assert!(body.contains("/admin/ui/static/admin.js"));
+}
+
+#[tokio::test]
+async fn detail_page_decodes_unicode_escapes_in_bodies_that_are_not_json() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    // A capture cut at the 1 MiB cap: no longer valid JSON, still worth reading.
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        None,
+        None,
+        Some(r#"{"prompt":"\u041f\u0440\u0438\u0432\u0435\u0442"#),
+        Some(r"upstream error: \u041e\u0448\u0438\u0431\u043a\u0430"),
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("Привет"),
+        "a truncated body must still read as Cyrillic: {body}"
+    );
+    assert!(body.contains("Ошибка"));
+    assert!(
+        !body.contains(r"\u041f"),
+        "the escapes must not survive: {body}"
+    );
+}
+
+#[tokio::test]
 async fn detail_page_shows_error_and_client_ip() {
     let db = test_pool().await;
     let (channel_id, key_id, _) = seed_channel_and_key(&db).await;

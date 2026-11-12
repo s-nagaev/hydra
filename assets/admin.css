@@ -448,6 +448,45 @@ form.inline {
   margin: 14px 0 0;
 }
 
+/* Log detail: one collapsible block per captured body, with the JSON
+   colors the highlighter in admin.js wraps around values. */
+.body-block {
+  margin: 14px 0 0;
+}
+
+.body-block > summary.snippet-label {
+  margin: 0;
+  cursor: pointer;
+}
+
+.body-block > summary.snippet-label:hover {
+  color: var(--text);
+}
+
+.body-block > .code-snippet {
+  margin: 8px 0 0;
+}
+
+.json-key {
+  color: #0550ae;
+}
+
+.json-string {
+  color: #0a7d33;
+}
+
+.json-number {
+  color: #a13d00;
+}
+
+.json-literal {
+  color: #8250df;
+}
+
+.json-punct {
+  color: var(--text-muted);
+}
+
 /* Logs page: filter bar, pagination strip, status badges */
 
 .filter-bar {

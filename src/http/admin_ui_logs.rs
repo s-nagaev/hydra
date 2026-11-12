@@ -123,8 +123,11 @@ pub struct LogsPage {
 }
 
 /// The drill-down page for one request log. Bodies arrive already
-/// formatted (pretty JSON when parseable, raw text otherwise); Askama
-/// escapes whatever is rendered, so no markup can become live HTML.
+/// formatted ([`body_view`]: pretty JSON, a re-rendered SSE capture, or the
+/// stored text with its escapes decoded) and are wrapped in collapsible
+/// sections; the JSON highlighter in `assets/admin.js` styles them on the
+/// client. Askama escapes whatever is rendered, so no markup can become
+/// live HTML.
 #[derive(Template, WebTemplate)]
 #[template(path = "log_detail.html")]
 pub struct LogDetailPage {
@@ -332,13 +335,124 @@ fn channel_label(channel_names: &HashMap<i64, String>, channel_id: Option<i64>) 
 }
 
 /// Prepares a stored body for display: pretty-printed when it parses as
-/// JSON, the stored text otherwise. Askama escapes the result, so hostile
-/// markup stays inert on the page.
+/// JSON, an SSE capture re-rendered frame by frame when it holds `data:`
+/// lines, and the stored text with its `\uXXXX` escapes decoded otherwise.
+/// Askama escapes the result, so hostile markup stays inert on the page.
+///
+/// The rendering is lossy on purpose: the database keeps the stream
+/// verbatim (every `data:` line and its framing), so machine consumers
+/// such as future guardrails read raw SSE while the page shows something a
+/// human can scan.
 fn body_view(raw: &str) -> String {
-    serde_json::from_str::<serde_json::Value>(raw)
-        .ok()
-        .and_then(|value| serde_json::to_string_pretty(&value).ok())
-        .unwrap_or_else(|| raw.to_string())
+    if let Some(pretty) = pretty_json(raw) {
+        return pretty;
+    }
+    if is_sse_body(raw) {
+        return sse_view(raw);
+    }
+    unescape_unicode(raw)
+}
+
+/// Pretty-prints text that parses as a whole JSON document; `None` leaves
+/// the caller in charge of the fallback rendering.
+fn pretty_json(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    serde_json::to_string_pretty(&value).ok()
+}
+
+/// True when any line of the stored text is an SSE `data:` field, the shape
+/// [`crate::logging`] writes for streamed responses. A whole-document JSON
+/// parse already failed by the time this is asked, so a captured body is
+/// never mistaken for a stream because of a string containing "data:".
+fn is_sse_body(raw: &str) -> bool {
+    raw.lines()
+        .any(|line| line.trim_end_matches('\r').starts_with("data:"))
+}
+
+/// Renders a stored SSE capture line by line: `data:` payloads are
+/// pretty-printed, the `[DONE]` sentinel, non-JSON payloads and framing
+/// lines (`event:`, blank separators) are echoed as stored. A pretty
+/// payload keeps its `data: ` prefix on the first line only, so a frame
+/// reads as one block instead of a prefix on every continuation line.
+fn sse_view(raw: &str) -> String {
+    raw.lines()
+        .map(sse_line_view)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn sse_line_view(line: &str) -> String {
+    let line = line.trim_end_matches('\r');
+    let Some(rest) = line.strip_prefix("data:") else {
+        return line.to_string();
+    };
+    let (prefix, payload) = match rest.strip_prefix(' ') {
+        Some(payload) => ("data: ", payload),
+        None => ("data:", rest),
+    };
+    if payload.trim() == "[DONE]" {
+        return line.to_string();
+    }
+    match pretty_json(payload) {
+        Some(pretty) => format!("{prefix}{pretty}"),
+        None => line.to_string(),
+    }
+}
+
+/// Length in characters of one `\uXXXX` escape.
+const UNICODE_ESCAPE_LEN: usize = 6;
+
+/// Reads the four hex digits of an escape starting at `start`; `None` when
+/// they are missing or not hex, so the text keeps them literally.
+fn hex4(chars: &[char], start: usize) -> Option<u32> {
+    let digits: String = chars.get(start..start + 4)?.iter().collect();
+    if digits.len() != 4 || !digits.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u32::from_str_radix(&digits, 16).ok()
+}
+
+/// Decodes the escape whose backslash sits at `index`: a `\uXXXX`
+/// sequence, or the two halves of a surrogate pair as one character.
+/// Malformed escapes and lone surrogates return `None` and stay literally
+/// escaped in the output.
+fn decode_escape(chars: &[char], index: usize) -> Option<(String, usize)> {
+    let code = hex4(chars, index + 2)?;
+    if !(0xD800..=0xDBFF).contains(&code) {
+        return Some((char::from_u32(code)?.to_string(), UNICODE_ESCAPE_LEN));
+    }
+    let low_index = index + UNICODE_ESCAPE_LEN;
+    if chars.get(low_index) != Some(&'\\') || chars.get(low_index + 1) != Some(&'u') {
+        return None;
+    }
+    let low = hex4(chars, low_index + 2)?;
+    if !(0xDC00..=0xDFFF).contains(&low) {
+        return None;
+    }
+    let scalar = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+    Some((char::from_u32(scalar)?.to_string(), 2 * UNICODE_ESCAPE_LEN))
+}
+
+/// Decodes every `\uXXXX` escape in the text, the same characters a JSON
+/// parser would produce. Captures that are not valid JSON on their own (a
+/// body cut at the 1 MiB cap, an upstream error page) still show their
+/// Cyrillic readably, while the stored text stays byte-for-byte unchanged.
+fn unescape_unicode(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\\' && chars.get(index + 1) == Some(&'u') {
+            if let Some((decoded, consumed)) = decode_escape(&chars, index) {
+                out.push_str(&decoded);
+                index += consumed;
+                continue;
+            }
+        }
+        out.push(chars[index]);
+        index += 1;
+    }
+    out
 }
 
 /// Groups an integer into thousands with commas. Shared with the stats page,
@@ -892,4 +1006,91 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/logs", get(page))
         .route("/logs/{id}", get(detail))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PLAIN_JSON: &str = r#"{"prompt":"hello","tokens":3,"stream":true,"stop":null}"#;
+
+    #[test]
+    fn plain_json_is_pretty_printed() {
+        // The serde round-trip sorts keys and indents with two spaces.
+        assert_eq!(
+            body_view(PLAIN_JSON),
+            "{\n  \"prompt\": \"hello\",\n  \"stop\": null,\n  \"stream\": true,\n  \"tokens\": 3\n}"
+        );
+    }
+
+    #[test]
+    fn plain_json_decodes_its_escapes_through_the_round_trip() {
+        assert_eq!(
+            body_view(r#"{"text":"\u041f\u0440\u0438\u0432\u0435\u0442"}"#),
+            "{\n  \"text\": \"Привет\"\n}"
+        );
+    }
+
+    #[test]
+    fn sse_payloads_are_pretty_printed_frame_by_frame() {
+        let raw = "data: {\"a\":1}\n\ndata: {\"choices\":[]}\n\ndata: [DONE]\n\n";
+        assert_eq!(
+            body_view(raw),
+            concat!(
+                "data: {\n  \"a\": 1\n}\n\n",
+                "data: {\n  \"choices\": []\n}\n\n",
+                "data: [DONE]\n"
+            )
+        );
+    }
+
+    #[test]
+    fn sse_framing_lines_and_non_json_payloads_are_echoed_as_stored() {
+        let raw = "event: message_start\ndata: {not json}\n\ndata: {broken\n";
+        assert_eq!(
+            body_view(raw),
+            "event: message_start\ndata: {not json}\n\ndata: {broken"
+        );
+    }
+
+    #[test]
+    fn sse_separators_crlf_and_the_done_sentinel_without_a_space_are_kept() {
+        let raw = "data:[DONE]\r\ndata:{\"a\":1}\r\n";
+        assert_eq!(body_view(raw), "data:[DONE]\ndata:{\n  \"a\": 1\n}");
+    }
+
+    #[test]
+    fn a_data_marker_inside_a_line_is_not_a_stream() {
+        assert_eq!(body_view("x data: {\"a\":1}"), "x data: {\"a\":1}");
+    }
+
+    #[test]
+    fn non_json_text_decodes_unicode_escapes() {
+        assert_eq!(
+            body_view(r"upstream said: \u041f\u0440\u0438\u0432\u0435\u0442!"),
+            "upstream said: Привет!"
+        );
+    }
+
+    #[test]
+    fn a_truncated_json_body_shows_its_escapes_readably() {
+        assert_eq!(body_view(r#"{"content":"\u041f"#), "{\"content\":\"П");
+    }
+
+    #[test]
+    fn surrogate_pairs_decode_to_one_character() {
+        assert_eq!(body_view(r"\uD83D\uDE00 ok"), "😀 ok");
+    }
+
+    #[test]
+    fn malformed_and_lone_surrogate_escapes_stay_literal() {
+        let raw = r"bad \uZZZZ lone \uD83D short \u12 and a bare \u";
+        assert_eq!(body_view(raw), raw);
+    }
+
+    #[test]
+    fn empty_and_plain_text_bodies_pass_through() {
+        assert_eq!(body_view(""), "");
+        assert_eq!(body_view("upstream returned 502"), "upstream returned 502");
+    }
 }
