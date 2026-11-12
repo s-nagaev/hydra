@@ -1,9 +1,12 @@
 //! OpenAI-compatible proxy handlers.
 //!
-//! `POST /v1/chat/completions` and `GET /v1/models` resolve the client key
-//! to its bound channel, enforce the channel's model whitelist, and forward
-//! to the upstream with the client `Authorization` dropped and the upstream
-//! key substituted. The chat body is buffered once, bounded by
+//! `POST /v1/chat/completions`, `POST /v1/responses` and `GET /v1/models`
+//! resolve the client key to its bound channel, enforce the channel's model
+//! whitelist, and forward to the upstream with the client `Authorization`
+//! dropped and the upstream key substituted. The two POST surfaces run one
+//! shared pipeline ([`forward_proxied`]) and differ only in the upstream
+//! path the bytes are forwarded to and in the usage shape their response is
+//! read in (see [`Surface`]). The request body is buffered once, bounded by
 //! [`CHAT_BODY_LIMIT`] (32 MiB, well past axum's 2 MiB default because
 //! vision requests embed base64 images), so `model` and `stream` can be
 //! peeked, then the original bytes are forwarded verbatim. A body over the
@@ -13,9 +16,9 @@
 //! `bytes_stream()` straight into `Body::from_stream` so SSE chunk semantics
 //! survive. The upstream-to-client response conversion lives in one place
 //! ([`upstream_to_response`]), which is also where the background request
-//! logging tee hooks in: every chat completion produces exactly one
-//! `request_logs` row written by a detached task that can never block or
-//! fail the client flow. Rejections are logged too, auth-layer ones
+//! logging tee hooks in: every proxied completion, on either POST surface,
+//! produces exactly one `request_logs` row, written by a detached task that
+//! can never block or fail the client flow. Rejections are logged too, auth-layer ones
 //! included (they resolve to no key, so their rows carry NULL ids); the
 //! only unloggable case is the 413 body-limit rejection, which happens in
 //! the body extractor before any handler code runs. A request rejected by
@@ -47,16 +50,18 @@ use crate::http::proxy_auth::{ProxyAuth, ProxyAuthError};
 use crate::http::AppState;
 use crate::logging::{self, ChatLogContext, ChatLogInit, UsageFormat};
 
-/// Maximum accepted chat request body, in bytes (32 MiB). Vision requests
-/// embed base64-encoded images and long-context conversations run well past
-/// axum's 2 MiB default; 32 MiB covers both while still bounding memory.
-/// Applied to `/v1/chat/completions` via `DefaultBodyLimit`; an over-limit
-/// body fails into [`ProxyError::PayloadTooLarge`].
+/// Maximum accepted proxied request body, in bytes (32 MiB). Vision
+/// requests embed base64-encoded images and long-context conversations run
+/// well past axum's 2 MiB default; 32 MiB covers both while still bounding
+/// memory. Each proxied POST route mounts it via `DefaultBodyLimit`
+/// (`/v1/chat/completions` and `/v1/responses`; the layer is per-route, so a
+/// route without it would silently fall back to axum's default); an
+/// over-limit body fails into [`ProxyError::PayloadTooLarge`].
 pub const CHAT_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
-/// Total-request cap for non-streaming chat calls. Generous on purpose:
-/// reasoning models can think for minutes before the single response body
-/// arrives.
+/// Total-request cap for non-streaming proxied calls (both POST surfaces).
+/// Generous on purpose: reasoning models can think for minutes before the
+/// single response body arrives.
 const NON_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// Total-request cap for the `/v1/models` proxy path; model listings are
 /// quick and never stream.
@@ -139,8 +144,9 @@ impl IntoResponse for ProxyError {
     }
 }
 
-/// Buffered chat request body. Wrapping `Bytes` in a dedicated extractor is
-/// what makes an over-limit body surface as an OpenAI-shaped 413 (via
+/// Buffered proxied request body, shared by the chat and the Responses
+/// routes. Wrapping `Bytes` in a dedicated extractor is what makes an
+/// over-limit body surface as an OpenAI-shaped 413 (via
 /// [`ProxyError::PayloadTooLarge`]) instead of axum's default plain-text
 /// rejection, which OpenAI client libraries cannot parse.
 pub struct ChatBody(Bytes);
@@ -171,10 +177,11 @@ where
     }
 }
 
-/// `POST /v1/chat/completions`: peek `model`/`stream`, check the whitelist,
-/// forward the original bytes with the upstream key, pass the response
-/// through byte-for-byte, and leave a background log row behind whatever
-/// the outcome (only the 413 body-limit rejection stays unlogged).
+/// `POST /v1/chat/completions`: the Chat Completions surface of the shared
+/// proxy pipeline ([`forward_proxied`]): peek `model`/`stream`, check the
+/// whitelist, forward the original bytes with the upstream key, pass the
+/// response through byte-for-byte, and leave a background log row behind
+/// whatever the outcome (only the 413 body-limit rejection stays unlogged).
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -308,29 +315,99 @@ pub async fn chat_completions(
     peer: client_ip::PeerAddr,
     ChatBody(body): ChatBody,
 ) -> Result<Response, ProxyError> {
-    let start = Instant::now();
-    let client_ip = client_ip::resolve(&headers, peer.0, &state.trusted_proxies);
+    forward_proxied(&state, auth, &headers, peer, body, CHAT_SURFACE).await
+}
+
+/// `POST /v1/responses`: the OpenAI Responses surface of the same proxy
+/// pipeline as chat ([`forward_proxied`]). Bearer auth, the 32 MiB body
+/// limit, the whitelist check and both gates are the shared ones, so an
+/// unknown key is answered 401, a disabled one 403, an unlisted model 404,
+/// an over-budget key 429 and a flood-capped IP the same 401 as everywhere
+/// else. What is specific to this route is the upstream path its bytes are
+/// forwarded to (`<base>/v1/responses`) and the usage shape its response is
+/// logged in (the Responses `input_tokens`/`output_tokens` mapping), so a
+/// Responses call prices and gates exactly like a chat call.
+pub async fn responses(
+    State(state): State<AppState>,
+    // Buffered as a Result for the same reason as chat: a rejected request
+    // still gets its audit row with the body it carried.
+    auth: Result<ProxyAuth, ProxyAuthError>,
+    headers: HeaderMap,
+    peer: client_ip::PeerAddr,
+    ChatBody(body): ChatBody,
+) -> Result<Response, ProxyError> {
+    forward_proxied(&state, auth, &headers, peer, body, RESPONSES_SURFACE).await
+}
+
+/// What differs between the proxied POST surfaces: the upstream path the
+/// request is forwarded to and the usage shape the response is read in.
+/// Everything else about a proxied POST (bearer auth, body limit, model
+/// whitelist, both gates, response piping, logging) is identical across
+/// surfaces and lives in [`forward_proxied`].
+struct Surface {
+    /// Path appended to the channel's base URL, with the same leading-`/v1`
+    /// semantics as chat.
+    path: &'static str,
+    /// Usage shape the surface's upstream answers in, handed to the log
+    /// context so the response body is read correctly.
+    usage_format: UsageFormat,
+}
+
+/// OpenAI Chat Completions.
+const CHAT_SURFACE: Surface = Surface {
+    path: "/v1/chat/completions",
+    usage_format: UsageFormat::Chat,
+};
+
+/// OpenAI Responses.
+const RESPONSES_SURFACE: Surface = Surface {
+    path: "/v1/responses",
+    usage_format: UsageFormat::Responses,
+};
+
+/// The thin-passthrough pipeline both proxied POST surfaces run. Every
+/// rejection keeps the audit row it has always had: a flood-capped or
+/// auth-layer one carries NULL ids, a monthly-limit one names the key that
+/// asked, a raw client error keeps the caller's key id. Then the buffered
+/// bytes are forwarded verbatim to the surface's upstream path with the
+/// client `Authorization` dropped and the upstream key substituted, and the
+/// upstream response goes back untouched through [`upstream_to_response`],
+/// which is where the response is tee'd and the surface's usage shape is
+/// read.
+async fn forward_proxied(
+    state: &AppState,
+    auth: Result<ProxyAuth, ProxyAuthError>,
+    headers: &HeaderMap,
+    peer: client_ip::PeerAddr,
+    body: Bytes,
+    surface: Surface,
+) -> Result<Response, ProxyError> {
+    let facts = RejectionFacts {
+        start: Instant::now(),
+        client_ip: client_ip::resolve(headers, peer.0, &state.trusted_proxies),
+        usage_format: surface.usage_format,
+    };
     let auth = match auth {
         Ok(auth) => auth,
         Err(ProxyAuthError::FloodCapped(ticket)) => {
-            log_flood_cap_rejection(&state, start, &body, client_ip, &ticket);
+            log_flood_cap_rejection(state, &facts, &body, &ticket);
             return Ok(ProxyAuthError::FloodCapped(ticket).into_response());
         }
         // The limit gate runs after the key resolved, so this rejection
         // knows who asked and gets its own row rather than the NULL-key one.
         Err(e @ ProxyAuthError::MonthlyLimitReached { key_id, channel_id }) => {
-            log_limit_rejection(&state, start, &body, client_ip, key_id, channel_id);
+            log_limit_rejection(state, &facts, &body, key_id, channel_id);
             return Ok(e.into_response());
         }
         Err(e) => {
-            log_auth_rejection(&state, start, &body, client_ip, &e);
+            log_auth_rejection(state, &facts, &body, &e);
             return Ok(e.into_response());
         }
     };
     let (model, stream_requested) = match peek_request(&body) {
         Ok(peeked) => peeked,
         Err(e) => {
-            log_rejection(&state, &auth, None, start, &body, client_ip, &e);
+            log_rejection(state, &auth, None, &facts, &body, &e);
             return Err(e);
         }
     };
@@ -340,17 +417,16 @@ pub async fn chat_completions(
         // log write; ChannelGone and ChannelDisabled are client-visible
         // routing failures that still get their audit row.
         Err(e @ (ProxyError::ChannelGone | ProxyError::ChannelDisabled)) => {
-            log_rejection(&state, &auth, Some(model), start, &body, client_ip, &e);
+            log_rejection(state, &auth, Some(model), &facts, &body, &e);
             return Err(e);
         }
         Err(e) => return Err(e),
     };
     if let Err(e) = ensure_model_allowed(&channel, &model) {
-        log_rejection(&state, &auth, Some(model), start, &body, client_ip, &e);
+        log_rejection(state, &auth, Some(model), &facts, &body, &e);
         return Err(e);
     }
-
-    let url = join_url(&channel.base_url, "/v1/chat/completions");
+    let url = join_url(&channel.base_url, surface.path);
     let mut request = state
         .client
         .post(&url)
@@ -370,18 +446,18 @@ pub async fn chat_completions(
     // Built before the body is handed to the forwarder: it already holds
     // whatever request bytes body logging will ever capture.
     let ctx = chat_log_context(
-        &state,
+        state,
         &auth,
         Some(model),
-        UsageFormat::Chat,
-        start,
+        facts.usage_format,
+        facts.start,
         &body,
-        client_ip,
+        facts.client_ip,
     );
     let upstream = match request.body(body).send().await {
         Ok(upstream) => upstream,
         Err(e) => {
-            tracing::warn!(error = %e, "upstream chat request failed");
+            tracing::warn!(error = %e, "upstream proxy request failed");
             ctx.finish(
                 None,
                 logging::UsageExtraction::default(),
@@ -683,6 +759,17 @@ fn chat_log_context(
     })
 }
 
+/// The request-scoped pieces every rejection row of one proxied request
+/// needs, whichever stage rejected it: when the request started (the logged
+/// duration is measured to the finished row), the resolved client IP, and
+/// the surface's usage shape. The format is stored but never read on these
+/// rows: a rejection parses no response body, because no upstream answered.
+struct RejectionFacts {
+    start: Instant,
+    client_ip: Option<String>,
+    usage_format: UsageFormat,
+}
+
 /// Writes the audit row for a request rejected by the auth layer (401
 /// unknown key, 403 disabled key, key lookup failure). The caller never
 /// resolved to a key row, so the row carries no key or channel ids. The
@@ -693,9 +780,8 @@ fn chat_log_context(
 /// the response deliberately omits.
 fn log_auth_rejection(
     state: &AppState,
-    start: Instant,
+    facts: &RejectionFacts,
     body: &Bytes,
-    client_ip: Option<String>,
     error: &ProxyAuthError,
 ) {
     let ctx = ChatLogContext::new(ChatLogInit {
@@ -705,10 +791,10 @@ fn log_auth_rejection(
         api_key_id: None,
         channel_id: None,
         model: None,
-        usage_format: UsageFormat::Chat,
-        start,
+        usage_format: facts.usage_format,
+        start: facts.start,
         request_body: body,
-        client_ip,
+        client_ip: facts.client_ip.clone(),
         flags: &state.limit_flags,
     });
     let (status, message) = match error {
@@ -743,9 +829,8 @@ fn log_auth_rejection(
 /// reset.
 fn log_flood_cap_rejection(
     state: &AppState,
-    start: Instant,
+    facts: &RejectionFacts,
     body: &Bytes,
-    client_ip: Option<String>,
     ticket: &FloodTicket,
 ) {
     if !state.flood.claim_log_slot(ticket) {
@@ -758,10 +843,10 @@ fn log_flood_cap_rejection(
         api_key_id: None,
         channel_id: None,
         model: None,
-        usage_format: UsageFormat::Chat,
-        start,
+        usage_format: facts.usage_format,
+        start: facts.start,
         request_body: body,
-        client_ip,
+        client_ip: facts.client_ip.clone(),
         flags: &state.limit_flags,
     });
     ctx.finish(
@@ -781,9 +866,8 @@ fn log_flood_cap_rejection(
 /// already buffered request body, which was never forwarded.
 fn log_limit_rejection(
     state: &AppState,
-    start: Instant,
+    facts: &RejectionFacts,
     body: &Bytes,
-    client_ip: Option<String>,
     key_id: i64,
     channel_id: i64,
 ) {
@@ -795,10 +879,10 @@ fn log_limit_rejection(
         api_key_id: Some(key_id),
         channel_id: Some(channel_id),
         model,
-        usage_format: UsageFormat::Chat,
-        start,
+        usage_format: facts.usage_format,
+        start: facts.start,
         request_body: body,
-        client_ip,
+        client_ip: facts.client_ip.clone(),
         flags: &state.limit_flags,
     });
     ctx.finish(
@@ -809,17 +893,16 @@ fn log_limit_rejection(
     );
 }
 
-/// Writes the audit row for an authenticated chat request rejected before
-/// the upstream was contacted: the row keeps the caller's key id. The 413
-/// body-limit rejection happens in the extractor instead and stays
+/// Writes the audit row for an authenticated proxied request rejected
+/// before the upstream was contacted: the row keeps the caller's key id. The
+/// 413 body-limit rejection happens in the extractor instead and stays
 /// unlogged; auth-layer rejections are logged by [`log_auth_rejection`].
 fn log_rejection(
     state: &AppState,
     auth: &ProxyAuth,
     model: Option<String>,
-    start: Instant,
+    facts: &RejectionFacts,
     body: &Bytes,
-    client_ip: Option<String>,
     error: &ProxyError,
 ) {
     // No response body is ever parsed for a rejection, so this row carries
@@ -828,10 +911,10 @@ fn log_rejection(
         state,
         auth,
         model,
-        UsageFormat::Chat,
-        start,
+        facts.usage_format,
+        facts.start,
         body,
-        client_ip,
+        facts.client_ip.clone(),
     );
     ctx.finish(
         None,
