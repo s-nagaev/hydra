@@ -3,13 +3,14 @@
 //! The `ApiDoc` derive pulls the `#[utoipa::path]` annotations from every
 //! handler and the `ToSchema` derives from the DTO modules into one OpenAPI
 //! document, served raw at `/api-docs/openapi.json` and rendered by the
-//! embedded Swagger UI at `/swagger-ui`. `SecurityAddon` registers the two
-//! auth schemes (Basic for admin routes, Bearer for proxy routes) so the UI
-//! can drive its Authorize dialog; the schemes document how to call the API,
-//! they do not add any enforcement, which stays with the extractors.
+//! embedded Swagger UI at `/swagger-ui`. `SecurityAddon` registers the three
+//! auth schemes (Basic for admin routes, Bearer for the proxy routes, and the
+//! `x-api-key` header the Messages surface also accepts) so the UI can drive
+//! its Authorize dialog; the schemes document how to call the API, they do not
+//! add any enforcement, which stays with the extractors.
 
 use serde::Serialize;
-use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::openapi::RefOr;
 use utoipa::{Modify, OpenApi, ToSchema};
 
@@ -39,6 +40,34 @@ pub struct OpenAiErrorDetail {
     /// Machine-readable code, `null` where OpenAI sends no code.
     #[schema(example = "invalid_api_key")]
     pub code: Option<String>,
+}
+
+/// Error body used by `/v1/messages`, in the Anthropic shape
+/// `{"type":"error","error":{"type","message"}}` that the Anthropic SDKs
+/// pointed at that route parse. The status and the message of a rejection are
+/// the same in this shape and in [`OpenAiError`]; only the envelope and the
+/// error family differ, and there is no `code` field in the Anthropic
+/// taxonomy.
+#[derive(Serialize, ToSchema)]
+pub struct AnthropicError {
+    /// Always `error`.
+    #[schema(example = "error")]
+    pub r#type: String,
+    pub error: AnthropicErrorDetail,
+}
+
+/// The `error` object inside an [`AnthropicError`] body.
+#[derive(Serialize, ToSchema)]
+pub struct AnthropicErrorDetail {
+    /// Anthropic error family, derived from the rejection status:
+    /// `invalid_request_error`, `authentication_error`, `permission_error`,
+    /// `rate_limit_error`, `overloaded_error` or `api_error`.
+    #[schema(example = "authentication_error")]
+    pub r#type: String,
+    /// What went wrong, phrased for display to a client. The same text the
+    /// OpenAI envelope carries for the same rejection.
+    #[schema(example = "Invalid API key provided")]
+    pub message: String,
 }
 
 /// Registers the security schemes referenced by the per-operation
@@ -73,6 +102,18 @@ impl Modify for SecurityAddon {
                     .build(),
             )),
         );
+        components.security_schemes.insert(
+            "api_key_auth".to_string(),
+            RefOr::T(SecurityScheme::ApiKey(ApiKey::Header(
+                ApiKeyValue::with_description(
+                    "x-api-key",
+                    "A Hydra client key, sent the way the Anthropic SDKs send \
+                     it. /v1/messages reads the key from this header as well \
+                     as from a bearer token, which is why its operation lists \
+                     both schemes.",
+                ),
+            ))),
+        );
     }
 }
 
@@ -81,10 +122,11 @@ impl Modify for SecurityAddon {
     info(
         title = "Hydra",
         version = "0.1.0",
-        description = "Self-hosted, OpenAI-compatible API router. An admin \
+        description = "Self-hosted API router. An admin \
             configures upstream channels (base URL, upstream key, optional \
             model whitelist) and issues `hyd-` client keys; clients then call \
-            the OpenAI-compatible /v1 endpoints while the upstream secret \
+            the /v1 endpoints (OpenAI Chat Completions, OpenAI Responses and \
+            Anthropic Messages) while the upstream secret \
             never leaves the server."
     ),
     paths(
@@ -101,6 +143,8 @@ impl Modify for SecurityAddon {
         super::admin_logs::list,
         super::admin_logs::get_one,
         super::proxy::chat_completions,
+        super::proxy::responses,
+        super::proxy::messages,
         super::proxy::models
     ),
     components(
@@ -108,6 +152,8 @@ impl Modify for SecurityAddon {
             AdminErrorBody,
             OpenAiError,
             OpenAiErrorDetail,
+            AnthropicError,
+            AnthropicErrorDetail,
             super::admin_channels::CreateChannelRequest,
             super::admin_channels::PatchChannelRequest,
             super::admin_channels::ChannelView,
@@ -127,9 +173,10 @@ impl Modify for SecurityAddon {
         (name = "Admin", description = "Router management over HTTP Basic \
             Auth: channels, client keys, request logs. GET /admin/health is \
             public."),
-        (name = "Proxy", description = "OpenAI-compatible endpoints for \
-            clients calling with a `hyd-` key: /v1/chat/completions and \
-            /v1/models.")
+        (name = "Proxy", description = "Endpoints for clients calling with a \
+            `hyd-` key: /v1/chat/completions and /v1/responses, which speak \
+            the OpenAI shapes, /v1/messages, which speaks the Anthropic \
+            shapes, and /v1/models.")
     ),
     modifiers(&SecurityAddon)
 )]
@@ -222,6 +269,8 @@ mod tests {
             "/admin/logs",
             "/admin/logs/{id}",
             "/v1/chat/completions",
+            "/v1/responses",
+            "/v1/messages",
             "/v1/models",
         ] {
             assert!(
@@ -286,6 +335,81 @@ mod tests {
             "admin routes must require the basic scheme"
         );
 
+        // The Responses surface is an OpenAI one: bearer auth, the OpenAI
+        // envelope, and the same rejection statuses chat documents.
+        let responses = &doc["paths"]["/v1/responses"]["post"];
+        assert!(
+            responses["security"][0]["bearer_auth"].is_array(),
+            "responses must require the bearer scheme"
+        );
+        for status in ["400", "401", "403", "404", "413", "429", "502", "503"] {
+            assert!(
+                responses["responses"][status].is_object(),
+                "responses must document {status}"
+            );
+        }
+        assert_eq!(
+            responses["responses"]["401"]["content"]["application/json"]["example"]["error"]
+                ["code"],
+            "invalid_api_key",
+            "the Responses rejections keep the OpenAI envelope"
+        );
+
+        // The Messages surface is the Anthropic one: either credential
+        // header, and the Anthropic envelope with its own error taxonomy on
+        // every status the route can answer with.
+        let messages = &doc["paths"]["/v1/messages"]["post"];
+        assert!(
+            messages["security"][0]["api_key_auth"].is_array()
+                && messages["security"][1]["bearer_auth"].is_array(),
+            "messages must accept the x-api-key header or a bearer token: {}",
+            messages["security"]
+        );
+        for status in [
+            "400", "401", "403", "404", "413", "429", "500", "502", "503",
+        ] {
+            let documented = &messages["responses"][status];
+            assert!(documented.is_object(), "messages must document {status}");
+            // A status documents either one example or a named set of them;
+            // each one must be the same envelope.
+            let content = &documented["content"]["application/json"];
+            let examples: Vec<&serde_json::Value> = match content.get("examples") {
+                Some(named) => named
+                    .as_object()
+                    .unwrap()
+                    .values()
+                    .map(|entry| &entry["value"])
+                    .collect(),
+                None => vec![&content["example"]],
+            };
+            assert!(
+                !examples.is_empty(),
+                "the {status} response must carry an example"
+            );
+            for example in examples {
+                assert_eq!(
+                    example["type"], "error",
+                    "the {status} example must be an Anthropic envelope: {example}"
+                );
+                assert!(
+                    example["error"]["message"].as_str().is_some(),
+                    "the {status} example must carry a message: {example}"
+                );
+                assert!(
+                    example["error"].get("code").is_none(),
+                    "the Anthropic envelope carries no code: {example}"
+                );
+            }
+        }
+        assert_eq!(
+            messages["responses"]["401"]["content"]["application/json"]["example"]["error"]["type"],
+            "authentication_error"
+        );
+        assert_eq!(
+            messages["responses"]["503"]["content"]["application/json"]["example"]["error"]["type"],
+            "overloaded_error"
+        );
+
         // The monthly limit must be documentable from the UI: the request
         // schemas carry the USD input field, the response schemas carry both
         // the canonical micro-USD integer and the rendered USD string, and
@@ -345,5 +469,8 @@ mod tests {
         let schemes = &doc["components"]["securitySchemes"];
         assert_eq!(schemes["basic_auth"]["scheme"], "basic");
         assert_eq!(schemes["bearer_auth"]["scheme"], "bearer");
+        assert_eq!(schemes["api_key_auth"]["type"], "apiKey");
+        assert_eq!(schemes["api_key_auth"]["in"], "header");
+        assert_eq!(schemes["api_key_auth"]["name"], "x-api-key");
     }
 }

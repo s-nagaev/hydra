@@ -57,7 +57,7 @@ use utoipa::ToSchema;
 use crate::db::channels::Channel;
 use crate::flood::FloodTicket;
 use crate::http::client_ip;
-use crate::http::docs::OpenAiError;
+use crate::http::docs::{AnthropicError, OpenAiError};
 use crate::http::openai_error::ErrorShape;
 use crate::http::proxy_auth::{MessagesAuth, ProxyAuth, ProxyAuthError, X_API_KEY};
 use crate::http::AppState;
@@ -313,9 +313,10 @@ where
         })),
         (status = 429, description = "The key's monthly spending limit is \
             reached. Enforced for a key that has a limit and whose channel \
-            is priceable (every whitelisted model carries all four prices); \
-            the verdict is recomputed in the background after each logged \
-            response, so the first requests after a restart pass", body = OpenAiError, example = json!({
+            is priceable (every whitelisted model carries a price entry, its \
+            optional cache-write rate included); the verdict is recomputed in \
+            the background after each logged response, so the first requests \
+            after a restart pass", body = OpenAiError, example = json!({
             "error": { "message": "Monthly limit reached", "type": "rate_limit_error", "code": null }
         })),
         (status = 502, description = "The bound channel is gone, or the \
@@ -369,6 +370,140 @@ pub async fn chat_completions(
 /// forwarded to (`<base>/v1/responses`) and the usage shape its response is
 /// logged in (the Responses `input_tokens`/`output_tokens` mapping), so a
 /// Responses call prices and gates exactly like a chat call.
+#[utoipa::path(
+    post,
+    path = "/v1/responses",
+    tag = "Proxy",
+    operation_id = "responses",
+    summary = "Create a response",
+    description = "Forwards an OpenAI Responses request to the channel bound \
+        to the key, with the client Authorization dropped and the upstream key \
+        substituted. The body passes through byte-for-byte, so anything the \
+        upstream accepts works here; the two fields Hydra itself reads are \
+        `model` (whitelist check) and `stream` (streaming path). Upstream \
+        responses, errors included, come back with the upstream status and \
+        body unchanged; Hydra's own rejections use the OpenAI envelope. Hydra \
+        reads the Responses \
+        usage shape for the request log, the cost and the monthly limit gate, \
+        so a Responses call prices exactly like a chat call. Every call, \
+        rejected ones included, leaves a row in the request log; the one \
+        exception is a 413 over-limit body, which cannot be logged.",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = Object,
+        description = "Any OpenAI Responses request body. `model` is required \
+            and must be admitted by the channel's whitelist (a channel \
+            without a whitelist admits any model). `stream: true` switches \
+            the response to text/event-stream, where the usage object arrives \
+            in the terminal `response.completed` or `response.incomplete` \
+            event. Bodies above 32 MiB are rejected with 413.",
+        examples(
+            ("plain" = (
+                summary = "Non-streaming request",
+                value = json!({
+                    "model": "gpt-4o",
+                    "input": "Say hello"
+                })
+            )),
+            ("streaming" = (
+                summary = "Streaming request (SSE response)",
+                value = json!({
+                    "model": "gpt-4o",
+                    "input": "Tell me a joke",
+                    "stream": true
+                })
+            )),
+            ("invalid" = (
+                summary = "Rejected with 400: no model parameter",
+                value = json!({
+                    "input": "Hi"
+                })
+            ))
+        )
+    ),
+    responses(
+        (status = 200, description = "The upstream response passed through \
+            unchanged; with `stream: true` the content type is \
+            text/event-stream and events arrive as the upstream sends them", body = Object, example = json!({
+            "id": "resp_67ccd2bed1ec8190b14f964abc0542670bb6a6b452d3795b",
+            "object": "response",
+            "created_at": 1770000000,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_67ccd2bf17f0819081ff3bb2cf6508e6",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "output_text", "text": "Hello!", "annotations": [] }
+                    ]
+                }
+            ],
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34,
+                "total_tokens": 46,
+                "input_tokens_details": { "cached_tokens": 0 }
+            }
+        })),
+        (status = 400, description = "Body is not JSON or has no string \
+            `model` parameter", body = OpenAiError, example = json!({
+            "error": { "message": "you must provide a model parameter", "type": "invalid_request_error", "code": null }
+        })),
+        (status = 401, description = "Missing, malformed, unknown or deleted \
+            key", body = OpenAiError, example = json!({
+            "error": { "message": "Invalid API key provided", "type": "invalid_request_error", "code": "invalid_api_key" }
+        })),
+        (status = 403, description = "The key exists but is disabled", body = OpenAiError, example = json!({
+            "error": { "message": "This API key has been disabled", "type": "invalid_request_error", "code": "key_disabled" }
+        })),
+        (status = 404, description = "The requested model is not in the \
+            channel's whitelist; the message lists the allowed models", body = OpenAiError, example = json!({
+            "error": {
+                "message": "The model `gpt-4` does not exist or you do not have access to it. Allowed models for this channel: gpt-4o-mini, gpt-4o",
+                "type": "invalid_request_error",
+                "code": "model_not_found"
+            }
+        })),
+        (status = 413, description = "The request body exceeds 32 MiB", body = OpenAiError, example = json!({
+            "error": { "message": "Request body exceeds the maximum allowed size of 32 MiB", "type": "invalid_request_error", "code": null }
+        })),
+        (status = 429, description = "The key's monthly spending limit is \
+            reached. Enforced for a key that has a limit and whose channel \
+            is priceable (every whitelisted model carries a price entry, its \
+            optional cache-write rate included); the verdict is recomputed in \
+            the background after each logged response, so the first requests \
+            after a restart pass", body = OpenAiError, example = json!({
+            "error": { "message": "Monthly limit reached", "type": "rate_limit_error", "code": null }
+        })),
+        (status = 502, description = "The bound channel is gone, or the \
+            upstream could not be reached; other upstream statuses pass \
+            through unchanged", body = OpenAiError, examples(
+            ("upstream_unavailable" = (
+                summary = "The upstream request failed",
+                value = json!({
+                    "error": { "message": "Failed to connect to the upstream provider", "type": "api_error", "code": null }
+                })
+            )),
+            ("channel_gone" = (
+                summary = "The channel bound to the key no longer exists",
+                value = json!({
+                    "error": { "message": "The channel bound to this API key is unavailable", "type": "api_error", "code": null }
+                })
+            ))
+        )),
+        (status = 503, description = "The channel bound to the key is \
+            disabled; the key itself stays valid", body = OpenAiError, example = json!({
+            "error": {
+                "message": "The channel bound to this API key is currently disabled",
+                "type": "api_error",
+                "code": "channel_disabled"
+            }
+        }))
+    )
+)]
 pub async fn responses(
     State(state): State<AppState>,
     // Buffered as a Result for the same reason as chat: a rejected request
@@ -394,6 +529,163 @@ pub async fn responses(
 /// the usage shape its response is logged in, and the Anthropic error
 /// envelope every rejection of this route is rendered in ([`ErrorShape`]),
 /// which is what the Anthropic SDKs pointed at this route parse.
+#[utoipa::path(
+    post,
+    path = "/v1/messages",
+    tag = "Proxy",
+    operation_id = "messages",
+    summary = "Create a message",
+    description = "Forwards an Anthropic Messages request to the channel \
+        bound to the key, with the client credential dropped and the upstream \
+        key substituted. The client key is read from `x-api-key` or from a \
+        bearer header, which is why this operation lists both schemes. The \
+        `anthropic-version` header is required and forwarded as sent; \
+        `anthropic-beta`, when the client sends it, hops across too. The body \
+        passes through byte-for-byte, so anything the upstream accepts works \
+        here; the two fields Hydra itself reads are `model` (whitelist check) \
+        and `stream` (streaming path). Upstream responses, errors included, \
+        come back with the upstream status and body unchanged. Hydra's own \
+        rejections on this route use the Anthropic error envelope, which is \
+        what the SDKs pointed here parse. The usage shape is read for the \
+        request log, the cost and the monthly limit gate, so a Messages call \
+        prices exactly like a chat call.",
+    security(("api_key_auth" = []), ("bearer_auth" = [])),
+    request_body(
+        content = Object,
+        description = "Any Anthropic Messages request body. `model` is \
+            required and must be admitted by the channel's whitelist (a \
+            channel without a whitelist admits any model); `max_tokens` is \
+            required by the Messages API itself. `stream: true` switches the \
+            response to text/event-stream. The `anthropic-version` header is \
+            required on every call and its absence is answered 400. Bodies \
+            above 32 MiB are rejected with 413.",
+        examples(
+            ("plain" = (
+                summary = "Non-streaming request",
+                value = json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "messages": [{ "role": "user", "content": "Say hello" }]
+                })
+            )),
+            ("system_prompt" = (
+                summary = "Request with a system prompt and a cacheable prefix",
+                value = json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "system": "Answer in one short sentence.",
+                    "messages": [{ "role": "user", "content": "Say hello" }]
+                })
+            )),
+            ("streaming" = (
+                summary = "Streaming request (SSE response)",
+                value = json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "messages": [{ "role": "user", "content": "Tell me a joke" }],
+                    "stream": true
+                })
+            ))
+        )
+    ),
+    responses(
+        (status = 200, description = "The upstream response passed through \
+            unchanged; with `stream: true` the content type is \
+            text/event-stream and events arrive as the upstream sends them. \
+            The cache fields of the usage object are what the request log \
+            stores as the cached and cache-write token counts", body = Object, example = json!({
+            "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{ "type": "text", "text": "Hello!" }],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        })),
+        (status = 400, description = "Body is not JSON, has no string \
+            `model` parameter, or the required `anthropic-version` header is \
+            missing", body = AnthropicError, examples(
+            ("no_model" = (
+                summary = "No model parameter",
+                value = json!({
+                    "type": "error",
+                    "error": { "type": "invalid_request_error", "message": "you must provide a model parameter" }
+                })
+            )),
+            ("no_version" = (
+                summary = "Missing anthropic-version header",
+                value = json!({
+                    "type": "error",
+                    "error": { "type": "invalid_request_error", "message": "you must provide an anthropic-version header" }
+                })
+            ))
+        )),
+        (status = 401, description = "Missing, malformed, unknown or deleted \
+            key, in either credential header", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "authentication_error", "message": "Invalid API key provided" }
+        })),
+        (status = 403, description = "The key exists but is disabled", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "permission_error", "message": "This API key has been disabled" }
+        })),
+        (status = 404, description = "The requested model is not in the \
+            channel's whitelist; the message lists the allowed models", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "The model `claude-opus-4-1` does not exist or you do not have access to it. Allowed models for this channel: claude-sonnet-4-5"
+            }
+        })),
+        (status = 413, description = "The request body exceeds 32 MiB", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": "Request body exceeds the maximum allowed size of 32 MiB" }
+        })),
+        (status = 429, description = "The key's monthly spending limit is \
+            reached. The limit is enforced \
+            for a key that has one and whose channel is priceable (every \
+            whitelisted model carries a price entry, its optional \
+            cache-write rate included); the verdict is recomputed in the \
+            background after each logged response, so the first requests \
+            after a restart pass", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "rate_limit_error", "message": "Monthly limit reached" }
+        })),
+        (status = 500, description = "A storage failure while resolving the \
+            key; the detail stays in the server log", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "api_error", "message": "internal server error" }
+        })),
+        (status = 502, description = "The bound channel is gone, or the \
+            upstream could not be reached; other upstream statuses pass \
+            through unchanged", body = AnthropicError, examples(
+            ("upstream_unavailable" = (
+                summary = "The upstream request failed",
+                value = json!({
+                    "type": "error",
+                    "error": { "type": "overloaded_error", "message": "Failed to connect to the upstream provider" }
+                })
+            )),
+            ("channel_gone" = (
+                summary = "The channel bound to the key no longer exists",
+                value = json!({
+                    "type": "error",
+                    "error": { "type": "overloaded_error", "message": "The channel bound to this API key is unavailable" }
+                })
+            ))
+        )),
+        (status = 503, description = "The channel bound to the key is \
+            disabled; the key itself stays valid", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "overloaded_error", "message": "The channel bound to this API key is currently disabled" }
+        }))
+    )
+)]
 pub async fn messages(
     State(state): State<AppState>,
     // Same Result shape as the other surfaces: an auth failure reaches the

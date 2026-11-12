@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- OpenAI Responses passthrough at `POST /v1/responses`, on the same channel, key and limit machinery as chat, with the Responses usage counts read for the log, the cost and the monthly gate.
+- Anthropic Messages passthrough at `POST /v1/messages`: the key may arrive in `x-api-key` or in a bearer header, the required `anthropic-version` and the optional `anthropic-beta` are forwarded as sent, and the request body and upstream response pass through untouched.
+- A fifth per-model price dimension, `cache_write_input`, for the tokens an upstream writes into its cache. It is set independently of the input price, so the provider's own figure is entered rather than derived, and a table that names no such rate keeps working and bills those tokens at zero.
+- Cache-write tokens are now stored per request and shown in the admin UI Stat tab next to the input, output and cached columns.
+
+### Changed
+
+- Cost accounting on Messages no longer undercounts cached calls: the Anthropic prompt counts input plus cache reads plus cache writes before it is priced, so the read share is charged at the read rate and the write share at the write rate.
+- Hydra's own rejections on `/v1/messages` use the Anthropic error envelope, with the error family derived from the status. Chat, Responses and model listing keep the OpenAI envelope.
+- Model prices may be given with four or five dimensions, in the JSON API and in the admin UI price editor, which renders five amounts and accepts either.
+
 ## 1.0.0 (2026-11-09)
 
 ### Added
