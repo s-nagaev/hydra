@@ -13,7 +13,7 @@
   <div class="error-banner" role="alert">{{ error }}</div>
   {% endif %}
 
-  <form class="filter-bar" method="get" action="/admin/ui/logs">
+  <form class="filter-bar filter-grid" method="get" action="/admin/ui/logs">
     <div class="filter-field">
       <label for="log-preset">Period</label>
       <select id="log-preset" name="preset">
@@ -80,8 +80,8 @@
         <th>Model</th>
         <th>Status</th>
         <th>Tokens</th>
-        <th>Cached tokens (in / out)</th>
-        <th>Duration (ms)</th>
+        <th title="Cached tokens (in / out)">Cached in/out</th>
+        <th title="Duration in milliseconds">Duration</th>
         <th>Client IP</th>
         <th>Bodies</th>
         <th>Error</th>

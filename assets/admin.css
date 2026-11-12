@@ -645,6 +645,46 @@ td.key-cell {
   min-width: 130px;
 }
 
+/* The logs bar (`.filter-grid`) is a grid of equal tracks instead of a flex
+   line: a flex line gave every field its own width, so the text input took its
+   intrinsic width while the selects fell back to their minimum, and the
+   native-height date inputs (21px against the 38px of a select) dropped their
+   labels out of line with the rest. 190px is the narrowest track that still
+   shows a whole `datetime-local` value, which settles the bar on four tracks
+   at the supported viewport widths. Fields stretch to the tallest one in their
+   row and their content sits at the bottom of that box, so each row of the bar
+   has one label line and one control line. */
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px 14px;
+  align-items: stretch;
+}
+
+.filter-grid .filter-field {
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.filter-grid .filter-field input,
+.filter-grid .filter-field select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  background: var(--surface);
+}
+
+/* The submit control keeps the width of its label instead of filling the
+   track it is placed in. */
+.filter-grid .filter-field button,
+.filter-grid .filter-field .button {
+  align-self: flex-start;
+}
+
 .table-meta {
   color: var(--text-muted);
   font-size: 13px;
@@ -731,6 +771,15 @@ td.key-cell {
 }
 
 .logs-table td {
+  white-space: nowrap;
+}
+
+/* A column with more data than the card can hold is squeezed to fit, and a
+   header cell wraps in that squeeze: the two longest labels used to stack over
+   two and three lines and left a tall band above the rows. The labels are
+   short now, and a header cell never wraps, so the band is one line tall
+   whatever the columns do. */
+.logs-table thead th {
   white-space: nowrap;
 }
 
