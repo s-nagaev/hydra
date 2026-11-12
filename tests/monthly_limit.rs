@@ -196,6 +196,27 @@ fn responses_request(key: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// The same request on the third proxied POST surface, which authenticates
+/// through its own extractor and therefore runs the same limit gate; the key
+/// rides the Messages credential header.
+fn messages_request(key: &str) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/messages")
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({
+                "model": CHAT_MODEL,
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hi" }]
+            })
+            .to_string(),
+        ))
+        .unwrap()
+}
+
 async fn send(state: &AppState, request: Request<Body>) -> (StatusCode, Value) {
     let response = within(router(state.clone()).oneshot(request))
         .await
@@ -461,6 +482,32 @@ async fn an_over_budget_key_cannot_call_responses() {
         status,
         StatusCode::TOO_MANY_REQUESTS,
         "the gate covers /v1/responses too: {body}"
+    );
+    assert_eq!(body["error"]["message"], "Monthly limit reached");
+    assert_eq!(body["error"]["type"], "rate_limit_error");
+
+    // The rejection is usage of the key that hit its limit, so it keeps the
+    // key and lets the per-key reporting stay complete on this surface too.
+    let row = wait_for_row(&pool, |row| row.status == Some(429)).await;
+    assert_eq!(row.api_key_id, Some(key_id));
+    assert_eq!(row.channel_id, Some(channel_id));
+    assert_eq!(row.model.as_deref(), Some(CHAT_MODEL));
+}
+
+#[tokio::test]
+async fn an_over_budget_key_cannot_call_messages() {
+    let pool = test_pool().await;
+    let channel_id = seed_limitable_channel(&pool, &upstream().await).await;
+    let (key_id, key) = seed_limited_key(&pool, channel_id, Some(1)).await;
+    let state = test_app(pool.clone());
+    log_usage_now(&pool, key_id, channel_id).await;
+    recompute(&state, &pool, key_id).await;
+
+    let (status, body) = send(&state, messages_request(&key)).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "the gate covers /v1/messages too: {body}"
     );
     assert_eq!(body["error"]["message"], "Monthly limit reached");
     assert_eq!(body["error"]["type"], "rate_limit_error");

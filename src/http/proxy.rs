@@ -1,12 +1,14 @@
 //! OpenAI-compatible proxy handlers.
 //!
-//! `POST /v1/chat/completions`, `POST /v1/responses` and `GET /v1/models`
-//! resolve the client key to its bound channel, enforce the channel's model
-//! whitelist, and forward to the upstream with the client `Authorization`
-//! dropped and the upstream key substituted. The two POST surfaces run one
-//! shared pipeline ([`forward_proxied`]) and differ only in the upstream
-//! path the bytes are forwarded to and in the usage shape their response is
-//! read in (see [`Surface`]). The request body is buffered once, bounded by
+//! `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`
+//! and `GET /v1/models` resolve the client key to its bound channel, enforce
+//! the channel's model whitelist, and forward to the upstream with the client
+//! credential dropped and the upstream key substituted. The three POST
+//! surfaces run one shared pipeline ([`forward_proxied`]) and differ only in
+//! the upstream path the bytes are forwarded to, in the usage shape their
+//! response is read in (see [`Surface`]) and in the header policy that puts
+//! the credential on the outbound request (see [`HeaderPolicy`]). The request
+//! body is buffered once, bounded by
 //! [`CHAT_BODY_LIMIT`] (32 MiB, well past axum's 2 MiB default because
 //! vision requests embed base64 images), so `model` and `stream` can be
 //! peeked, then the original bytes are forwarded verbatim. A body over the
@@ -16,7 +18,7 @@
 //! `bytes_stream()` straight into `Body::from_stream` so SSE chunk semantics
 //! survive. The upstream-to-client response conversion lives in one place
 //! ([`upstream_to_response`]), which is also where the background request
-//! logging tee hooks in: every proxied completion, on either POST surface,
+//! logging tee hooks in: every proxied completion, on any POST surface,
 //! produces exactly one `request_logs` row, written by a detached task that
 //! can never block or fail the client flow. Rejections are logged too, auth-layer ones
 //! included (they resolve to no key, so their rows carry NULL ids); the
@@ -30,6 +32,14 @@
 //! touching the database and contributes at most one log row per window
 //! per IP. `/v1/models` is a lightweight discovery endpoint and is not
 //! logged.
+//!
+//! The Messages surface is the one whose client key need not arrive in a
+//! bearer header and whose upstream does not speak the OpenAI usage shape:
+//! its key comes from `x-api-key` or from a bearer header ([`MessagesAuth`]),
+//! its upstream answers in the Anthropic usage shape
+//! (`UsageFormat::Anthropic`), and its upstream needs the `anthropic-version`
+//! header, which Hydra therefore requires from the client instead of
+//! inventing one.
 
 use std::time::{Duration, Instant};
 
@@ -46,7 +56,7 @@ use crate::flood::FloodTicket;
 use crate::http::client_ip;
 use crate::http::docs::OpenAiError;
 use crate::http::openai_error::openai_error;
-use crate::http::proxy_auth::{ProxyAuth, ProxyAuthError};
+use crate::http::proxy_auth::{MessagesAuth, ProxyAuth, ProxyAuthError, X_API_KEY};
 use crate::http::AppState;
 use crate::logging::{self, ChatLogContext, ChatLogInit, UsageFormat};
 
@@ -54,12 +64,12 @@ use crate::logging::{self, ChatLogContext, ChatLogInit, UsageFormat};
 /// requests embed base64-encoded images and long-context conversations run
 /// well past axum's 2 MiB default; 32 MiB covers both while still bounding
 /// memory. Each proxied POST route mounts it via `DefaultBodyLimit`
-/// (`/v1/chat/completions` and `/v1/responses`; the layer is per-route, so a
-/// route without it would silently fall back to axum's default); an
-/// over-limit body fails into [`ProxyError::PayloadTooLarge`].
+/// (`/v1/chat/completions`, `/v1/responses` and `/v1/messages`; the layer is
+/// per-route, so a route without it would silently fall back to axum's
+/// default); an over-limit body fails into [`ProxyError::PayloadTooLarge`].
 pub const CHAT_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
-/// Total-request cap for non-streaming proxied calls (both POST surfaces).
+/// Total-request cap for non-streaming proxied calls (every POST surface).
 /// Generous on purpose: reasoning models can think for minutes before the
 /// single response body arrives.
 const NON_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
@@ -144,9 +154,9 @@ impl IntoResponse for ProxyError {
     }
 }
 
-/// Buffered proxied request body, shared by the chat and the Responses
-/// routes. Wrapping `Bytes` in a dedicated extractor is what makes an
-/// over-limit body surface as an OpenAI-shaped 413 (via
+/// Buffered proxied request body, shared by every proxied POST route (chat,
+/// Responses, Messages). Wrapping `Bytes` in a dedicated extractor is what
+/// makes an over-limit body surface as an OpenAI-shaped 413 (via
 /// [`ProxyError::PayloadTooLarge`]) instead of axum's default plain-text
 /// rejection, which OpenAI client libraries cannot parse.
 pub struct ChatBody(Bytes);
@@ -339,11 +349,44 @@ pub async fn responses(
     forward_proxied(&state, auth, &headers, peer, body, RESPONSES_SURFACE).await
 }
 
+/// `POST /v1/messages`: the Anthropic Messages surface of the same proxy
+/// pipeline as chat and Responses ([`forward_proxied`]). The client key is
+/// read from `x-api-key` or from a bearer header ([`MessagesAuth`]); the 32
+/// MiB body limit, the model whitelist, the flood cap and the monthly-limit
+/// gate are the shared ones, so an unknown key is answered 401, a disabled
+/// one 403, an unlisted model 404, an over-budget key 429 and a flood-capped
+/// IP the same 401 as everywhere else. What is specific to this surface is
+/// the upstream path (`<base>/v1/messages`), the header policy
+/// ([`HeaderPolicy::Anthropic`]: the upstream key rides `x-api-key`, the
+/// required `anthropic-version` and the optional `anthropic-beta` hop across)
+/// and the usage shape its response is logged in, so a Messages call prices
+/// and gates exactly like a chat call.
+pub async fn messages(
+    State(state): State<AppState>,
+    // Same Result shape as the other surfaces: an auth failure reaches the
+    // handler with the body already buffered, and the rejection still gets
+    // its audit row.
+    auth: Result<MessagesAuth, ProxyAuthError>,
+    headers: HeaderMap,
+    peer: client_ip::PeerAddr,
+    ChatBody(body): ChatBody,
+) -> Result<Response, ProxyError> {
+    forward_proxied(
+        &state,
+        auth.map(MessagesAuth::into_inner),
+        &headers,
+        peer,
+        body,
+        MESSAGES_SURFACE,
+    )
+    .await
+}
+
 /// What differs between the proxied POST surfaces: the upstream path the
-/// request is forwarded to and the usage shape the response is read in.
-/// Everything else about a proxied POST (bearer auth, body limit, model
-/// whitelist, both gates, response piping, logging) is identical across
-/// surfaces and lives in [`forward_proxied`].
+/// request is forwarded to, the usage shape the response is read in, and the
+/// header policy that carries the credential upstream. Everything else about
+/// a proxied POST (body limit, model whitelist, both gates, response piping,
+/// logging) is identical across surfaces and lives in [`forward_proxied`].
 struct Surface {
     /// Path appended to the channel's base URL, with the same leading-`/v1`
     /// semantics as chat.
@@ -351,29 +394,110 @@ struct Surface {
     /// Usage shape the surface's upstream answers in, handed to the log
     /// context so the response body is read correctly.
     usage_format: UsageFormat,
+    /// How this surface's upstream expects the credential, and which of the
+    /// client's own headers it needs beyond the two every surface forwards.
+    headers: HeaderPolicy,
+}
+
+/// Outbound header policy of one proxied surface: which header carries the
+/// upstream key, and which client headers hop across on top of the
+/// `Content-Type` and `Accept` every surface forwards. It is per-surface
+/// because the Messages API is the one upstream that authenticates on
+/// `x-api-key` and states its version per request through `anthropic-version`.
+/// The OpenAI surfaces keep exactly the hygiene rules chat has always had.
+enum HeaderPolicy {
+    /// OpenAI surfaces: the upstream key replaces the client Authorization
+    /// as `Authorization: Bearer`; nothing else of the client's hops across.
+    OpenAi,
+    /// Anthropic Messages: the upstream key replaces the client credentials
+    /// as `x-api-key`, and the version header the Messages API requires plus
+    /// the beta opt-in list, when the client sent one, are forwarded. The
+    /// client's own credential header is never among them, whichever header
+    /// it arrived in.
+    Anthropic,
+}
+
+/// The Messages API version header, required on every Messages request.
+const ANTHROPIC_VERSION: &str = "anthropic-version";
+/// The Messages API beta opt-in list, optional and forwarded as sent.
+const ANTHROPIC_BETA: &str = "anthropic-beta";
+
+impl HeaderPolicy {
+    /// Rejects a request this surface cannot forward upstream. Only the
+    /// Messages surface has a header contract of its own: the Messages API
+    /// requires `anthropic-version` on every request and would answer
+    /// without it only with an error, so Hydra reports the missing header at
+    /// its own boundary rather than spending an upstream round-trip to
+    /// relay it. A present value is forwarded verbatim: which versions an
+    /// account may use is the upstream's business, not the router's.
+    fn check(&self, headers: &HeaderMap) -> Result<(), ProxyError> {
+        match self {
+            HeaderPolicy::OpenAi => Ok(()),
+            HeaderPolicy::Anthropic if headers.contains_key(ANTHROPIC_VERSION) => Ok(()),
+            HeaderPolicy::Anthropic => Err(ProxyError::BadRequest(format!(
+                "you must provide an {ANTHROPIC_VERSION} header"
+            ))),
+        }
+    }
+
+    /// Puts the surface's credential header on the outbound request and
+    /// copies the surface's own extra headers across. The credential the
+    /// client sent is never forwarded: the upstream always sees the bound
+    /// channel's key under the surface's own header name.
+    fn apply(
+        &self,
+        request: reqwest::RequestBuilder,
+        headers: &HeaderMap,
+        upstream_key: &str,
+    ) -> reqwest::RequestBuilder {
+        match self {
+            HeaderPolicy::OpenAi => {
+                request.header(header::AUTHORIZATION, format!("Bearer {upstream_key}"))
+            }
+            HeaderPolicy::Anthropic => {
+                let mut request = request.header(X_API_KEY, upstream_key);
+                if let Some(version) = headers.get(ANTHROPIC_VERSION) {
+                    request = request.header(ANTHROPIC_VERSION, version);
+                }
+                if let Some(beta) = headers.get(ANTHROPIC_BETA) {
+                    request = request.header(ANTHROPIC_BETA, beta);
+                }
+                request
+            }
+        }
+    }
 }
 
 /// OpenAI Chat Completions.
 const CHAT_SURFACE: Surface = Surface {
     path: "/v1/chat/completions",
     usage_format: UsageFormat::Chat,
+    headers: HeaderPolicy::OpenAi,
 };
 
 /// OpenAI Responses.
 const RESPONSES_SURFACE: Surface = Surface {
     path: "/v1/responses",
     usage_format: UsageFormat::Responses,
+    headers: HeaderPolicy::OpenAi,
 };
 
-/// The thin-passthrough pipeline both proxied POST surfaces run. Every
+/// Anthropic Messages.
+const MESSAGES_SURFACE: Surface = Surface {
+    path: "/v1/messages",
+    usage_format: UsageFormat::Anthropic,
+    headers: HeaderPolicy::Anthropic,
+};
+
+/// The thin-passthrough pipeline every proxied POST surface runs. Every
 /// rejection keeps the audit row it has always had: a flood-capped or
 /// auth-layer one carries NULL ids, a monthly-limit one names the key that
 /// asked, a raw client error keeps the caller's key id. Then the buffered
 /// bytes are forwarded verbatim to the surface's upstream path with the
-/// client `Authorization` dropped and the upstream key substituted, and the
-/// upstream response goes back untouched through [`upstream_to_response`],
-/// which is where the response is tee'd and the surface's usage shape is
-/// read.
+/// client credential replaced by the upstream key through the surface's
+/// header policy, and the upstream response goes back untouched through
+/// [`upstream_to_response`], which is where the response is tee'd and the
+/// surface's usage shape is read.
 async fn forward_proxied(
     state: &AppState,
     auth: Result<ProxyAuth, ProxyAuthError>,
@@ -426,11 +550,19 @@ async fn forward_proxied(
         log_rejection(state, &auth, Some(model), &facts, &body, &e);
         return Err(e);
     }
+    // The surface's own header contract is the last gate, right where the
+    // outbound request is built: the routing rejections above keep their
+    // documented statuses (a whitelist miss stays a 404, a gone channel a
+    // 502), and this one fires only for a request that would otherwise be
+    // forwarded without a header its upstream requires.
+    if let Err(e) = surface.headers.check(headers) {
+        log_rejection(state, &auth, Some(model), &facts, &body, &e);
+        return Err(e);
+    }
     let url = join_url(&channel.base_url, surface.path);
-    let mut request = state
-        .client
-        .post(&url)
-        .header(header::AUTHORIZATION, format!("Bearer {}", channel.api_key));
+    let mut request = surface
+        .headers
+        .apply(state.client.post(&url), headers, &channel.api_key);
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         request = request.header(header::CONTENT_TYPE, content_type);
     }
@@ -926,7 +1058,97 @@ fn log_rejection(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
+
     use super::*;
+
+    fn headers_with_version() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ANTHROPIC_VERSION, HeaderValue::from_static("2023-06-01"));
+        headers
+    }
+
+    /// Builds the outbound request one policy produces, so the header rules
+    /// are asserted on what would actually leave the process.
+    fn outbound(policy: &HeaderPolicy, headers: &HeaderMap) -> reqwest::Request {
+        policy
+            .apply(
+                reqwest::Client::new().post("http://127.0.0.1:9/v1/messages"),
+                headers,
+                "sk-upstream-secret",
+            )
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn only_the_messages_policy_requires_the_version_header() {
+        assert!(HeaderPolicy::OpenAi.check(&HeaderMap::new()).is_ok());
+        assert!(matches!(
+            HeaderPolicy::Anthropic.check(&HeaderMap::new()),
+            Err(ProxyError::BadRequest(message)) if message.contains("anthropic-version")
+        ));
+        assert!(HeaderPolicy::Anthropic
+            .check(&headers_with_version())
+            .is_ok());
+    }
+
+    #[test]
+    fn the_messages_policy_substitutes_the_api_key_header() {
+        let mut headers = headers_with_version();
+        headers.insert(X_API_KEY, HeaderValue::from_static("hyd-client-key"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer hyd-client-key"),
+        );
+        let request = outbound(&HeaderPolicy::Anthropic, &headers);
+
+        assert_eq!(request.headers()[X_API_KEY], "sk-upstream-secret");
+        assert!(
+            !request.headers().contains_key(header::AUTHORIZATION),
+            "the client credential must not hop across: {:?}",
+            request.headers()
+        );
+        assert_eq!(request.headers()[ANTHROPIC_VERSION], "2023-06-01");
+    }
+
+    #[test]
+    fn the_messages_policy_forwards_the_beta_header_only_when_sent() {
+        assert!(!outbound(&HeaderPolicy::Anthropic, &headers_with_version())
+            .headers()
+            .contains_key(ANTHROPIC_BETA));
+
+        let mut with_beta = headers_with_version();
+        with_beta.insert(
+            ANTHROPIC_BETA,
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        assert_eq!(
+            outbound(&HeaderPolicy::Anthropic, &with_beta).headers()[ANTHROPIC_BETA],
+            "prompt-caching-2024-07-31"
+        );
+    }
+
+    /// The OpenAI policy is what chat has always done: a bearer substitution
+    /// and nothing else, whatever the client sent alongside it.
+    #[test]
+    fn the_openai_policy_keeps_the_bearer_substitution_and_forwards_nothing_else() {
+        let mut headers = headers_with_version();
+        headers.insert(X_API_KEY, HeaderValue::from_static("hyd-client-key"));
+        headers.insert(
+            ANTHROPIC_BETA,
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        let request = outbound(&HeaderPolicy::OpenAi, &headers);
+
+        assert_eq!(
+            request.headers()[header::AUTHORIZATION],
+            "Bearer sk-upstream-secret"
+        );
+        assert!(!request.headers().contains_key(X_API_KEY));
+        assert!(!request.headers().contains_key(ANTHROPIC_VERSION));
+        assert!(!request.headers().contains_key(ANTHROPIC_BETA));
+    }
 
     #[test]
     fn join_url_handles_trailing_slashes() {

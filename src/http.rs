@@ -157,6 +157,13 @@ pub fn router(state: AppState) -> Router {
             "/v1/responses",
             post(proxy::responses).layer(DefaultBodyLimit::max(proxy::CHAT_BODY_LIMIT)),
         )
+        // The Anthropic Messages surface: the same pipeline again, with its
+        // own body limit for the same reason and its credential in the
+        // `x-api-key` header the Messages SDKs send.
+        .route(
+            "/v1/messages",
+            post(proxy::messages).layer(DefaultBodyLimit::max(proxy::CHAT_BODY_LIMIT)),
+        )
         .route("/v1/models", get(proxy::models))
         .with_state(state)
         .merge(swagger)

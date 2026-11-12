@@ -99,6 +99,26 @@ async fn send_bad_responses(base_url: &str) -> reqwest::StatusCode {
     status
 }
 
+/// The same anonymous spam against the third proxied POST surface, which
+/// authenticates through its own extractor and therefore shares the same
+/// flood gate; the key rides the Messages credential header here.
+async fn send_bad_messages(base_url: &str) -> reqwest::StatusCode {
+    let response = within(
+        reqwest::Client::new()
+            .post(format!("{base_url}/v1/messages"))
+            .header("x-api-key", BAD_KEY)
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .body("{}")
+            .send(),
+    )
+    .await
+    .expect("request completes");
+    let status = response.status();
+    let _ = within(async { response.bytes().await }).await;
+    status
+}
+
 #[tokio::test]
 async fn failures_below_the_limit_are_all_logged_normally() {
     let db = test_pool().await;
@@ -191,6 +211,31 @@ async fn the_flood_cap_covers_the_responses_route() {
     for _ in 0..3 {
         assert_eq!(
             send_bad_responses(&base).await,
+            reqwest::StatusCode::UNAUTHORIZED
+        );
+    }
+
+    let rows = wait_for_rows(&db, 2).await;
+    assert_eq!(rows.len(), 2, "one normal row plus exactly one capped row");
+    assert_eq!(rows[0].error.as_deref(), Some("Invalid API key provided"));
+    assert_eq!(
+        rows[1].error.as_deref(),
+        Some("flood cap: too many failed authentications from this address"),
+        "the capped phase contributes its single row on this surface too"
+    );
+    assert_eq!(rows[1].status, Some(401));
+    assert_eq!(rows[1].api_key_id, None);
+}
+
+#[tokio::test]
+async fn the_flood_cap_covers_the_messages_route() {
+    let db = test_pool().await;
+    let base = common::spawn_hydra_with_connect_info(test_app_with_flood(db.clone(), 1, 60)).await;
+
+    // Failure 1: processed normally. Failures 2..3: capped phase.
+    for _ in 0..3 {
+        assert_eq!(
+            send_bad_messages(&base).await,
             reqwest::StatusCode::UNAUTHORIZED
         );
     }

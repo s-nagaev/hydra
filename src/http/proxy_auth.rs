@@ -1,4 +1,4 @@
-//! Bearer-key authentication for the proxy routes.
+//! Proxy-key authentication for the proxy routes.
 //!
 //! [`ProxyAuth`] extracts `Authorization: Bearer <key>`, hashes the full
 //! key string (prefix included) and resolves the alive key row plus its
@@ -19,6 +19,12 @@
 //! malformed header and for an unknown key, 403 for a disabled key, 500 for
 //! storage failures. The plaintext key never appears in a response or log
 //! line.
+//!
+//! The Messages route authenticates through [`MessagesAuth`], which reads the
+//! same key from the Anthropic-native `x-api-key` header or from a bearer
+//! header and then runs the identical sequence ([`authenticate`]): the two
+//! surfaces differ only in where the client writes the credential. The chat,
+//! Responses and models routes stay [`ProxyAuth`] and therefore Bearer-only.
 //!
 //! Before any key lookup, requests carrying a resolvable client IP pass
 //! through the per-IP flood cap ([`crate::flood`]): admission reserves one
@@ -52,7 +58,7 @@ use axum::extract::connect_info::ConnectInfo;
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
 use axum::http::request::Parts;
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 
 use crate::db::channels::{self, Channel};
@@ -128,6 +134,38 @@ impl IntoResponse for ProxyAuthError {
     }
 }
 
+/// The Anthropic credential header: the Messages surface reads the client
+/// key from it, and the proxy pipeline writes the upstream key into it. The
+/// `http` crate defines no constant for it.
+pub(crate) const X_API_KEY: &str = "x-api-key";
+
+/// The `/v1/messages` auth extractor: the same resolution, flood gate and
+/// monthly-limit gate as [`ProxyAuth`], from a wider credential source.
+pub struct MessagesAuth(ProxyAuth);
+
+impl MessagesAuth {
+    /// The resolved key and channel, for the shared proxy pipeline, which
+    /// needs the data and not the header the credential arrived in.
+    pub fn into_inner(self) -> ProxyAuth {
+        self.0
+    }
+
+    /// The key this request presents, if it presents one: the value of the
+    /// `x-api-key` header, or else the token of an `Authorization: Bearer`
+    /// header. A blank or non-ASCII `x-api-key` falls through to the bearer
+    /// header, so an unusable header cannot lock out a client that also sent
+    /// a usable one. A well-formed `x-api-key` that simply does not resolve
+    /// does not fall back: a wrong key is a failed authentication, not a
+    /// missing one, and the two must stay distinguishable in the flood
+    /// counter.
+    fn client_token(headers: &HeaderMap) -> Option<String> {
+        match headers.get(X_API_KEY).and_then(|value| value.to_str().ok()) {
+            Some(value) if !value.trim().is_empty() => Some(value.trim().to_string()),
+            _ => bearer_token(headers),
+        }
+    }
+}
+
 impl FromRequestParts<AppState> for ProxyAuth {
     type Rejection = ProxyAuthError;
 
@@ -135,61 +173,96 @@ impl FromRequestParts<AppState> for ProxyAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        // Flood gate first: admission reserves one budget slot in a single
-        // atomic step, before any cache probe or database read. A parallel
-        // burst therefore cannot all pass the gate against a stale counter,
-        // and a capped IP costs neither a cache probe nor a database read.
-        // The gate needs the same client-IP resolution the log rows use, so
-        // it shares the trusted-proxy logic.
-        let peer = parts
-            .extensions
-            .get::<ConnectInfo<SocketAddr>>()
-            .map(|info| info.0);
-        let flood_ip: Option<IpAddr> = if state.flood.is_enabled() {
-            client_ip::resolve_ip(&parts.headers, peer, &state.trusted_proxies)
-        } else {
-            None
-        };
-        let flood_ticket = match flood_ip {
-            Some(ip) => match state.flood.admit(ip) {
-                Admission::Allowed(ticket) => Some(ticket),
-                Admission::Capped(ticket) => return Err(ProxyAuthError::FloodCapped(ticket)),
-            },
-            None => None,
-        };
+        let token = bearer_token(&parts.headers);
+        authenticate(parts, state, token).await
+    }
+}
 
-        let resolution = Self::resolve_key(parts, state).await;
-        match resolution {
-            // An invalid key is exactly the failure the budget counts: its
-            // admission slot settles into a recorded failure.
-            Err(ProxyAuthError::InvalidKey) => Err(ProxyAuthError::InvalidKey),
-            // Every other outcome releases the slot first: successes, a
-            // disabled key (403), a spent monthly limit (429) and storage
-            // failures must not feed the counter. Only then is the monthly
-            // limit checked, so a rejected request cannot starve the IP's
-            // budget for the requests that follow it.
-            other => {
-                if let Some(ticket) = &flood_ticket {
-                    state.flood.release(ticket);
-                }
-                let auth = other?;
-                Self::check_monthly_limit(state, &auth)?;
-                Ok(auth)
+impl FromRequestParts<AppState> for MessagesAuth {
+    type Rejection = ProxyAuthError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = Self::client_token(&parts.headers);
+        authenticate(parts, state, token).await.map(MessagesAuth)
+    }
+}
+
+/// The authentication sequence every proxy extractor runs, given the
+/// credential the request carried (`None` when it carried none): the per-IP
+/// flood gate, resolution of the token (cache first, database on a miss) and
+/// the monthly-limit gate. Both extractors call this, so [`ProxyAuth`] and
+/// [`MessagesAuth`] cannot drift apart in anything but where the token is
+/// read from.
+async fn authenticate(
+    parts: &mut Parts,
+    state: &AppState,
+    token: Option<String>,
+) -> Result<ProxyAuth, ProxyAuthError> {
+    // Flood gate first: admission reserves one budget slot in a single
+    // atomic step, before any cache probe or database read. A parallel
+    // burst therefore cannot all pass the gate against a stale counter,
+    // and a capped IP costs neither a cache probe nor a database read.
+    // The gate needs the same client-IP resolution the log rows use, so
+    // it shares the trusted-proxy logic.
+    let peer = parts
+        .extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|info| info.0);
+    let flood_ip: Option<IpAddr> = if state.flood.is_enabled() {
+        client_ip::resolve_ip(&parts.headers, peer, &state.trusted_proxies)
+    } else {
+        None
+    };
+    let flood_ticket = match flood_ip {
+        Some(ip) => match state.flood.admit(ip) {
+            Admission::Allowed(ticket) => Some(ticket),
+            Admission::Capped(ticket) => return Err(ProxyAuthError::FloodCapped(ticket)),
+        },
+        None => None,
+    };
+
+    let resolution = match token {
+        Some(token) => ProxyAuth::resolve_token(state, &token).await,
+        None => Err(ProxyAuthError::InvalidKey),
+    };
+    match resolution {
+        // An invalid key is exactly the failure the budget counts: its
+        // admission slot settles into a recorded failure. A request that
+        // carried no credential at all settles the same way, which keeps
+        // the capped response indistinguishable from the unknown-key one.
+        Err(ProxyAuthError::InvalidKey) => Err(ProxyAuthError::InvalidKey),
+        // Every other outcome releases the slot first: successes, a
+        // disabled key (403), a spent monthly limit (429) and storage
+        // failures must not feed the counter. Only then is the monthly
+        // limit checked, so a rejected request cannot starve the IP's
+        // budget for the requests that follow it.
+        other => {
+            if let Some(ticket) = &flood_ticket {
+                state.flood.release(ticket);
             }
+            let auth = other?;
+            ProxyAuth::check_monthly_limit(state, &auth)?;
+            Ok(auth)
         }
     }
 }
 
+/// The token of an `Authorization: Bearer` header, if the request carries a
+/// usable one.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let header_value = headers.get(AUTHORIZATION)?.to_str().ok()?;
+    parse_bearer(header_value).map(str::to_string)
+}
+
 impl ProxyAuth {
-    /// Header parsing, cache probe and database resolution for one request,
-    /// after the flood gate has admitted it.
-    async fn resolve_key(parts: &mut Parts, state: &AppState) -> Result<Self, ProxyAuthError> {
-        let header_value = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .ok_or(ProxyAuthError::InvalidKey)?;
-        let token = parse_bearer(header_value).ok_or(ProxyAuthError::InvalidKey)?;
+    /// Cache probe and database resolution for one presented key, after the
+    /// flood gate has admitted the request. Both extractors call this with
+    /// the token they read, so resolution is identical whichever credential
+    /// header carried it.
+    async fn resolve_token(state: &AppState, token: &str) -> Result<Self, ProxyAuthError> {
         let key_hash = sha256_hex(token.as_bytes());
 
         // Fresh hit: both the key and the channel come from memory and the
@@ -262,6 +335,8 @@ fn parse_bearer(header: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
+
     use super::*;
 
     #[test]
@@ -278,5 +353,69 @@ mod tests {
         assert_eq!(parse_bearer("Bearer"), None);
         assert_eq!(parse_bearer("Bearer "), None);
         assert_eq!(parse_bearer("hyd-abc"), None);
+    }
+
+    #[test]
+    fn messages_client_token_reads_the_api_key_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_API_KEY, HeaderValue::from_static("hyd-from-api-key"));
+        assert_eq!(
+            MessagesAuth::client_token(&headers).as_deref(),
+            Some("hyd-from-api-key")
+        );
+    }
+
+    /// Both headers at once: the Anthropic-native one wins, so a client that
+    /// keeps its OpenAI-style header alongside cannot authenticate as someone
+    /// else by accident.
+    #[test]
+    fn messages_client_token_prefers_the_api_key_header_over_the_bearer_one() {
+        let mut headers = HeaderMap::new();
+        headers.insert(X_API_KEY, HeaderValue::from_static("hyd-from-api-key"));
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Bearer hyd-from-bearer"),
+        );
+        assert_eq!(
+            MessagesAuth::client_token(&headers).as_deref(),
+            Some("hyd-from-api-key")
+        );
+    }
+
+    #[test]
+    fn messages_client_token_falls_back_to_the_bearer_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("bearer hyd-from-bearer"),
+        );
+        assert_eq!(
+            MessagesAuth::client_token(&headers).as_deref(),
+            Some("hyd-from-bearer")
+        );
+
+        // A blank api-key header is not a credential, so the bearer token it
+        // was sent next to still authenticates.
+        headers.insert(X_API_KEY, HeaderValue::from_static("   "));
+        assert_eq!(
+            MessagesAuth::client_token(&headers).as_deref(),
+            Some("hyd-from-bearer")
+        );
+    }
+
+    #[test]
+    fn messages_client_token_is_none_without_any_usable_credential() {
+        assert_eq!(MessagesAuth::client_token(&HeaderMap::new()), None);
+
+        let mut basic = HeaderMap::new();
+        basic.insert(
+            AUTHORIZATION,
+            HeaderValue::from_static("Basic dXNlcjpwYXNz"),
+        );
+        assert_eq!(MessagesAuth::client_token(&basic), None);
+
+        let mut empty_bearer = HeaderMap::new();
+        empty_bearer.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
+        assert_eq!(MessagesAuth::client_token(&empty_bearer), None);
     }
 }
