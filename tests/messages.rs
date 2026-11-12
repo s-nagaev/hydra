@@ -5,9 +5,10 @@
 //! accepts, the outbound header policy (the upstream key as `x-api-key`
 //! instead of a bearer token, the required `anthropic-version` and the
 //! optional `anthropic-beta`), the route-specific 32 MiB body limit, the
-//! shared rejection mapping, and the Anthropic usage shape the response is
-//! logged in, additively normalized, on both the streaming and the buffered
-//! path.
+//! shared rejections rendered in the Anthropic error envelope that this
+//! route's clients parse, with the OpenAI surfaces checked alongside for the
+//! same rejection, and the Anthropic usage shape the response is logged in,
+//! additively normalized, on both the streaming and the buffered path.
 
 mod common;
 
@@ -132,7 +133,138 @@ struct LogRow {
 }
 
 fn error_json(body: &[u8]) -> Value {
-    serde_json::from_slice(body).expect("proxy errors must be OpenAI-shaped JSON")
+    serde_json::from_slice(body).expect("proxy errors must be JSON")
+}
+
+/// Asserts the Anthropic envelope an Anthropic SDK pointed at this route
+/// parses: `type: "error"` at the top level and an `error` object carrying
+/// exactly the taxonomy `type` and a non-empty `message`. Returns that inner
+/// object for message assertions.
+fn anthropic_error(body: &[u8], expected_type: &str) -> Value {
+    let value = error_json(body);
+    assert_eq!(
+        value["type"], "error",
+        "a rejection of this route must be Anthropic-shaped: {value}"
+    );
+    let error = value["error"].clone();
+    assert_eq!(error["type"], expected_type, "body: {value}");
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "every rejection carries a message: {value}"
+    );
+    assert_eq!(
+        error.as_object().unwrap().len(),
+        2,
+        "the Anthropic error object has no `code` field: {value}"
+    );
+    error
+}
+
+/// The same rejection as the OpenAI surfaces render it: the envelope stays
+/// `{"error":{"message","type","code"}}`, `code` included, so the change
+/// that gives this route its own envelope cannot leak onto chat.
+fn openai_error(body: &[u8], expected_type: &str) -> Value {
+    let value = error_json(body);
+    assert!(
+        value.get("type").is_none(),
+        "an OpenAI surface must not grow the Anthropic envelope: {value}"
+    );
+    let error = value["error"].clone();
+    assert_eq!(error["type"], expected_type, "body: {value}");
+    assert!(
+        error.get("code").is_some(),
+        "the OpenAI envelope keeps its `code`, `null` included: {value}"
+    );
+    assert!(
+        error["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()),
+        "every rejection carries a message: {value}"
+    );
+    error
+}
+
+/// A chat body for the given model, for the paired assertion that the
+/// OpenAI surfaces keep their envelope for the same rejection.
+fn chat_body(model: &str) -> Vec<u8> {
+    serde_json::to_vec(&json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": "hi" }],
+    }))
+    .unwrap()
+}
+
+/// The same body sent to the chat route with a bearer credential.
+fn chat_request(key: &str, body: Vec<u8>) -> Request<Body> {
+    Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("authorization", format!("Bearer {key}"))
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap()
+}
+
+/// A body one chunk past the production limit, streamed so the router stops
+/// reading at the limit instead of the test materializing it.
+fn oversized_stream_body(uri: &str) -> Request<Body> {
+    use tokio_stream::StreamExt as _;
+    let chunk: Bytes = vec![b'x'; 1024 * 1024].into();
+    let chunks_needed = hydra::http::CHAT_BODY_LIMIT / chunk.len() + 1;
+    Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from_stream(
+            tokio_stream::iter(std::iter::repeat_n(chunk, chunks_needed))
+                .map(Ok::<_, std::convert::Infallible>),
+        ))
+        .unwrap()
+}
+
+/// A key with a monthly limit, returned with its row id. The limit verdict
+/// is what the gate reads, so this seeds the key the gate needs and nothing
+/// else: what these tests pin is the envelope of a rejected request, not the
+/// gate, which has its own suite.
+async fn seed_limited_key(db: &SqlitePool, channel_id: i64) -> (i64, String) {
+    let generated = hydra::keys::generate();
+    let key = within(hydra::db::keys::create(
+        &hydra::db::Db::from(db.clone()),
+        &hydra::db::keys::NewKey {
+            key_hash: generated.key_hash,
+            display_prefix: generated.display_prefix,
+            name: None,
+            channel_id,
+            monthly_limit_micro_usd: Some(1),
+        },
+    ))
+    .await
+    .unwrap();
+    (key.id, generated.full)
+}
+
+/// A pool whose every query fails: connected, then closed, so any acquire
+/// errors out. Swapped into an app's state to reach the storage-failure
+/// arms.
+async fn dead_pool() -> SqlitePool {
+    let pool = within(
+        sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:"),
+    )
+    .await
+    .unwrap();
+    pool.close().await;
+    pool
+}
+
+/// An app whose key lookup cannot succeed, for the 500 arms.
+fn app_with_dead_db(app: &AppState, db: SqlitePool) -> AppState {
+    let mut offline = app.clone();
+    offline.db = hydra::db::Db::from(db);
+    offline
 }
 
 #[tokio::test]
@@ -291,7 +423,7 @@ async fn messages_prefers_the_api_key_header_over_a_bearer_header() {
 }
 
 #[tokio::test]
-async fn messages_without_any_credential_returns_401_openai_error() {
+async fn messages_without_any_credential_returns_401_anthropic_error() {
     let db = common::test_pool().await;
     let base = common::unreachable_base_url().await;
     let channel_id = common::seed_channel(&db, &base, None).await;
@@ -305,15 +437,27 @@ async fn messages_without_any_credential_returns_401_openai_error() {
         .header("content-type", "application/json")
         .body(Body::from(messages_body("claude-3", false)))
         .unwrap();
-    let (status, _, body) = send(app, request).await;
+    let (status, _, body) = send(app.clone(), request).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let error = error_json(&body)["error"].clone();
-    assert_eq!(error["type"], "invalid_request_error");
+    let error = anthropic_error(&body, "authentication_error");
+    assert_eq!(error["message"], "Invalid API key provided");
+
+    // The same rejection on chat, the surface that has always answered in
+    // the OpenAI envelope.
+    let chat_without_credentials = Request::builder()
+        .method("POST")
+        .uri("/v1/chat/completions")
+        .header("content-type", "application/json")
+        .body(Body::from(chat_body("gpt-4o")))
+        .unwrap();
+    let (status, _, body) = send(app, chat_without_credentials).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let error = openai_error(&body, "invalid_request_error");
     assert_eq!(error["code"], "invalid_api_key");
 }
 
 #[tokio::test]
-async fn messages_with_an_unknown_api_key_returns_401_openai_error() {
+async fn messages_with_an_unknown_api_key_returns_401_anthropic_error() {
     let db = common::test_pool().await;
     let base = common::unreachable_base_url().await;
     let channel_id = common::seed_channel(&db, &base, None).await;
@@ -321,18 +465,23 @@ async fn messages_with_an_unknown_api_key_returns_401_openai_error() {
     let app = common::test_app(db);
 
     let (status, _, body) = send(
-        app,
+        app.clone(),
         messages_request("hyd-not-a-real-key", messages_body("claude-3", false)),
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
-    let error = error_json(&body)["error"].clone();
-    assert_eq!(error["code"], "invalid_api_key");
+    let error = anthropic_error(&body, "authentication_error");
     assert!(error["message"].as_str().unwrap().contains("API key"));
+
+    let (status, _, body) =
+        send(app, chat_request("hyd-not-a-real-key", chat_body("gpt-4o"))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let error = openai_error(&body, "invalid_request_error");
+    assert_eq!(error["code"], "invalid_api_key");
 }
 
 #[tokio::test]
-async fn messages_with_a_disabled_key_returns_403_key_disabled() {
+async fn messages_with_a_disabled_key_returns_403_anthropic_error() {
     let db = common::test_pool().await;
     let base = common::unreachable_base_url().await;
     let channel_id = common::seed_channel(&db, &base, None).await;
@@ -341,18 +490,22 @@ async fn messages_with_a_disabled_key_returns_403_key_disabled() {
     let app = common::test_app(db);
 
     let (status, _, body) = send(
-        app,
+        app.clone(),
         messages_request(&key, messages_body("claude-3", false)),
     )
     .await;
     assert_eq!(status, StatusCode::FORBIDDEN);
-    let error = error_json(&body)["error"].clone();
-    assert_eq!(error["type"], "invalid_request_error");
+    let error = anthropic_error(&body, "permission_error");
+    assert_eq!(error["message"], "This API key has been disabled");
+
+    let (status, _, body) = send(app, chat_request(&key, chat_body("gpt-4o"))).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let error = openai_error(&body, "invalid_request_error");
     assert_eq!(error["code"], "key_disabled");
 }
 
 #[tokio::test]
-async fn messages_with_a_model_outside_the_whitelist_returns_404_model_not_found() {
+async fn messages_with_a_model_outside_the_whitelist_returns_404_anthropic_error() {
     let db = common::test_pool().await;
     let recorder = Recorder::default();
     let base = common::spawn_upstream(fixed_response_router(
@@ -366,14 +519,25 @@ async fn messages_with_a_model_outside_the_whitelist_returns_404_model_not_found
     let key = common::seed_key(&db, channel_id).await;
     let app = common::test_app(db);
 
-    let (status, _, body) = send(app, messages_request(&key, messages_body("gpt-4o", false))).await;
+    let (status, _, body) = send(
+        app.clone(),
+        messages_request(&key, messages_body("gpt-4o", false)),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let error = error_json(&body)["error"].clone();
-    assert_eq!(error["code"], "model_not_found");
+    let error = anthropic_error(&body, "invalid_request_error");
     assert!(
         error["message"].as_str().unwrap().contains("claude-3"),
         "the message must list the whitelist: {error}"
     );
+
+    // Chat rejects the very same model against the very same whitelist, in
+    // the OpenAI envelope it has always used.
+    let (status, _, body) = send(app, chat_request(&key, chat_body("gpt-4o"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let error = openai_error(&body, "invalid_request_error");
+    assert_eq!(error["code"], "model_not_found");
+
     assert_eq!(
         recorder.requests().len(),
         0,
@@ -385,7 +549,7 @@ async fn messages_with_a_model_outside_the_whitelist_returns_404_model_not_found
 /// missing header at its own boundary instead of spending a round-trip to
 /// relay the upstream's 400.
 #[tokio::test]
-async fn messages_without_the_version_header_returns_400_and_never_reaches_the_upstream() {
+async fn messages_without_the_version_header_returns_400_anthropic_error() {
     let db = common::test_pool().await;
     let recorder = Recorder::default();
     let base = common::spawn_upstream(fixed_response_router(
@@ -406,11 +570,10 @@ async fn messages_without_the_version_header_returns_400_and_never_reaches_the_u
         .header("content-type", "application/json")
         .body(Body::from(messages_body("claude-3", false)))
         .unwrap();
-    let (status, _, body) = send(app, request).await;
+    let (status, _, body) = send(app.clone(), request).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    let error = error_json(&body)["error"].clone();
-    assert_eq!(error["type"], "invalid_request_error");
+    let error = anthropic_error(&body, "invalid_request_error");
     assert!(
         error["message"]
             .as_str()
@@ -423,6 +586,12 @@ async fn messages_without_the_version_header_returns_400_and_never_reaches_the_u
         0,
         "a request Hydra rejects must not reach the upstream"
     );
+
+    // The chat 400 for the same class of request, a body Hydra cannot
+    // dispatch, keeps the OpenAI envelope.
+    let (status, _, body) = send(app, chat_request(&key, br#"{"messages":[]}"#.to_vec())).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    openai_error(&body, "invalid_request_error");
 
     // The rejection is logged like every other rejection on this route: a
     // client-level rejection carries no status, and the row keeps the model
@@ -557,7 +726,7 @@ async fn messages_body_above_the_axum_default_limit_is_accepted() {
 }
 
 #[tokio::test]
-async fn oversized_messages_body_returns_413_openai_error() {
+async fn oversized_messages_body_returns_413_anthropic_error() {
     let db = common::test_pool().await;
     let recorder = Recorder::default();
     // A live upstream so the test proves the oversized body never leaves.
@@ -572,27 +741,20 @@ async fn oversized_messages_body_returns_413_openai_error() {
     let key = common::seed_key(&db, channel_id).await;
     let app = common::test_app(db);
 
-    // One 1 MiB chunk more than the production limit, streamed so the
-    // request is produced lazily; the router stops reading at the limit.
-    use tokio_stream::StreamExt as _;
-    let chunk: Bytes = vec![b'x'; 1024 * 1024].into();
-    let chunks_needed = hydra::http::CHAT_BODY_LIMIT / chunk.len() + 1;
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/messages")
-        .header("x-api-key", &key)
-        .header("anthropic-version", VERSION)
-        .header("content-type", "application/json")
-        .body(Body::from_stream(
-            tokio_stream::iter(std::iter::repeat_n(chunk, chunks_needed))
-                .map(Ok::<_, std::convert::Infallible>),
-        ))
-        .unwrap();
-
-    let (status, _, body) = send(app, request).await;
+    // The body-limit rejection happens in the extractor, before any handler
+    // code runs, so it is the one rejection that reaches the client without
+    // an audit row: the envelope it is rendered in still belongs to the
+    // surface the client called.
+    let mut request = oversized_stream_body("/v1/messages");
+    request
+        .headers_mut()
+        .insert("x-api-key", key.parse().unwrap());
+    request
+        .headers_mut()
+        .insert("anthropic-version", VERSION.parse().unwrap());
+    let (status, _, body) = send(app.clone(), request).await;
     assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
-    let error = error_json(&body)["error"].clone();
-    assert_eq!(error["type"], "invalid_request_error");
+    let error = anthropic_error(&body, "invalid_request_error");
     assert!(
         error["message"]
             .as_str()
@@ -601,6 +763,21 @@ async fn oversized_messages_body_returns_413_openai_error() {
             .contains("size"),
         "message must say the payload is too large: {error}"
     );
+
+    // Chat answers the same oversized body in the OpenAI envelope, which is
+    // what its clients parse.
+    let mut request = oversized_stream_body("/v1/chat/completions");
+    request
+        .headers_mut()
+        .insert("authorization", format!("Bearer {key}").parse().unwrap());
+    let (status, _, body) = send(app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let error = openai_error(&body, "invalid_request_error");
+    assert!(
+        error["code"].is_null(),
+        "OpenAI sends no code here: {error}"
+    );
+
     assert_eq!(
         recorder.requests().len(),
         0,
@@ -609,7 +786,7 @@ async fn oversized_messages_body_returns_413_openai_error() {
 }
 
 #[tokio::test]
-async fn messages_upstream_unreachable_returns_502_openai_error() {
+async fn messages_upstream_unreachable_returns_502_anthropic_error() {
     let db = common::test_pool().await;
     let base = common::unreachable_base_url().await;
     let channel_id = common::seed_channel(&db, &base, None).await;
@@ -617,18 +794,110 @@ async fn messages_upstream_unreachable_returns_502_openai_error() {
     let app = common::test_app(db);
 
     let (status, _, body) = send(
-        app,
+        app.clone(),
         messages_request(&key, messages_body("claude-3", false)),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
-    let error = error_json(&body)["error"].clone();
-    assert_eq!(error["type"], "api_error");
+    let error = anthropic_error(&body, "overloaded_error");
     assert!(error["message"]
         .as_str()
         .unwrap()
         .to_lowercase()
         .contains("upstream"));
+
+    let (status, _, body) = send(app, chat_request(&key, chat_body("gpt-4o"))).await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY);
+    let error = openai_error(&body, "api_error");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .to_lowercase()
+        .contains("upstream"));
+}
+
+/// The monthly-limit gate rejects after the key resolved, and the surface
+/// the request was sent to decides the envelope: `rate_limit_error` under
+/// both, inside each shape.
+#[tokio::test]
+async fn messages_over_the_monthly_limit_returns_429_anthropic_error() {
+    let db = common::test_pool().await;
+    let base = common::unreachable_base_url().await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let (key_id, key) = seed_limited_key(&db, channel_id).await;
+    let app = common::test_app(db);
+    app.limit_flags
+        .set(key_id, hydra::month::Month::current().bucket(), true);
+
+    let (status, _, body) = send(
+        app.clone(),
+        messages_request(&key, messages_body("claude-3", false)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let error = anthropic_error(&body, "rate_limit_error");
+    assert_eq!(error["message"], "Monthly limit reached");
+
+    let (status, _, body) = send(app, chat_request(&key, chat_body("gpt-4o"))).await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let error = openai_error(&body, "rate_limit_error");
+    assert_eq!(error["message"], "Monthly limit reached");
+}
+
+/// A storage failure while resolving the key is answered 500 on every
+/// surface, and the envelope is the only difference.
+#[tokio::test]
+async fn messages_key_lookup_failure_returns_500_anthropic_error() {
+    let db = common::test_pool().await;
+    let base = common::unreachable_base_url().await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let key = common::seed_key(&db, channel_id).await;
+    let app = common::test_app(db);
+    let offline = app_with_dead_db(&app, dead_pool().await);
+
+    let (status, _, body) = send(
+        offline.clone(),
+        messages_request(&key, messages_body("claude-3", false)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let error = anthropic_error(&body, "api_error");
+    assert_eq!(error["message"], "internal server error");
+
+    let (status, _, body) = send(offline, chat_request(&key, chat_body("gpt-4o"))).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    let error = openai_error(&body, "server_error");
+    assert_eq!(error["message"], "internal server error");
+}
+
+/// A channel disabled after its keys were issued rejects on both surfaces
+/// with 503; the Anthropic envelope calls that an overload, the OpenAI one
+/// an `api_error`.
+#[tokio::test]
+async fn messages_with_a_disabled_channel_returns_503_anthropic_error() {
+    let db = common::test_pool().await;
+    let base = common::unreachable_base_url().await;
+    let channel_id = common::seed_channel(&db, &base, None).await;
+    let key = common::seed_key(&db, channel_id).await;
+    common::set_channel_enabled(&db, channel_id, false).await;
+    let app = common::test_app(db);
+
+    let (status, _, body) = send(
+        app.clone(),
+        messages_request(&key, messages_body("claude-3", false)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let error = anthropic_error(&body, "overloaded_error");
+    assert_eq!(
+        error["message"],
+        "The channel bound to this API key is currently disabled"
+    );
+
+    let (status, _, body) = send(app, chat_request(&key, chat_body("gpt-4o"))).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    let error = openai_error(&body, "api_error");
+    assert_eq!(error["code"], "channel_disabled");
 }
 
 /// An Anthropic error body is an Anthropic error body: Hydra passes it

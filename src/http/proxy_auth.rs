@@ -14,11 +14,13 @@
 //! admin mutation that completed while the read was in flight invalidates
 //! the cache and advances the epoch, so the stale pre-write entry is
 //! dropped rather than re-inserted after the mutation's invalidation.
-//! Rejections use the
-//! OpenAI error shape shared by all proxy routes: 401 for a missing or
-//! malformed header and for an unknown key, 403 for a disabled key, 500 for
-//! storage failures. The plaintext key never appears in a response or log
-//! line.
+//! Rejections
+//! use the error shape of the surface that produced them ([`ErrorShape`]):
+//! 401 for a missing
+//! or malformed header and for an unknown key, 403 for a disabled key, 500
+//! for storage failures, in the OpenAI envelope everywhere except the
+//! Messages surface, which answers its Anthropic clients in the Anthropic
+//! envelope. The plaintext key never appears in a response or log line.
 //!
 //! The Messages route authenticates through [`MessagesAuth`], which reads the
 //! same key from the Anthropic-native `x-api-key` header or from a bearer
@@ -40,7 +42,8 @@
 //! oracle for key validity.
 //!
 //! A resolved key whose monthly spending limit is used up is answered
-//! [`ProxyAuthError::MonthlyLimitReached`], a 429 in the OpenAI error shape.
+//! [`ProxyAuthError::MonthlyLimitReached`], a 429 in the surface's error
+//! envelope.
 //! The decision is one in-memory lookup ([`crate::limit_flags`]); the
 //! verdict itself is recomputed off the request path by
 //! [`crate::usage::recompute`] after every logged response. It is only ever
@@ -65,7 +68,7 @@ use crate::db::channels::{self, Channel};
 use crate::db::keys::{self, ApiKey};
 use crate::flood::{Admission, FloodTicket};
 use crate::http::client_ip;
-use crate::http::openai_error::openai_error;
+use crate::http::openai_error::ErrorShape;
 use crate::http::AppState;
 use crate::keys::sha256_hex;
 
@@ -98,39 +101,64 @@ pub enum ProxyAuthError {
     Database(#[from] sqlx::Error),
 }
 
-impl IntoResponse for ProxyAuthError {
-    fn into_response(self) -> Response {
+impl ProxyAuthError {
+    /// Renders this rejection in the envelope of the surface that produced
+    /// it: the status, the message and the OpenAI taxonomy type are the same
+    /// everywhere, the envelope is per surface (see [`ErrorShape`]). The
+    /// pipeline renders through this so an Anthropic SDK gets an Anthropic
+    /// envelope, and the bare [`IntoResponse`] below stays the OpenAI
+    /// default for the routes that have no surface of their own.
+    pub fn into_response_with(self, shape: ErrorShape) -> Response {
+        let (status, message, error_type, code) = self.parts();
+        shape.render(status, &message, error_type, code)
+    }
+
+    /// The surface-independent pieces of this rejection: status, the message
+    /// the client reads, and the OpenAI taxonomy type and code, which only
+    /// the OpenAI envelope carries. The Database arm logs the internal
+    /// failure here, before the body is reduced to the generic 500 text.
+    fn parts(self) -> (StatusCode, String, &'static str, Option<&'static str>) {
         match self {
             // The flood-capped response is deliberately indistinguishable
             // from the unknown-key one.
-            ProxyAuthError::InvalidKey | ProxyAuthError::FloodCapped(_) => openai_error(
+            ProxyAuthError::InvalidKey | ProxyAuthError::FloodCapped(_) => (
                 StatusCode::UNAUTHORIZED,
-                "Invalid API key provided",
+                "Invalid API key provided".to_string(),
                 "invalid_request_error",
                 Some("invalid_api_key"),
             ),
-            ProxyAuthError::DisabledKey => openai_error(
+            ProxyAuthError::DisabledKey => (
                 StatusCode::FORBIDDEN,
-                "This API key has been disabled",
+                "This API key has been disabled".to_string(),
                 "invalid_request_error",
                 Some("key_disabled"),
             ),
-            ProxyAuthError::MonthlyLimitReached { .. } => openai_error(
+            ProxyAuthError::MonthlyLimitReached { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
-                "Monthly limit reached",
+                "Monthly limit reached".to_string(),
                 "rate_limit_error",
                 None,
             ),
             ProxyAuthError::Database(e) => {
                 tracing::error!(error = %e, "proxy key lookup failed");
-                openai_error(
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
+                    "internal server error".to_string(),
                     "server_error",
                     None,
                 )
             }
         }
+    }
+}
+
+impl IntoResponse for ProxyAuthError {
+    /// The OpenAI envelope: what the `/v1/models` extractor rejection
+    /// renders and what the proxied surfaces fall back to. The proxied POST
+    /// surfaces render through [`ProxyAuthError::into_response_with`] with
+    /// their own surface's shape.
+    fn into_response(self) -> Response {
+        self.into_response_with(ErrorShape::OpenAi)
     }
 }
 
@@ -337,6 +365,8 @@ fn parse_bearer(header: &str) -> Option<&str> {
 mod tests {
     use axum::http::HeaderValue;
 
+    use crate::flood::FloodCap;
+
     use super::*;
 
     #[test]
@@ -417,5 +447,117 @@ mod tests {
         let mut empty_bearer = HeaderMap::new();
         empty_bearer.insert(AUTHORIZATION, HeaderValue::from_static("Bearer "));
         assert_eq!(MessagesAuth::client_token(&empty_bearer), None);
+    }
+
+    /// Reads a rendered rejection back, so the envelope is asserted on the
+    /// bytes a client would receive.
+    async fn body_of(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// Every auth-layer rejection in both envelopes: same status and same
+    /// message, the OpenAI envelope on the OpenAI surfaces and the Anthropic
+    /// envelope on the Messages surface. The flood-capped 401 is built
+    /// through the cap itself, its ticket having no public constructor, and
+    /// it must render exactly like the unknown-key 401 it imitates.
+    #[tokio::test]
+    async fn every_auth_rejection_renders_in_the_surface_envelope() {
+        type Build = Box<dyn Fn() -> ProxyAuthError>;
+        let cap = FloodCap::new(1, 60);
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(matches!(cap.admit(ip), Admission::Allowed(_)));
+        let Admission::Capped(ticket) = cap.admit(ip) else {
+            panic!("a spent budget must cap the next admission")
+        };
+
+        let cases: [(Build, StatusCode, &str, &str, Option<&str>); 5] = [
+            (
+                Box::new(|| ProxyAuthError::InvalidKey),
+                StatusCode::UNAUTHORIZED,
+                "invalid_request_error",
+                "authentication_error",
+                Some("invalid_api_key"),
+            ),
+            (
+                Box::new(move || ProxyAuthError::FloodCapped(ticket.clone())),
+                StatusCode::UNAUTHORIZED,
+                "invalid_request_error",
+                "authentication_error",
+                Some("invalid_api_key"),
+            ),
+            (
+                Box::new(|| ProxyAuthError::DisabledKey),
+                StatusCode::FORBIDDEN,
+                "invalid_request_error",
+                "permission_error",
+                Some("key_disabled"),
+            ),
+            (
+                Box::new(|| ProxyAuthError::MonthlyLimitReached {
+                    key_id: 1,
+                    channel_id: 2,
+                }),
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limit_error",
+                "rate_limit_error",
+                None,
+            ),
+            (
+                Box::new(|| ProxyAuthError::Database(sqlx::Error::RowNotFound)),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "api_error",
+                None,
+            ),
+        ];
+
+        for (build, status, openai_type, anthropic_type, code) in cases {
+            let (rendered_status, openai) =
+                body_of(build().into_response_with(ErrorShape::OpenAi)).await;
+            assert_eq!(rendered_status, status, "OpenAI status: {openai}");
+            assert_eq!(openai["error"]["type"], openai_type, "body: {openai}");
+            assert_eq!(
+                openai["error"]["code"],
+                serde_json::json!(code),
+                "body: {openai}"
+            );
+            let message = openai["error"]["message"].clone();
+            assert!(
+                message.as_str().is_some_and(|message| !message.is_empty()),
+                "every rejection must carry a message: {openai}"
+            );
+
+            let (rendered_status, anthropic) =
+                body_of(build().into_response_with(ErrorShape::Anthropic)).await;
+            assert_eq!(rendered_status, status, "Anthropic status: {anthropic}");
+            assert_eq!(anthropic["type"], "error", "body: {anthropic}");
+            assert_eq!(
+                anthropic["error"]["type"], anthropic_type,
+                "body: {anthropic}"
+            );
+            assert_eq!(
+                anthropic["error"]["message"], message,
+                "the message must not depend on the envelope"
+            );
+            assert_eq!(
+                anthropic["error"].as_object().unwrap().len(),
+                2,
+                "the Anthropic error object carries type and message only: {anthropic}"
+            );
+        }
+    }
+
+    /// The `IntoResponse` default is what the `/v1/models` extractor
+    /// rejection renders, and it stays the OpenAI envelope.
+    #[tokio::test]
+    async fn the_default_envelope_stays_openai() {
+        let (status, body) = body_of(ProxyAuthError::InvalidKey.into_response()).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+        assert!(body.get("type").is_none(), "body: {body}");
     }
 }
