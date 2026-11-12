@@ -38,6 +38,9 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
+/* The header and the page body share one width cap so their content edges
+   line up. It stays at 1080px: the logs list is down to seven columns, so
+   the widest table on the page fits the card without a wider panel. */
 .topbar-inner {
   max-width: 1080px;
   margin: 0 auto;
@@ -91,6 +94,7 @@ body {
 
 /* Page */
 
+/* Same cap as `.topbar-inner`: one width for the header and the content. */
 .page {
   flex: 1;
   width: 100%;
@@ -751,87 +755,49 @@ td.key-cell {
   background: var(--bg);
 }
 
-.badge.bodies {
-  color: var(--accent-dark);
-  background: #eaf1fe;
-  font-size: 11.5px;
-}
-
-.error-cell {
-  max-width: 260px;
-}
-
-/* The clipped box is the span, and it may not be wider than the cell that
-   holds it: a fixed cap that is wider than the column (the 260px this used to
-   be) adds its excess to the page, which then scrolls sideways. */
-.error-cell span {
-  display: inline-block;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  vertical-align: bottom;
-}
-
-/* The logs table carries eleven columns, and with every cell a single
-   unbreakable line it does not fit the card: at 14px the longest token of each
-   column alone sums to 1519px against 990px of card, and the table measured
-   1844px, which pushed the page 719-899px wider than the viewport because the
-   card is not a scroll container. It now uses the same fixed layout as the
-   channels and keys tables, so the table is exactly as wide as the card at
-   every viewport and the values wrap or clip inside their own column. */
+/* The logs table carries the seven columns of the list, and with the fixed
+   layout it is exactly as wide as the card at every viewport, so a value that
+   does not fit wraps or clips inside its own column instead of widening the
+   page. Channel, cached tokens, bodies and the error text are not columns
+   here: they live on the drill-down page, which has no column budget. */
 .logs-table {
   table-layout: fixed;
 }
 
-/* Each share is what its column needs at 1000px, where the card content is
-   910px, so the sum is exactly 100%. Two rules decide a share: the value must
-   not lose its tail to the clip, and the header label must stay on one line
-   (measured: the 20-char timestamp needs 93.6px of cell content, the 16-char
-   key prefix 124.8px, an IPv4 address 62.4px, and the `Cached in/out` label
-   alone needs 106.1px of column). */
+/* Each share is what its column needs when the card is at its narrowest: a
+   1000px viewport leaves 910px of card content, and the shares sum to exactly
+   100% of it. A value that has to stay on one line has to fit, and so does
+   every header label (measured at 15px: the 20-char timestamp needs 169px of
+   cell content, the 16-char masked key prefix 137px, an IPv4 address 129px,
+   the `Duration` label with an 8-digit duration 75px; the longest header,
+   `Time (UTC)`, needs 86px). The key and model columns get the rest of their
+   share because their values wrap instead of clipping. */
 .logs-table th:nth-child(1) {
-  width: 11.8%; /* Time (UTC) */
+  width: 19%; /* Time (UTC) */
 }
 
 .logs-table th:nth-child(2) {
-  width: 15.3%; /* Key */
+  width: 18%; /* Key */
 }
 
 .logs-table th:nth-child(3) {
-  width: 7.8%; /* Channel */
+  width: 15.2%; /* Model */
 }
 
 .logs-table th:nth-child(4) {
-  width: 7.8%; /* Model */
+  width: 6.8%; /* Status */
 }
 
 .logs-table th:nth-child(5) {
-  width: 6.2%; /* Status */
+  width: 12.4%; /* Tokens */
 }
 
 .logs-table th:nth-child(6) {
-  width: 8%; /* Tokens */
+  width: 20%; /* Client IP */
 }
 
 .logs-table th:nth-child(7) {
-  width: 11.8%; /* Cached in/out */
-}
-
-.logs-table th:nth-child(8) {
-  width: 8.3%; /* Duration */
-}
-
-.logs-table th:nth-child(9) {
-  width: 8.3%; /* Client IP */
-}
-
-.logs-table th:nth-child(10) {
-  width: 7.4%; /* Bodies */
-}
-
-.logs-table th:nth-child(11) {
-  width: 7.3%; /* Error */
+  width: 8.6%; /* Duration */
 }
 
 /* The shares above are sized for this padding. */
@@ -848,8 +814,14 @@ td.key-cell {
   overflow: hidden;
 }
 
-/* Values that are one long word: a key label, a channel name, a model id.
-   They break inside the word rather than lose their tail to the clip. */
+/* The timestamp is one fixed-shape value whose halves are both shorter than
+   the column, and it would otherwise split every row over two lines. */
+.logs-table td.time-cell {
+  white-space: nowrap;
+}
+
+/* Values that are one long word: a key name, a model id. They break inside the
+   word rather than lose their tail to the clip. */
 .logs-table td.cell-wrap {
   overflow-wrap: anywhere;
 }

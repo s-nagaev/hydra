@@ -102,6 +102,69 @@ fn input_value(html: &str, id: &str) -> String {
     after[start..].split('"').next().unwrap().to_string()
 }
 
+/// The header cells of the only table on the page, in order. A cell's text is
+/// whatever follows its last `>` (an attribute such as `title` sits between).
+fn table_headers(html: &str) -> Vec<String> {
+    let thead = html
+        .split("<thead>")
+        .nth(1)
+        .expect("the page must carry a table with a head")
+        .split("</thead>")
+        .next()
+        .unwrap();
+    thead
+        .split("<th")
+        .skip(1)
+        .map(|cell| {
+            cell.split("</th>")
+                .next()
+                .unwrap()
+                .rsplit('>')
+                .next()
+                .unwrap()
+                .to_string()
+        })
+        .collect()
+}
+
+/// The `<tbody>` of that table, so that an assertion about a row cell cannot
+/// be satisfied by the matching text in the filter selects above the table.
+fn table_body(html: &str) -> &str {
+    html.split("<tbody>")
+        .nth(1)
+        .expect("the page must carry a table body")
+        .split("</tbody>")
+        .next()
+        .unwrap()
+}
+
+/// Inserts a key that carries a human name; returns (key_id, display_prefix).
+async fn seed_named_key(db: &SqlitePool, channel_id: i64, name: &str) -> (i64, String) {
+    let prefix = "hyd-4f9dEg2x".to_string();
+    within(
+        sqlx::query(
+            "INSERT INTO api_keys (key_hash, display_prefix, name, channel_id, created_at) \
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(format!("hash-of-{name}"))
+        .bind(&prefix)
+        .bind(name)
+        .bind(channel_id)
+        .bind("2026-11-01T00:00:00Z")
+        .execute(db),
+    )
+    .await
+    .unwrap();
+    let key_id: i64 = within(
+        sqlx::query_scalar("SELECT id FROM api_keys WHERE key_hash = ?")
+            .bind(format!("hash-of-{name}"))
+            .fetch_one(db),
+    )
+    .await
+    .unwrap();
+    (key_id, prefix)
+}
+
 // --- Auth gate ------------------------------------------------------------
 
 #[tokio::test]
@@ -209,16 +272,110 @@ async fn rows_render_status_badges_token_dashes_and_labels() {
     assert!(body.contains("badge status-err"));
     assert!(body.contains("10 / 5"));
     assert!(body.contains("7 / -"));
-    assert!(body.contains("upstream connection refused"));
     assert!(body.contains(prefix.as_str()));
     assert!(body.contains("of 4"));
+    // The error text of the fourth row belongs to the drill-down page; the
+    // list carries seven columns and the error is not one of them.
+    assert!(!body.contains("upstream connection refused"));
 }
 
 #[tokio::test]
-async fn captured_bodies_show_a_badge_but_never_their_content() {
+async fn list_renders_exactly_the_seven_agreed_columns() {
     let db = test_pool().await;
     let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
     insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(502),
+        Some(10),
+        Some(5),
+        Some(r#"{"prompt":"hi"}"#),
+        Some(r#"{"reply":"hi"}"#),
+        Some("upstream returned 502"),
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, "/admin/ui/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        table_headers(&body),
+        vec![
+            "Time (UTC)",
+            "Key",
+            "Model",
+            "Status",
+            "Tokens",
+            "Client IP",
+            "Duration"
+        ]
+    );
+    let first_row = table_body(&body).split("</tr>").next().unwrap();
+    assert_eq!(
+        first_row.matches("<td").count(),
+        7,
+        "the row must carry one cell per column: {first_row}"
+    );
+}
+
+#[tokio::test]
+async fn list_key_column_shows_the_name_and_falls_back_to_the_masked_prefix() {
+    let db = test_pool().await;
+    let (channel_id, key_id, prefix) = seed_channel_and_key(&db).await;
+    let (named_id, named_prefix) = seed_named_key(&db, channel_id, "production-agent").await;
+    insert_log(
+        &db,
+        named_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(10),
+        Some(5),
+        None,
+        None,
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+    insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(10),
+        Some(5),
+        None,
+        None,
+        None,
+        "2026-11-07 10:01:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, "/admin/ui/logs").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = table_body(&body);
+    assert!(
+        rows.contains(r#"<td class="mono cell-wrap">production-agent</td>"#),
+        "a named key shows its name: {rows}"
+    );
+    assert!(
+        !rows.contains(&format!("{named_prefix} production-agent")),
+        "the name replaces the label, it is not appended to the prefix: {rows}"
+    );
+    assert!(
+        rows.contains(&format!(r#"<td class="mono cell-wrap">{prefix}</td>"#)),
+        "a key without a name shows its masked prefix: {rows}"
+    );
+}
+
+#[tokio::test]
+async fn body_content_never_reaches_the_list_and_shows_on_the_detail_page() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let log_id = insert_log(
         &db,
         key_id,
         channel_id,
@@ -235,9 +392,46 @@ async fn captured_bodies_show_a_badge_but_never_their_content() {
 
     let (status, body) = get_page(&db, "/admin/ui/logs").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("badge bodies"));
+    assert!(
+        !body.contains("badge bodies"),
+        "the list has no bodies column any more: {body}"
+    );
     assert!(!body.contains("super-secret-prompt-42"));
     assert!(!body.contains("super-secret-reply-42"));
+
+    let (status, detail) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(detail.contains("super-secret-prompt-42"));
+    assert!(detail.contains("super-secret-reply-42"));
+}
+
+#[tokio::test]
+async fn detail_page_keeps_the_channel_cached_bodies_and_error_the_list_dropped() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(502),
+        Some(10),
+        Some(5),
+        Some(r#"{"prompt":"hi"}"#),
+        Some(r#"{"reply":"hi"}"#),
+        Some("upstream returned 502"),
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<th scope=\"row\">Channel</th>"));
+    assert!(body.contains("test channel"));
+    assert!(body.contains("Cached tokens (in / out)"));
+    assert!(body.contains("upstream returned 502"));
+    assert!(body.contains("<summary class=\"snippet-label\">Request body</summary>"));
+    assert!(body.contains("<summary class=\"snippet-label\">Response body</summary>"));
 }
 
 // --- URL state and filters ------------------------------------------------
@@ -515,7 +709,7 @@ async fn client_ip_column_renders_the_ip_or_a_dash() {
 }
 
 #[tokio::test]
-async fn rejection_rows_with_null_ids_render_placeholder_labels() {
+async fn rejection_rows_with_null_ids_render_the_key_placeholder() {
     let db = test_pool().await;
     seed_channel_and_key(&db).await;
     within(
@@ -535,11 +729,9 @@ async fn rejection_rows_with_null_ids_render_placeholder_labels() {
     let (status, body) = get_page(&db, "/admin/ui/logs").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("unknown key"),
-        "a NULL key id must render as a placeholder, not a lookup panic: {body}"
+        table_body(&body).contains(r#"<td class="mono cell-wrap">n/a</td>"#),
+        "a rejected request that carries no key must render as n/a, not a lookup panic: {body}"
     );
-    assert!(body.contains("unknown channel"));
-    assert!(body.contains("Invalid API key provided"));
 }
 
 /// Inserts a rejection-style row with NULL key and channel ids.
@@ -869,7 +1061,7 @@ async fn insert_cached_log(
 }
 
 #[tokio::test]
-async fn cached_tokens_render_beside_the_plain_tokens_with_a_dash_for_nulls() {
+async fn cached_tokens_render_on_the_detail_page_with_a_dash_for_nulls() {
     let db = test_pool().await;
     let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
     let both = insert_cached_log(
@@ -894,8 +1086,10 @@ async fn cached_tokens_render_beside_the_plain_tokens_with_a_dash_for_nulls() {
 
     let (status, body) = get_page(&db, "/admin/ui/logs").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("Cached tokens (in / out)"));
-    assert!(body.contains("6 / 2"));
+    assert!(
+        !body.contains("Cached in/out"),
+        "the cached-token column belongs to the drill-down page now: {body}"
+    );
 
     let (status, detail) = get_page(&db, &format!("/admin/ui/logs/{both}")).await;
     assert_eq!(status, StatusCode::OK);
