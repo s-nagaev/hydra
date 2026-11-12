@@ -145,6 +145,20 @@ body {
 
 .actions-col {
   text-align: right;
+  white-space: nowrap;
+  /* Shrink to the width the controls need; the other columns absorb the rest. */
+  width: 1%;
+  /* Drop the collapsed inline whitespace so the margin below is the only gap. */
+  font-size: 0;
+}
+
+.actions-col > * {
+  font-size: 14px;
+  vertical-align: middle;
+}
+
+.actions-col form.inline {
+  margin-left: 8px;
 }
 
 .empty-state {
