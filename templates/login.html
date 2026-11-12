@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Hydra</title>
+  <link rel="stylesheet" href="/admin/ui/static/admin.css">
+</head>
+<body>
+  <main class="login-page">
+    <form class="login-card" method="post" action="/admin/ui/login">
+      <h1 class="login-brand">Hydra</h1>
+      <p class="login-hint">Sign in with the admin credentials.</p>
+      {%- if !error.is_empty() %}
+      <p class="login-error" role="alert">{{ error }}</p>
+      {%- endif %}
+      <label for="login">Login</label>
+      <input id="login" name="login" type="text" autocomplete="username" required autofocus>
+      <label for="password">Password</label>
+      <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <button class="primary" type="submit">Sign in</button>
+    </form>
+  </main>
+  <footer class="footer">hydra {{ version }} · admin</footer>
+</body>
+</html>

@@ -27,8 +27,8 @@ use time::{Duration, OffsetDateTime, UtcOffset};
 use crate::db::channels::{self, Channel};
 use crate::db::keys::{self, ApiKey};
 use crate::db::request_logs::{self, LogFilters, RequestLog};
-use crate::http::admin_auth::AdminAuth;
 use crate::http::admin_logs::{build_filters, LogsError, RawLogQuery, DEFAULT_PAGE_SIZE};
+use crate::http::ui_auth::UiAuth;
 use crate::http::AppState;
 
 /// Time presets: URL value, label, length in minutes. The URL keeps the
@@ -870,7 +870,7 @@ async fn render(state: &AppState, query: LogsQuery) -> LogsPage {
 /// fields, but the rejection path is kept for robustness.
 pub async fn page(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     query: Result<Query<LogsQuery>, QueryRejection>,
 ) -> LogsPage {
     match query {
@@ -965,7 +965,7 @@ fn back_page(query: &LogsQuery) -> u64 {
 /// shapes the back link: a malformed one never hides a stored row.
 pub async fn detail(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     Path(raw_id): Path<String>,
     query: Result<Query<LogsQuery>, QueryRejection>,
 ) -> (StatusCode, LogDetailPage) {

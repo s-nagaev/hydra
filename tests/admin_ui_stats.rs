@@ -180,10 +180,10 @@ async fn log_priced_request(db: &SqlitePool, key_id: i64, channel_id: i64, at: &
 // --- Auth gate and navigation --------------------------------------------
 
 #[tokio::test]
-async fn stats_page_without_credentials_returns_401() {
+async fn stats_page_without_a_session_redirects_to_the_login_page() {
     let db = test_pool().await;
     let (status, body) = send(&db, "/admin/ui/stats", None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(body.is_empty());
 }
 

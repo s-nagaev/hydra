@@ -105,10 +105,10 @@ fn input_value(html: &str, id: &str) -> String {
 // --- Auth gate ------------------------------------------------------------
 
 #[tokio::test]
-async fn logs_page_without_credentials_returns_401() {
+async fn logs_page_without_a_session_redirects_to_the_login_page() {
     let db = test_pool().await;
     let (status, body) = send(&db, "/admin/ui/logs", None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(body.is_empty());
 }
 
@@ -755,10 +755,10 @@ async fn malformed_log_id_renders_the_bad_request_banner() {
 }
 
 #[tokio::test]
-async fn detail_page_without_credentials_returns_401() {
+async fn detail_page_without_a_session_redirects_to_the_login_page() {
     let db = test_pool().await;
     let (status, body) = send(&db, "/admin/ui/logs/1", None).await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(status, StatusCode::SEE_OTHER);
     assert!(body.is_empty());
 }
 

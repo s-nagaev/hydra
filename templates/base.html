@@ -23,6 +23,9 @@
           {%- if section == "stats" %} class="active"{% endif %}>Stat</a>
       </nav>
       <a class="api-link" href="/swagger-ui">API</a>
+      <form class="logout-form" method="post" action="/admin/ui/logout">
+        <button type="submit">Log out</button>
+      </form>
     </div>
   </header>
   <main class="page">

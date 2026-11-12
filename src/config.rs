@@ -144,6 +144,12 @@ pub struct Config {
     pub admin_login: String,
     #[allow(dead_code)]
     pub admin_password: String,
+    /// Optional override of the admin UI session signing key; see
+    /// `crate::http::admin_session`. Unset (the default) derives the key
+    /// from `HYDRA_ADMIN_PASSWORD`, so rotating the password invalidates
+    /// every session; setting this keeps sessions valid across a rotation.
+    /// An empty value counts as unset.
+    pub session_secret: Option<String>,
     pub log_bodies: bool,
     /// Lifetime of a key→channel cache entry, in seconds; 0 disables the
     /// cache. Semantics live in [`crate::cache`].
@@ -162,13 +168,14 @@ pub struct Config {
 
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The database URL (via DbTarget's own redacted Debug) and the admin
-        // password must never appear in Debug output.
+        // The database URL (via DbTarget's own redacted Debug), the admin
+        // password and the session secret must never appear in Debug output.
         f.debug_struct("Config")
             .field("bind_addr", &self.bind_addr)
             .field("db", &self.db)
             .field("admin_login", &self.admin_login)
             .field("admin_password", &"<redacted>")
+            .field("session_secret", &self.session_secret.is_some())
             .field("log_bodies", &self.log_bodies)
             .field("cache_ttl_secs", &self.cache_ttl_secs)
             .field("trusted_proxies", &self.trusted_proxies)
@@ -201,6 +208,10 @@ impl Config {
         let db = resolve_db_target()?;
         let admin_login = required_non_empty("HYDRA_ADMIN_LOGIN")?;
         let admin_password = required_non_empty("HYDRA_ADMIN_PASSWORD")?;
+        let session_secret = match env::var("HYDRA_SESSION_SECRET") {
+            Ok(secret) if !secret.is_empty() => Some(secret),
+            _ => None,
+        };
         let log_bodies = match env::var("HYDRA_LOG_BODIES") {
             Ok(raw) => raw
                 .parse::<bool>()
@@ -245,6 +256,7 @@ impl Config {
             db,
             admin_login,
             admin_password,
+            session_secret,
             log_bodies,
             cache_ttl_secs,
             trusted_proxies,
@@ -539,6 +551,7 @@ mod tests {
             db: DbTarget::Postgres("postgres://user:sekret@host:5432/db".to_string()),
             admin_login: "admin".to_string(),
             admin_password: "sekret".to_string(),
+            session_secret: Some("session-sekret".to_string()),
             log_bodies: false,
             cache_ttl_secs: 3600,
             trusted_proxies: TrustedProxies::default(),
@@ -549,7 +562,30 @@ mod tests {
         assert!(!shown.contains("sekret"));
         assert!(!shown.contains("user@"));
         assert!(!shown.contains("postgres://user"));
+        assert!(!shown.contains("session-sekret"));
         assert!(shown.contains("<redacted>"));
+    }
+
+    #[test]
+    fn session_secret_defaults_to_unset_and_an_empty_value_is_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        env::remove_var("HYDRA_BIND_ADDR");
+        env::remove_var("HYDRA_DATABASE_URL");
+        env::set_var("HYDRA_ADMIN_LOGIN", "admin");
+        env::set_var("HYDRA_ADMIN_PASSWORD", "secret");
+
+        env::remove_var("HYDRA_SESSION_SECRET");
+        assert_eq!(Config::from_env().unwrap().session_secret, None);
+
+        env::set_var("HYDRA_SESSION_SECRET", "");
+        assert_eq!(Config::from_env().unwrap().session_secret, None);
+
+        env::set_var("HYDRA_SESSION_SECRET", "session-secret");
+        assert_eq!(
+            Config::from_env().unwrap().session_secret,
+            Some("session-secret".to_string())
+        );
+        env::remove_var("HYDRA_SESSION_SECRET");
     }
 
     #[test]

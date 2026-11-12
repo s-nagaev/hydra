@@ -49,8 +49,8 @@ use crate::db::channels::{self, PricedChannel};
 use crate::db::keys::{self, ApiKey};
 use crate::db::request_logs::{self, ModelUsage};
 use crate::db::Db;
-use crate::http::admin_auth::AdminAuth;
 use crate::http::admin_ui_logs::thousands;
+use crate::http::ui_auth::UiAuth;
 use crate::http::AppState;
 use crate::limits;
 use crate::month::Month;
@@ -403,7 +403,7 @@ fn build_page(data: StatsData, error: Option<String>) -> StatsPage {
 /// robustness.
 pub async fn page(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     query: Result<Query<StatsQuery>, QueryRejection>,
 ) -> StatsPage {
     let (query, rejection) = match query {

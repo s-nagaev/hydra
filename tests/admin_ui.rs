@@ -798,75 +798,109 @@ async fn cross_site_posts_to_every_mutating_ui_route_return_403() {
 }
 
 #[tokio::test]
-async fn ui_posts_without_credentials_return_401() {
+async fn ui_posts_without_credentials_redirect_to_the_login_page() {
     let db = test_pool().await;
-    let (status, _) = send(
-        &db,
-        "POST",
-        "/admin/ui/channels",
-        Some(form(&[
-            ("name", "x"),
-            ("base_url", "https://api.example.com"),
-            ("api_key", "sk-anything"),
-            ("allowed_models", ""),
-        ])),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-
-    let (status, _) = send(
-        &db,
-        "POST",
-        "/admin/ui/keys",
-        Some(form(&[("channel_id", "1"), ("name", "")])),
-        None,
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    for (uri, body) in [
+        (
+            "/admin/ui/channels",
+            form(&[
+                ("name", "x"),
+                ("base_url", "https://api.example.com"),
+                ("api_key", "sk-anything"),
+                ("allowed_models", ""),
+            ]),
+        ),
+        ("/admin/ui/keys", form(&[("channel_id", "1"), ("name", "")])),
+    ] {
+        let (status, _) = send(&db, "POST", uri, Some(body), None, None).await;
+        assert_eq!(
+            status,
+            StatusCode::SEE_OTHER,
+            "unauthenticated POST {uri} must be sent to the login page, not challenged"
+        );
+    }
 }
 
 // --- Access control matrix --------------------------------------------------
 
-/// Every GET route on the admin UI; `/admin/ui` redirects when
-/// authenticated, everything else answers 200. Built with a real channel id
-/// and a real key id so the edit-form routes resolve existing rows.
-fn ui_get_routes(channel_id: i64, key_id: i64) -> Vec<(String, StatusCode)> {
+/// Every GET route on the admin UI with the status it answers
+/// unauthenticated and with credentials. Pages without a session go to the
+/// login page; the login page itself and the static assets the login page
+/// needs are public; `/admin/ui` redirects once authenticated. Built with a
+/// real channel id and a real key id so the edit-form routes resolve
+/// existing rows.
+fn ui_get_routes(channel_id: i64, key_id: i64) -> Vec<(String, StatusCode, StatusCode)> {
     vec![
-        ("/admin/ui".to_string(), StatusCode::SEE_OTHER),
-        ("/admin/ui/channels".to_string(), StatusCode::OK),
-        ("/admin/ui/channels/form".to_string(), StatusCode::OK),
         (
-            format!("/admin/ui/channels/{channel_id}/edit"),
+            "/admin/ui/login".to_string(),
+            StatusCode::OK,
             StatusCode::OK,
         ),
-        ("/admin/ui/keys".to_string(), StatusCode::OK),
-        ("/admin/ui/keys/form".to_string(), StatusCode::OK),
-        (format!("/admin/ui/keys/{key_id}/edit"), StatusCode::OK),
-        ("/admin/ui/logs".to_string(), StatusCode::OK),
-        ("/admin/ui/static/htmx.min.js".to_string(), StatusCode::OK),
-        ("/admin/ui/static/admin.css".to_string(), StatusCode::OK),
+        (
+            "/admin/ui".to_string(),
+            StatusCode::SEE_OTHER,
+            StatusCode::SEE_OTHER,
+        ),
+        (
+            "/admin/ui/channels".to_string(),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        (
+            "/admin/ui/channels/form".to_string(),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        (
+            format!("/admin/ui/channels/{channel_id}/edit"),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        (
+            "/admin/ui/keys".to_string(),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        (
+            "/admin/ui/keys/form".to_string(),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        (
+            format!("/admin/ui/keys/{key_id}/edit"),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        (
+            "/admin/ui/logs".to_string(),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        (
+            "/admin/ui/static/htmx.min.js".to_string(),
+            StatusCode::OK,
+            StatusCode::OK,
+        ),
+        (
+            "/admin/ui/static/admin.css".to_string(),
+            StatusCode::OK,
+            StatusCode::OK,
+        ),
     ]
 }
 
 #[tokio::test]
-async fn every_ui_get_route_is_401_without_credentials_and_serves_with_them() {
+async fn every_ui_get_route_redirects_without_a_session_and_serves_with_credentials() {
     let db = test_pool().await;
     let channel_id = create_channel(&db).await;
     common::seed_key(&db, channel_id).await;
     let key_id = key_id_for_channel(&db, channel_id).await;
 
-    for (uri, expected) in ui_get_routes(channel_id, key_id) {
+    for (uri, unauthenticated, authenticated) in ui_get_routes(channel_id, key_id) {
         let (status, _) = send(&db, "GET", &uri, None, None, None).await;
-        assert_eq!(
-            status,
-            StatusCode::UNAUTHORIZED,
-            "unauthenticated GET {uri}"
-        );
+        assert_eq!(status, unauthenticated, "unauthenticated GET {uri}");
 
         let (status, _) = send(&db, "GET", &uri, None, None, Some(&auth_header())).await;
-        assert_eq!(status, expected, "authenticated GET {uri}");
+        assert_eq!(status, authenticated, "authenticated GET {uri}");
     }
 }

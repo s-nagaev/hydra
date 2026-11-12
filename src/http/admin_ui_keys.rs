@@ -39,9 +39,9 @@ use serde::Deserialize;
 
 use crate::db::channels;
 use crate::db::keys::{self, ApiKey, DeleteOutcome, KeyPatch, PatchOutcome};
-use crate::http::admin_auth::AdminAuth;
 use crate::http::admin_keys::{issue_key, mutate_key, KeysError};
 use crate::http::admin_ui_channels::ToggleForm;
+use crate::http::ui_auth::UiAuth;
 use crate::http::AppState;
 use crate::limits;
 
@@ -243,7 +243,7 @@ async fn panel(
 }
 
 /// Renders the full keys page for GET /admin/ui/keys.
-pub async fn page(State(state): State<AppState>, _auth: AdminAuth) -> KeysPage {
+pub async fn page(State(state): State<AppState>, _auth: UiAuth) -> KeysPage {
     let panel = panel(&state, None, None, None).await;
     KeysPage {
         version: env!("CARGO_PKG_VERSION"),
@@ -337,7 +337,7 @@ async fn edit_panel(
 
 /// "New key" action: opens the form. Without an enabled channel there is
 /// nothing to bind a key to, so the banner says so instead.
-async fn new_form(State(state): State<AppState>, _auth: AdminAuth) -> KeysPanel {
+async fn new_form(State(state): State<AppState>, _auth: UiAuth) -> KeysPanel {
     match channel_options(&state, None).await {
         Ok(options) if options.is_empty() => {
             panel(
@@ -372,11 +372,7 @@ async fn new_form(State(state): State<AppState>, _auth: AdminAuth) -> KeysPanel 
 /// "Edit" action: opens the form prefilled with the key's current label and
 /// limit; the channel binding is shown read-only. A soft-deleted key cannot
 /// be edited, matching the JSON API's 409.
-async fn edit_form(
-    State(state): State<AppState>,
-    _auth: AdminAuth,
-    Path(id): Path<i64>,
-) -> KeysPanel {
+async fn edit_form(State(state): State<AppState>, _auth: UiAuth, Path(id): Path<i64>) -> KeysPanel {
     match keys::find(&state.db, id).await {
         Ok(Some(key)) if key.deleted_at.is_none() => {
             let monthly_limit_usd = key
@@ -412,7 +408,7 @@ async fn edit_form(
 /// from the shared issuance path.
 async fn create(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     payload: Result<axum::Form<KeyCreateForm>, FormRejection>,
 ) -> KeysPanel {
     let Ok(submitted) = payload else {
@@ -483,7 +479,7 @@ async fn create(
 /// unlimited, and a present value replaces it.
 async fn update(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     Path(id): Path<i64>,
     payload: Result<axum::Form<KeyEditForm>, FormRejection>,
 ) -> KeysPanel {
@@ -550,7 +546,7 @@ async fn update(
 /// the banner carries the same message the JSON API returns.
 async fn toggle(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     Path(id): Path<i64>,
     payload: Result<axum::Form<ToggleForm>, FormRejection>,
 ) -> KeysPanel {
@@ -596,7 +592,7 @@ async fn toggle(
 
 /// Soft delete: the key stops authenticating, the row and its request logs
 /// stay. The confirm dialog on the button spells that out.
-async fn delete(State(state): State<AppState>, _auth: AdminAuth, Path(id): Path<i64>) -> KeysPanel {
+async fn delete(State(state): State<AppState>, _auth: UiAuth, Path(id): Path<i64>) -> KeysPanel {
     // Before and after, like the resolution cache: a deleted key must neither
     // authenticate nor keep a monthly-limit verdict alive.
     state.cache.invalidate_key(id);

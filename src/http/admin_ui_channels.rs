@@ -19,11 +19,11 @@ use axum::Router;
 use serde::Deserialize;
 
 use crate::db::channels::{self, Channel, ChannelPatch, DeleteOutcome, NewChannel, PricedChannel};
-use crate::http::admin_auth::AdminAuth;
 use crate::http::admin_channels::{
     mask_api_key, validate_allowed_models, validate_base_url, validate_channel_api_key,
     validate_channel_name, validate_model_prices, AdminError,
 };
+use crate::http::ui_auth::UiAuth;
 use crate::http::AppState;
 use crate::prices::{self, ModelPrice, ModelPrices, UsdAmountError, DIMENSIONS};
 
@@ -328,7 +328,7 @@ async fn panel(
 }
 
 /// Renders the full channels page for GET /admin/ui/channels.
-pub async fn page(State(state): State<AppState>, _auth: AdminAuth) -> ChannelsPage {
+pub async fn page(State(state): State<AppState>, _auth: UiAuth) -> ChannelsPage {
     let panel = panel(&state, None, None, None).await;
     ChannelsPage {
         version: env!("CARGO_PKG_VERSION"),
@@ -341,7 +341,7 @@ pub async fn page(State(state): State<AppState>, _auth: AdminAuth) -> ChannelsPa
 }
 
 /// "New channel" action: opens the empty create form.
-async fn new_form(State(state): State<AppState>, _auth: AdminAuth) -> ChannelsPanel {
+async fn new_form(State(state): State<AppState>, _auth: UiAuth) -> ChannelsPanel {
     panel(
         &state,
         Some(ChannelForm {
@@ -365,7 +365,7 @@ async fn new_form(State(state): State<AppState>, _auth: AdminAuth) -> ChannelsPa
 /// line format the parser reads back.
 async fn edit_form(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     Path(id): Path<i64>,
 ) -> ChannelsPanel {
     match channels::find_priced(&state.db, id).await {
@@ -462,7 +462,7 @@ fn collect_errors(
 /// the submitted values and per-field errors; success re-renders the table.
 async fn create(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     payload: Result<axum::Form<ChannelCreateForm>, FormRejection>,
 ) -> ChannelsPanel {
     let Ok(submitted) = payload else {
@@ -521,7 +521,7 @@ async fn create(
 /// meaning allow-all (matching the JSON API's `Some(Some([]))` semantics).
 async fn update(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     Path(id): Path<i64>,
     payload: Result<axum::Form<ChannelEditForm>, FormRejection>,
 ) -> ChannelsPanel {
@@ -595,7 +595,7 @@ async fn update(
 /// of the current row is needed.
 async fn toggle(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     Path(id): Path<i64>,
     payload: Result<axum::Form<ToggleForm>, FormRejection>,
 ) -> ChannelsPanel {
@@ -636,7 +636,7 @@ async fn toggle(
 /// because disabling preserves the keys and their request logs.
 async fn delete(
     State(state): State<AppState>,
-    _auth: AdminAuth,
+    _auth: UiAuth,
     Path(id): Path<i64>,
 ) -> ChannelsPanel {
     state.cache.invalidate_channel(id);

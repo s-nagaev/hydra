@@ -29,6 +29,8 @@ base64 = "0.22"
 url = "2"
 time = { version = "0.3", default-features = false, features = ["std", "parsing"] }
 sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
 getrandom = "0.3"
 dotenvy = "0.15"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

@@ -1,11 +1,17 @@
-//! Basic Auth protection for admin routes.
+//! Basic Auth protection for the JSON admin API.
 //!
 //! The [`AdminAuth`] extractor validates the `Authorization` header against
 //! the credentials from `HYDRA_ADMIN_LOGIN` / `HYDRA_ADMIN_PASSWORD` using a
-//! constant-time comparison. Every admin handler takes it as its first
+//! constant-time comparison. Every JSON admin handler takes it as its first
 //! extractor; `GET /admin/health` deliberately does not. Failed
 //! authentication responds with 401 and a `WWW-Authenticate: Basic
-//! realm="hydra"` challenge and an empty body.
+//! realm="hydra"` challenge and an empty body, which is what makes the
+//! browser show its Basic Auth dialog: the admin UI pages use
+//! [`crate::http::ui_auth::UiAuth`] instead and answer a redirect.
+//!
+//! Credential parsing, the constant-time comparison and the credential check
+//! itself are shared with the UI extractor and the login form, so every
+//! admin surface compares the same way.
 
 use axum::extract::FromRequestParts;
 use axum::http::header::AUTHORIZATION;
@@ -41,21 +47,34 @@ impl FromRequestParts<AppState> for AdminAuth {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let (login, password) = parts
-            .headers
-            .get(AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(parse_basic)
-            .ok_or(AdminAuthError)?;
-
-        let login_ok = constant_time_eq(login.as_bytes(), state.admin_login.as_bytes());
-        let password_ok = constant_time_eq(password.as_bytes(), state.admin_password.as_bytes());
-        if login_ok && password_ok {
+        if basic_ok(&parts.headers, state) {
             Ok(AdminAuth)
         } else {
             Err(AdminAuthError)
         }
     }
+}
+
+/// Whether the request headers carry valid Basic credentials. Shared by the
+/// JSON API extractor and the admin UI extractor.
+pub(crate) fn basic_ok(headers: &axum::http::HeaderMap, state: &AppState) -> bool {
+    let Some((login, password)) = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(parse_basic)
+    else {
+        return false;
+    };
+    credentials_match(&login, &password, state)
+}
+
+/// Compares credentials against the configured ones, both in constant time
+/// and both always evaluated, so neither a wrong login nor a wrong password
+/// is distinguishable by timing.
+pub(crate) fn credentials_match(login: &str, password: &str, state: &AppState) -> bool {
+    let login_ok = constant_time_eq(login.as_bytes(), state.admin_login.as_bytes());
+    let password_ok = constant_time_eq(password.as_bytes(), state.admin_password.as_bytes());
+    login_ok && password_ok
 }
 
 fn parse_basic(header: &str) -> Option<(String, String)> {
@@ -68,7 +87,9 @@ fn parse_basic(header: &str) -> Option<(String, String)> {
     Some((login.to_string(), password.to_string()))
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+/// Equality check that does not leak where two slices first differ; also
+/// used to compare session signatures.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
