@@ -143,11 +143,25 @@ body {
   background: #fafbfc;
 }
 
+/* A table whose nowrap columns need more room than the card has scrolls inside
+   it. Without this the auto layout keeps the table at its minimum content width
+   and the rows, the header rule and the buttons spill past the card border. */
+.table-scroll {
+  overflow-x: auto;
+}
+
 .actions-col {
   text-align: right;
   white-space: nowrap;
   /* Shrink to the width the controls need; the other columns absorb the rest. */
   width: 1%;
+}
+
+/* `.data-table th` is one class plus one element and outbids the bare
+   .actions-col class, so the header would otherwise sit left of the button
+   group it labels. Same selector weight, later in the sheet, so it wins. */
+th.actions-col {
+  text-align: right;
 }
 
 .actions-col > * {
@@ -403,6 +417,23 @@ form.inline {
 .mono {
   font-family: var(--mono);
   font-size: 13px;
+}
+
+/* A masked upstream key carries a hyphen, and a hyphen is a wrap opportunity:
+   the browser would break it after the `sk-` prefix and the cell reads as two
+   values. The mask is short, so holding it on one line costs almost nothing. */
+td.key-cell {
+  white-space: nowrap;
+}
+
+/* One model per line, five rates on that one line. At the default cell size the
+   rate run reads as a wall of digits, and the browser breaks it across three
+   sub-lines; a slightly smaller face with more leading, held on a single line
+   per model, keeps a multi-model channel scannable. */
+.price-line {
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: nowrap;
 }
 
 .model-badge {
