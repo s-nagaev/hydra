@@ -45,7 +45,7 @@ use crate::http::docs::OpenAiError;
 use crate::http::openai_error::openai_error;
 use crate::http::proxy_auth::{ProxyAuth, ProxyAuthError};
 use crate::http::AppState;
-use crate::logging::{self, ChatLogContext, ChatLogInit};
+use crate::logging::{self, ChatLogContext, ChatLogInit, UsageFormat};
 
 /// Maximum accepted chat request body, in bytes (32 MiB). Vision requests
 /// embed base64-encoded images and long-context conversations run well past
@@ -369,14 +369,22 @@ pub async fn chat_completions(
 
     // Built before the body is handed to the forwarder: it already holds
     // whatever request bytes body logging will ever capture.
-    let ctx = chat_log_context(&state, &auth, Some(model), start, &body, client_ip);
+    let ctx = chat_log_context(
+        &state,
+        &auth,
+        Some(model),
+        UsageFormat::Chat,
+        start,
+        &body,
+        client_ip,
+    );
     let upstream = match request.body(body).send().await {
         Ok(upstream) => upstream,
         Err(e) => {
             tracing::warn!(error = %e, "upstream chat request failed");
             ctx.finish(
                 None,
-                logging::Usage::default(),
+                logging::UsageExtraction::default(),
                 None,
                 Some(format!("upstream request failed: {e}")),
             );
@@ -627,7 +635,7 @@ async fn upstream_to_response(
                 if let Some(ctx) = log {
                     ctx.finish(
                         Some(status_code),
-                        logging::Usage::default(),
+                        logging::UsageExtraction::default(),
                         None,
                         Some("upstream response body read failed".to_string()),
                     );
@@ -636,7 +644,7 @@ async fn upstream_to_response(
             }
         };
         if let Some(ctx) = log {
-            let usage = logging::parse_usage(&bytes);
+            let usage = ctx.buffered_usage(&bytes);
             let response_body = ctx.capture_response_body(&bytes);
             ctx.finish(Some(status_code), usage, response_body, None);
         }
@@ -646,13 +654,16 @@ async fn upstream_to_response(
     }
 }
 
-/// Gathers the log context for one chat request from the request's own
-/// pieces; the channel id comes from the authenticated key, which is what
-/// the log row must reference even if channel resolution later fails.
+/// Gathers the log context for one request from the request's own pieces;
+/// the channel id comes from the authenticated key, which is what the log row
+/// must reference even if channel resolution later fails. The usage format
+/// names the shape this request's upstream will answer in, so each surface's
+/// handler passes its own.
 fn chat_log_context(
     state: &AppState,
     auth: &ProxyAuth,
     model: Option<String>,
+    usage_format: UsageFormat,
     start: Instant,
     body: &Bytes,
     client_ip: Option<String>,
@@ -664,6 +675,7 @@ fn chat_log_context(
         api_key_id: Some(auth.key.id),
         channel_id: Some(auth.key.channel_id),
         model,
+        usage_format,
         start,
         request_body: body,
         client_ip,
@@ -693,6 +705,7 @@ fn log_auth_rejection(
         api_key_id: None,
         channel_id: None,
         model: None,
+        usage_format: UsageFormat::Chat,
         start,
         request_body: body,
         client_ip,
@@ -712,7 +725,12 @@ fn log_auth_rejection(
             (Some(429), "Monthly limit reached".to_string())
         }
     };
-    ctx.finish(status, logging::Usage::default(), None, Some(message));
+    ctx.finish(
+        status,
+        logging::UsageExtraction::default(),
+        None,
+        Some(message),
+    );
 }
 
 /// Writes the audit row for a flood-capped request: at most one row per
@@ -740,6 +758,7 @@ fn log_flood_cap_rejection(
         api_key_id: None,
         channel_id: None,
         model: None,
+        usage_format: UsageFormat::Chat,
         start,
         request_body: body,
         client_ip,
@@ -747,7 +766,7 @@ fn log_flood_cap_rejection(
     });
     ctx.finish(
         Some(401),
-        logging::Usage::default(),
+        logging::UsageExtraction::default(),
         None,
         Some("flood cap: too many failed authentications from this address".to_string()),
     );
@@ -776,6 +795,7 @@ fn log_limit_rejection(
         api_key_id: Some(key_id),
         channel_id: Some(channel_id),
         model,
+        usage_format: UsageFormat::Chat,
         start,
         request_body: body,
         client_ip,
@@ -783,7 +803,7 @@ fn log_limit_rejection(
     });
     ctx.finish(
         Some(429),
-        logging::Usage::default(),
+        logging::UsageExtraction::default(),
         None,
         Some("Monthly limit reached".to_string()),
     );
@@ -802,10 +822,20 @@ fn log_rejection(
     client_ip: Option<String>,
     error: &ProxyError,
 ) {
-    let ctx = chat_log_context(state, auth, model, start, body, client_ip);
+    // No response body is ever parsed for a rejection, so this row carries
+    // no usage and the format the context stores is only a placeholder.
+    let ctx = chat_log_context(
+        state,
+        auth,
+        model,
+        UsageFormat::Chat,
+        start,
+        body,
+        client_ip,
+    );
     ctx.finish(
         None,
-        logging::Usage::default(),
+        logging::UsageExtraction::default(),
         None,
         Some(error.to_string()),
     );

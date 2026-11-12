@@ -26,12 +26,17 @@
 //! semantics. That capture stops at [`BODY_CAPTURE_LIMIT`] (1 MiB); past the
 //! cap bytes are simply not captured.
 //!
-//! Token usage is captured independently of body logging. A streaming
-//! response gets a rolling tail window of its last [`USAGE_TAIL_WINDOW`]
-//! bytes, so the closing usage chunk is parsed even when the stream runs far
-//! past the 1 MiB body cap; a buffered response has its usage read straight
-//! from the body. Stream rows therefore carry tokens with body logging off,
-//! only the bodies stay NULL.
+//! Token usage is captured independently of body logging, read in the shape
+//! the request's own surface speaks ([`UsageFormat`]). Chat and Responses
+//! report usage in the event that closes the stream, so a streaming response
+//! gets a rolling tail window of its last [`USAGE_TAIL_WINDOW`] bytes and
+//! that closing event is parsed from it even when the stream runs far past
+//! the 1 MiB body cap. Anthropic reports its input counters in the event
+//! that OPENS the stream, which no window anchored at the end can hold, so
+//! it is read event by event as the bytes arrive ([`AnthropicStreamUsage`]).
+//! A buffered response has its usage read straight from the body. Stream
+//! rows therefore carry tokens with body logging off, only the bodies stay
+//! NULL.
 //!
 //! A logged row that names a key is followed, in the same detached flow, by
 //! a month-to-date recompute of that key's monthly-limit verdict
@@ -60,6 +65,12 @@ pub const BODY_CAPTURE_LIMIT: usize = 1024 * 1024;
 /// smaller than [`BODY_CAPTURE_LIMIT`] because only the closing chunks
 /// matter, not the content.
 pub const USAGE_TAIL_WINDOW: usize = 64 * 1024;
+
+/// Longest single SSE line the Anthropic stream reader buffers. Usage lines
+/// run to a few hundred bytes; a line past the cap is dropped up to its
+/// newline, so a malformed or hostile stream cannot grow the buffer without
+/// bound.
+const USAGE_EVENT_LINE_LIMIT: usize = 64 * 1024;
 
 /// In-flight background log insert counter, so graceful shutdown can wait
 /// briefly for the last rows to land before the process exits.
@@ -103,6 +114,11 @@ pub struct ChatLogInit<'a> {
     /// NULL exactly when `api_key_id` is NULL.
     pub channel_id: Option<i64>,
     pub model: Option<String>,
+    /// Which surface the request came through, so any response body is read
+    /// in the shape its upstream speaks. The chat handler passes
+    /// [`UsageFormat::Chat`]; the rejection paths, whose rows never carry
+    /// usage because no upstream answered, pass it as an inert placeholder.
+    pub usage_format: UsageFormat,
     pub start: Instant,
     pub request_body: &'a [u8],
     /// Resolved client IP, absent when no peer address was available.
@@ -121,6 +137,7 @@ pub struct ChatLogContext {
     api_key_id: Option<i64>,
     channel_id: Option<i64>,
     model: Option<String>,
+    usage_format: UsageFormat,
     start: Instant,
     request_body: Option<String>,
     client_ip: Option<String>,
@@ -136,6 +153,7 @@ impl ChatLogContext {
             api_key_id: init.api_key_id,
             channel_id: init.channel_id,
             model: init.model,
+            usage_format: init.usage_format,
             start: init.start,
             request_body: init
                 .log_bodies
@@ -145,10 +163,21 @@ impl ChatLogContext {
         }
     }
 
+    /// The usage shape this request's response carries.
+    pub fn usage_format(&self) -> UsageFormat {
+        self.usage_format
+    }
+
     /// Captured response body for a fully buffered (non-streaming) response,
     /// NULL unless body logging is on.
     pub fn capture_response_body(&self, bytes: &[u8]) -> Option<String> {
         self.log_bodies.then(|| capture_to_string(bytes))
+    }
+
+    /// Token counts of a fully buffered (non-streaming) response body, read
+    /// in the shape this request's surface speaks.
+    pub fn buffered_usage(&self, bytes: &[u8]) -> UsageExtraction {
+        parse_usage_for(bytes, self.usage_format)
     }
 
     /// Assembles the final row and dispatches the detached insert. Consumes
@@ -156,7 +185,7 @@ impl ChatLogContext {
     pub fn finish(
         self,
         status: Option<i64>,
-        usage: Usage,
+        usage: UsageExtraction,
         response_body: Option<String>,
         error: Option<String>,
     ) {
@@ -242,8 +271,9 @@ pub async fn drain(tracker: &LogTracker, timeout: Duration) {
 /// forwarding every chunk untouched. Chunk copies are refcount bumps and
 /// the channel is unbounded, so the forwarding stream keeps its own
 /// backpressure and timing. When the stream ends or is dropped, the capture
-/// task parses usage from the tail of the SSE bytes, stores the captured
-/// body when body logging is on, and finishes the log row.
+/// task extracts usage in the context's own format (a tail window for chat
+/// and Responses, event by event for Anthropic), stores the captured body
+/// when body logging is on, and finishes the log row.
 pub fn tee_stream<S, E>(
     stream: S,
     status: i64,
@@ -255,18 +285,19 @@ where
 {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     let capture = ctx.log_bodies;
+    let format = ctx.usage_format();
     tokio::spawn(async move {
         let mut buffer: Vec<u8> = Vec::new();
-        let mut tail: Vec<u8> = Vec::new();
+        let mut usage = StreamUsage::new(format);
         while let Some(chunk) = rx.recv().await {
             if capture && buffer.len() < BODY_CAPTURE_LIMIT {
                 let room = BODY_CAPTURE_LIMIT - buffer.len();
                 buffer.extend_from_slice(&chunk[..chunk.len().min(room)]);
             }
-            push_tail(&mut tail, &chunk);
+            usage.observe(&chunk);
         }
         // The channel closed: the response body finished or was dropped.
-        let usage = parse_sse_usage(&tail);
+        let usage = usage.finish();
         let response_body = capture.then(|| capture_to_string(&buffer));
         ctx.finish(Some(status), usage, response_body, None);
     });
@@ -344,6 +375,336 @@ pub fn parse_sse_usage(buffer: &[u8]) -> Usage {
         }
     }
     last
+}
+
+/// Which API surface a request came through, and therefore which usage shape
+/// its upstream answers with. A route hands it to [`ChatLogInit`] when it
+/// builds the log context; every extraction below reads it from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageFormat {
+    /// OpenAI Chat Completions (`/v1/chat/completions`).
+    Chat,
+    /// OpenAI Responses (`/v1/responses`).
+    Responses,
+    /// Anthropic Messages (`/v1/messages`).
+    Anthropic,
+}
+
+/// Token counts extracted from one upstream response, in Hydra's own
+/// vocabulary: the four dimensions the `request_logs` row stores, plus the
+/// Anthropic cache-write count that no column prices yet (the fifth price
+/// dimension is a later migration). A dimension the upstream did not report
+/// stays NULL, never a fabricated zero.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct UsageExtraction {
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub cached_input_tokens: Option<i64>,
+    pub cached_output_tokens: Option<i64>,
+    /// Prompt tokens the upstream wrote into its cache (Anthropic
+    /// `cache_creation_input_tokens`), already counted inside
+    /// `prompt_tokens` and kept separately because it stays unpriced for now.
+    pub cache_write_input_tokens: Option<i64>,
+}
+
+impl From<Usage> for UsageExtraction {
+    fn from(usage: Usage) -> Self {
+        Self {
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            cached_output_tokens: usage.cached_output_tokens,
+            cache_write_input_tokens: None,
+        }
+    }
+}
+
+/// Extracts usage from a buffered (non-streaming) response body in the shape
+/// the given surface speaks. A missing or malformed `usage` yields NULLs for
+/// every format, exactly as [`parse_usage`] does for chat.
+pub fn parse_usage_for(body: &[u8], format: UsageFormat) -> UsageExtraction {
+    let value = serde_json::from_slice::<serde_json::Value>(body).ok();
+    let usage = value.as_ref().and_then(|value| value.get("usage"));
+    match format {
+        UsageFormat::Chat => usage_from_value(usage).into(),
+        UsageFormat::Responses => responses_usage(usage),
+        UsageFormat::Anthropic => anthropic_usage(usage),
+    }
+}
+
+/// Usage of an OpenAI Responses object: `input_tokens` already includes the
+/// cached ones, `output_tokens_details.reasoning_tokens` is a subset of
+/// `output_tokens` with no column of its own, and a Responses object has no
+/// cached-output concept at all, so those dimensions stay NULL.
+fn responses_usage(usage: Option<&serde_json::Value>) -> UsageExtraction {
+    let Some(usage) = usage else {
+        return UsageExtraction::default();
+    };
+    UsageExtraction {
+        prompt_tokens: usage_int(usage, "input_tokens"),
+        completion_tokens: usage_int(usage, "output_tokens"),
+        cached_input_tokens: details_cached_tokens(usage, "input_tokens_details"),
+        cached_output_tokens: None,
+        cache_write_input_tokens: None,
+    }
+}
+
+/// Usage of an Anthropic message object.
+fn anthropic_usage(usage: Option<&serde_json::Value>) -> UsageExtraction {
+    let Some(usage) = usage else {
+        return UsageExtraction::default();
+    };
+    anthropic_usage_parts(
+        usage_int(usage, "input_tokens"),
+        usage_int(usage, "cache_read_input_tokens"),
+        usage_int(usage, "cache_creation_input_tokens"),
+        usage_int(usage, "output_tokens"),
+    )
+}
+
+/// Assembles one Anthropic reading from counters already read out of the
+/// payload, shared by the buffered and the streaming paths so both normalize
+/// the input side identically.
+fn anthropic_usage_parts(
+    input_tokens: Option<i64>,
+    cache_read_input_tokens: Option<i64>,
+    cache_creation_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+) -> UsageExtraction {
+    UsageExtraction {
+        prompt_tokens: anthropic_prompt_tokens(
+            input_tokens,
+            cache_read_input_tokens,
+            cache_creation_input_tokens,
+        ),
+        completion_tokens: output_tokens,
+        cached_input_tokens: cache_read_input_tokens,
+        cached_output_tokens: None,
+        cache_write_input_tokens: cache_creation_input_tokens,
+    }
+}
+
+/// Anthropic reports a prompt additively: `input_tokens` holds only the
+/// uncached part, `cache_read_input_tokens` the cache hits and
+/// `cache_creation_input_tokens` the cache writes, so the stored total is the
+/// sum of whichever of the three the upstream reported. A report with none of
+/// them leaves the total NULL rather than zero, and cache writes are never
+/// dropped from the sum: they are prompt tokens the upstream really read.
+pub fn anthropic_prompt_tokens(
+    input_tokens: Option<i64>,
+    cache_read_input_tokens: Option<i64>,
+    cache_creation_input_tokens: Option<i64>,
+) -> Option<i64> {
+    [
+        input_tokens,
+        cache_read_input_tokens,
+        cache_creation_input_tokens,
+    ]
+    .into_iter()
+    .flatten()
+    .reduce(|sum, part| sum + part)
+}
+
+/// Extracts usage from a captured tail of an OpenAI Responses SSE stream.
+/// Usage rides only the terminal events, `response.completed` when the
+/// generation finished and `response.incomplete` when a limit cut it short,
+/// one level down at `data.response.usage`; both are read, and the last one
+/// seen wins. The caller passes the tail window of the stream, which holds
+/// the terminal event because nothing follows it.
+pub fn parse_responses_sse_usage(buffer: &[u8]) -> UsageExtraction {
+    let text = String::from_utf8_lossy(buffer);
+    let mut last = UsageExtraction::default();
+    for line in text.lines() {
+        let Some(data) = line.strip_prefix("data:") else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data.trim_start()) else {
+            continue;
+        };
+        if !matches!(
+            value.get("type").and_then(serde_json::Value::as_str),
+            Some("response.completed" | "response.incomplete")
+        ) {
+            continue;
+        }
+        let parsed = responses_usage(
+            value
+                .get("response")
+                .and_then(|response| response.get("usage")),
+        );
+        if parsed != UsageExtraction::default() {
+            last = parsed;
+        }
+    }
+    last
+}
+
+/// Usage evidence gathered from a streaming response while its chunks fly
+/// past. Chat and Responses are read once at the end from a rolling tail of
+/// raw bytes, which suffices because both report usage in the event that
+/// closes the stream; Anthropic is read as the bytes arrive, because its
+/// input counters ride the stream's first event and no window can hold both
+/// ends of a long stream.
+enum StreamUsage {
+    Chat { window: Vec<u8> },
+    Responses { window: Vec<u8> },
+    Anthropic(AnthropicStreamUsage),
+}
+
+impl StreamUsage {
+    fn new(format: UsageFormat) -> Self {
+        match format {
+            UsageFormat::Chat => StreamUsage::Chat { window: Vec::new() },
+            UsageFormat::Responses => StreamUsage::Responses { window: Vec::new() },
+            UsageFormat::Anthropic => StreamUsage::Anthropic(AnthropicStreamUsage::default()),
+        }
+    }
+
+    fn observe(&mut self, chunk: &[u8]) {
+        match self {
+            StreamUsage::Chat { window } | StreamUsage::Responses { window } => {
+                push_tail(window, chunk);
+            }
+            StreamUsage::Anthropic(reader) => reader.observe(chunk),
+        }
+    }
+
+    fn finish(self) -> UsageExtraction {
+        match self {
+            StreamUsage::Chat { window } => parse_sse_usage(&window).into(),
+            StreamUsage::Responses { window } => parse_responses_sse_usage(&window),
+            StreamUsage::Anthropic(reader) => reader.finish(),
+        }
+    }
+}
+
+/// Incremental event reader for an Anthropic Messages SSE stream.
+///
+/// The tail window the chat path uses cannot serve this stream: the input
+/// counters ride `message_start`, which opens the stream, while the
+/// authoritative `output_tokens` closes it in `message_delta`, so on a stream
+/// longer than the window the window would evict the input counters and the
+/// request would be logged with a NULL prompt, silently unbilled. The reader
+/// therefore walks the bytes as they arrive and keeps only the incomplete
+/// trailing line plus the numbers it has already seen, whatever the stream
+/// length. A stream whose `message_start` never arrives (malformed, or cut
+/// before its first event) yields NULL input counters instead of guesses; the
+/// repetitions some vendors put on the closing event are not an opening
+/// report, and inventing counts from them would bill a guess.
+#[derive(Default)]
+struct AnthropicStreamUsage {
+    /// The line being received: SSE frames are line delimited and a chunk
+    /// boundary can fall anywhere, so a partial line waits here.
+    partial: Vec<u8>,
+    /// Set while an over-long line is being dropped, up to its newline.
+    skipping: bool,
+    input_tokens: Option<i64>,
+    cache_read_input_tokens: Option<i64>,
+    cache_creation_input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+}
+
+impl AnthropicStreamUsage {
+    fn observe(&mut self, chunk: &[u8]) {
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            let Some(newline) = rest.iter().position(|byte| *byte == b'\n') else {
+                self.push_partial(rest);
+                return;
+            };
+            if !self.skipping {
+                self.partial.extend_from_slice(&rest[..newline]);
+                let line = std::mem::take(&mut self.partial);
+                self.event(&line);
+            }
+            self.skipping = false;
+            rest = &rest[newline + 1..];
+        }
+    }
+
+    /// Appends an unterminated line, dropping the whole line once it passes
+    /// the cap: a stream that never sends a newline must not grow the buffer,
+    /// and no usage object is that large.
+    fn push_partial(&mut self, bytes: &[u8]) {
+        if self.skipping {
+            return;
+        }
+        if self.partial.len() + bytes.len() > USAGE_EVENT_LINE_LIMIT {
+            self.partial.clear();
+            self.skipping = true;
+            return;
+        }
+        self.partial.extend_from_slice(bytes);
+    }
+
+    /// Reads one complete SSE line. Input counters are taken only from
+    /// `message_start`, and only the first time they appear; `output_tokens`
+    /// is taken from every usage-bearing event, so the provisional count of
+    /// `message_start` gives way to the `message_delta` that closes the
+    /// stream.
+    fn event(&mut self, line: &[u8]) {
+        let Ok(text) = std::str::from_utf8(line) else {
+            return;
+        };
+        let Some(data) = text.trim_end_matches('\r').strip_prefix("data:") else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(data.trim_start()) else {
+            return;
+        };
+        match value.get("type").and_then(serde_json::Value::as_str) {
+            Some("message_start") => {
+                let usage = value
+                    .get("message")
+                    .and_then(|message| message.get("usage"));
+                self.first_inputs(usage);
+                self.latest_output(usage);
+            }
+            Some("message_delta") => self.latest_output(value.get("usage")),
+            _ => {}
+        }
+    }
+
+    /// Keeps the counters the stream opened with; a repeated `message_start`
+    /// never overwrites a value already read.
+    fn first_inputs(&mut self, usage: Option<&serde_json::Value>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        if self.input_tokens.is_none() {
+            self.input_tokens = usage_int(usage, "input_tokens");
+        }
+        if self.cache_read_input_tokens.is_none() {
+            self.cache_read_input_tokens = usage_int(usage, "cache_read_input_tokens");
+        }
+        if self.cache_creation_input_tokens.is_none() {
+            self.cache_creation_input_tokens = usage_int(usage, "cache_creation_input_tokens");
+        }
+    }
+
+    fn latest_output(&mut self, usage: Option<&serde_json::Value>) {
+        let Some(usage) = usage else {
+            return;
+        };
+        if let Some(output) = usage_int(usage, "output_tokens") {
+            self.output_tokens = Some(output);
+        }
+    }
+
+    fn finish(self) -> UsageExtraction {
+        anthropic_usage_parts(
+            self.input_tokens,
+            self.cache_read_input_tokens,
+            self.cache_creation_input_tokens,
+            self.output_tokens,
+        )
+    }
+}
+
+/// One integer counter of a usage object; an absent or non-integer field
+/// stays NULL.
+fn usage_int(usage: &serde_json::Value, key: &str) -> Option<i64> {
+    usage.get(key).and_then(serde_json::Value::as_i64)
 }
 
 /// Reads one `usage` object field by field; every field is independent, and
@@ -618,6 +979,27 @@ mod tests {
         }
     }
 
+    /// Waits for `expected` rows to land. A stream's capture task, its insert
+    /// and the recompute that follows are all detached, so a drained tracker
+    /// is not yet a written row.
+    async fn wait_for_rows(pool: &SqlitePool, expected: i64) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM request_logs")
+                .fetch_one(pool)
+                .await
+                .unwrap();
+            if count >= expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected {expected} log rows, found {count}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     #[tokio::test]
     async fn spawn_insert_writes_the_row_and_drains_to_zero() {
         let pool = seeded_pool().await;
@@ -706,5 +1088,384 @@ mod tests {
         );
         wait_until_drained(&tracker).await;
         assert_eq!(tracker.inflight(), 0);
+    }
+
+    #[test]
+    fn anthropic_prompt_tokens_adds_the_three_input_counters() {
+        assert_eq!(
+            anthropic_prompt_tokens(Some(100), Some(20), Some(5)),
+            Some(125)
+        );
+    }
+
+    #[test]
+    fn anthropic_prompt_tokens_without_cache_is_the_plain_input_count() {
+        assert_eq!(anthropic_prompt_tokens(Some(100), None, None), Some(100));
+        // A reported zero is still a reported value, and adding it must not
+        // turn the total into a NULL.
+        assert_eq!(
+            anthropic_prompt_tokens(Some(100), Some(0), Some(0)),
+            Some(100)
+        );
+        assert_eq!(anthropic_prompt_tokens(Some(100), Some(0), None), Some(100));
+    }
+
+    #[test]
+    fn anthropic_prompt_tokens_sums_whatever_the_upstream_reported() {
+        // Partial reports still total up: an upstream that skips
+        // `input_tokens` but reports cache hits has real prompt tokens.
+        assert_eq!(anthropic_prompt_tokens(None, Some(7), None), Some(7));
+        assert_eq!(anthropic_prompt_tokens(None, None, Some(3)), Some(3));
+    }
+
+    #[test]
+    fn anthropic_prompt_tokens_without_any_component_is_null() {
+        assert_eq!(anthropic_prompt_tokens(None, None, None), None);
+    }
+
+    #[test]
+    fn parse_usage_for_chat_matches_the_chat_parser() {
+        let body = br#"{"usage":{"prompt_tokens":100,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":64},"completion_tokens_details":{"cached_tokens":8}}}"#;
+        assert_eq!(
+            parse_usage_for(body, UsageFormat::Chat),
+            parse_usage(body).into()
+        );
+    }
+
+    #[test]
+    fn parse_usage_for_responses_reads_the_responses_shape() {
+        // `reasoning_tokens` is a subset of `output_tokens` and has no
+        // column, so it must not be added anywhere.
+        let body = br#"{"usage":{"input_tokens":10,"output_tokens":5,"input_tokens_details":{"cached_tokens":4},"output_tokens_details":{"reasoning_tokens":2}}}"#;
+        assert_eq!(
+            parse_usage_for(body, UsageFormat::Responses),
+            UsageExtraction {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                cached_input_tokens: Some(4),
+                cached_output_tokens: None,
+                cache_write_input_tokens: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_usage_for_responses_without_details_leaves_cached_input_null() {
+        let body = br#"{"usage":{"input_tokens":10,"output_tokens":5}}"#;
+        assert_eq!(
+            parse_usage_for(body, UsageFormat::Responses),
+            UsageExtraction {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                ..UsageExtraction::default()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_usage_for_anthropic_normalizes_the_prompt_additively() {
+        let body = br#"{"usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}"#;
+        assert_eq!(
+            parse_usage_for(body, UsageFormat::Anthropic),
+            UsageExtraction {
+                prompt_tokens: Some(16),
+                completion_tokens: Some(7),
+                cached_input_tokens: Some(4),
+                cached_output_tokens: None,
+                cache_write_input_tokens: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_usage_for_anthropic_without_cache_reports_the_plain_prompt() {
+        let body = br#"{"usage":{"input_tokens":10,"output_tokens":7}}"#;
+        let usage = parse_usage_for(body, UsageFormat::Anthropic);
+        assert_eq!(usage.prompt_tokens, Some(10));
+        assert_eq!(usage.cached_input_tokens, None);
+        assert_eq!(usage.cache_write_input_tokens, None);
+    }
+
+    #[test]
+    fn parse_usage_for_yields_nulls_for_every_format_without_usage() {
+        for format in [
+            UsageFormat::Chat,
+            UsageFormat::Responses,
+            UsageFormat::Anthropic,
+        ] {
+            assert_eq!(
+                parse_usage_for(br#"{"id":"x"}"#, format),
+                UsageExtraction::default()
+            );
+            // A usage object that reports only an output count must not have
+            // a prompt total invented for it.
+            let usage = parse_usage_for(br#"{"usage":{"output_tokens":7}}"#, format);
+            assert_eq!(usage.prompt_tokens, None, "{format:?} invented a prompt");
+            assert_eq!(usage.cached_input_tokens, None);
+            assert_eq!(usage.cache_write_input_tokens, None);
+        }
+    }
+
+    #[test]
+    fn responses_stream_usage_is_read_from_the_terminal_event() {
+        let chunks = [
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_1\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":4},\"output_tokens_details\":{\"reasoning_tokens\":2}}}}\n\n",
+        ];
+        assert_eq!(
+            observe_stream_chunks(UsageFormat::Responses, &chunks),
+            UsageExtraction {
+                prompt_tokens: Some(10),
+                completion_tokens: Some(5),
+                cached_input_tokens: Some(4),
+                cached_output_tokens: None,
+                cache_write_input_tokens: None,
+            }
+        );
+    }
+
+    #[test]
+    fn responses_stream_usage_is_read_from_a_terminal_event_far_into_the_stream() {
+        // The terminal event carries the only usage of the stream and sits
+        // after more bytes than the tail window holds, so the window must
+        // keep the END of the stream, not the beginning.
+        let filler = "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"chunk\"}\n\n";
+        let long = filler.repeat(USAGE_TAIL_WINDOW / filler.len() + 2);
+        let terminal = "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1000,\"output_tokens\":200}}}\n\n";
+        let usage = observe_stream_chunks(UsageFormat::Responses, &[&long, terminal]);
+        assert_eq!(usage.prompt_tokens, Some(1000));
+        assert_eq!(usage.completion_tokens, Some(200));
+    }
+
+    #[test]
+    fn responses_stream_usage_is_read_from_response_incomplete() {
+        // A generation cut short by a limit reports its usage on the
+        // `response.incomplete` terminal event instead.
+        let chunks = [
+            "event: response.in_progress\ndata: {\"type\":\"response.in_progress\"}\n\n",
+            "event: response.incomplete\ndata: {\"type\":\"response.incomplete\",\"response\":{\"usage\":{\"input_tokens\":9,\"output_tokens\":4}}}\n\n",
+        ];
+        let usage = observe_stream_chunks(UsageFormat::Responses, &chunks);
+        assert_eq!(usage.prompt_tokens, Some(9));
+        assert_eq!(usage.completion_tokens, Some(4));
+    }
+
+    #[test]
+    fn anthropic_stream_usage_survives_a_stream_longer_than_the_tail_window() {
+        // The opening event carries the input counters and the closing one
+        // the authoritative output count, with more bytes between them than
+        // any window holds. The window is proven to lose the opening event,
+        // which is exactly why the reader walks the stream instead.
+        let opening = "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"usage\":{\"input_tokens\":1000,\"cache_read_input_tokens\":250,\"cache_creation_input_tokens\":50,\"output_tokens\":1}}}\n\n";
+        let filler = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"chunk\"}}\n\n";
+        let long = filler.repeat(USAGE_TAIL_WINDOW / filler.len() + 2);
+        let closing = "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":42}}\n\n";
+
+        let mut window: Vec<u8> = Vec::new();
+        for chunk in [opening, long.as_str(), closing] {
+            push_tail(&mut window, chunk.as_bytes());
+        }
+        assert!(
+            !String::from_utf8_lossy(&window).contains("message_start"),
+            "premise: the tail window evicts the opening event"
+        );
+
+        let usage = observe_stream_chunks(UsageFormat::Anthropic, &[opening, &long, closing]);
+        assert_eq!(
+            usage,
+            UsageExtraction {
+                prompt_tokens: Some(1300),
+                completion_tokens: Some(42),
+                cached_input_tokens: Some(250),
+                cached_output_tokens: None,
+                cache_write_input_tokens: Some(50),
+            }
+        );
+    }
+
+    #[test]
+    fn anthropic_stream_usage_keeps_the_opening_inputs_and_the_latest_output() {
+        // A chunk boundary can fall inside a line; the reader must rejoin
+        // it. The repeated input fields of `message_delta` must not
+        // overwrite the opening report, and its `output_tokens` must.
+        let chunks = [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"cache_read_input_tokens\":10,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":999,\"output_tokens\":40}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_del",
+            "ta\",\"usage\":{\"output_tokens\":77}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        ];
+        let usage = observe_stream_chunks(UsageFormat::Anthropic, &chunks);
+        assert_eq!(usage.prompt_tokens, Some(45), "the opening report wins");
+        assert_eq!(usage.cached_input_tokens, Some(10));
+        assert_eq!(usage.cache_write_input_tokens, Some(5));
+        assert_eq!(usage.completion_tokens, Some(77), "the latest count wins");
+    }
+
+    #[test]
+    fn anthropic_stream_usage_without_message_start_yields_null_inputs() {
+        // Malformed stream: the opening event never arrives, so the input
+        // counters stay NULL rather than being guessed from the repetitions
+        // some vendors put on the closing event. The output count, which is
+        // authoritative wherever it appears, is still read.
+        let chunks = [
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"input_tokens\":12,\"output_tokens\":6}}\n\n",
+        ];
+        let usage = observe_stream_chunks(UsageFormat::Anthropic, &chunks);
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.cached_input_tokens, None);
+        assert_eq!(usage.cache_write_input_tokens, None);
+        assert_eq!(usage.completion_tokens, Some(6));
+    }
+
+    #[test]
+    fn anthropic_stream_usage_drops_an_over_long_line_and_keeps_reading() {
+        // A line past the cap is dropped up to its newline instead of
+        // growing the buffer; the events around it are still read.
+        let mut oversized =
+            String::from("data: {\"type\":\"content_block_delta\",\"delta\":{\"text\":\"");
+        oversized.push_str(&"a".repeat(USAGE_EVENT_LINE_LIMIT));
+        oversized.push_str("\"}}\n\n");
+        let chunks = [
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":8,\"output_tokens\":1}}}\n\n",
+            oversized.as_str(),
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":21}}\n\n",
+        ];
+        let usage = observe_stream_chunks(UsageFormat::Anthropic, &chunks);
+        assert_eq!(usage.prompt_tokens, Some(8));
+        assert_eq!(usage.completion_tokens, Some(21));
+    }
+
+    #[test]
+    fn stream_usage_without_usage_yields_nulls_for_every_format() {
+        let chunks = [
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\"}\n\n",
+            "data: [DONE]\n\n",
+        ];
+        for format in [
+            UsageFormat::Chat,
+            UsageFormat::Responses,
+            UsageFormat::Anthropic,
+        ] {
+            assert_eq!(
+                observe_stream_chunks(format, &chunks),
+                UsageExtraction::default(),
+                "{format:?} must log NULLs when the upstream reported nothing"
+            );
+        }
+    }
+
+    /// Feeds raw SSE chunks through the same streaming capture the tee uses
+    /// and returns the reading it would have logged.
+    fn observe_stream_chunks(format: UsageFormat, chunks: &[&str]) -> UsageExtraction {
+        let mut capture = StreamUsage::new(format);
+        for chunk in chunks {
+            capture.observe(chunk.as_bytes());
+        }
+        capture.finish()
+    }
+
+    /// Drives one SSE body through the real tee with the given format, so the
+    /// resulting row lands in the seeded pool.
+    async fn tee_stream_once(
+        pool: &SqlitePool,
+        tracker: &LogTracker,
+        format: UsageFormat,
+        body: &str,
+    ) {
+        let db = Db::from(pool.clone());
+        let flags = crate::limit_flags::LimitFlags::default();
+        let ctx = ChatLogContext::new(ChatLogInit {
+            db: &db,
+            tracker,
+            log_bodies: false,
+            api_key_id: Some(1),
+            channel_id: Some(1),
+            model: Some("mock-model".to_string()),
+            usage_format: format,
+            start: Instant::now(),
+            request_body: b"{}",
+            client_ip: None,
+            flags: &flags,
+        });
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![Ok(Bytes::from(body.to_string()))];
+        let stream = tee_stream(futures_util::stream::iter(chunks), 200, ctx);
+        let forwarded: Vec<_> = futures_util::StreamExt::collect(stream).await;
+        assert_eq!(forwarded.len(), 1, "the tee forwards every chunk");
+        wait_until_drained(tracker).await;
+    }
+
+    #[tokio::test]
+    async fn tee_stream_logs_usage_in_the_context_format() {
+        let pool = seeded_pool().await;
+        let tracker = LogTracker::default();
+        tee_stream_once(
+            &pool,
+            &tracker,
+            UsageFormat::Responses,
+            "event: response.created\ndata: {\"type\":\"response.created\"}\n\n\
+             event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":10,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n",
+        )
+        .await;
+        tee_stream_once(
+            &pool,
+            &tracker,
+            UsageFormat::Anthropic,
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":30,\"cache_read_input_tokens\":10,\"cache_creation_input_tokens\":5,\"output_tokens\":1}}}\n\n\
+             event: message_delta\ndata: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":40}}\n\n",
+        )
+        .await;
+        wait_for_rows(&pool, 2).await;
+
+        let rows = sqlx::query(
+            "SELECT prompt_tokens, completion_tokens, cached_input_tokens, \
+             cached_output_tokens FROM request_logs ORDER BY id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0].try_get::<Option<i64>, _>("prompt_tokens").unwrap(),
+            Some(10),
+            "the Responses row reads input_tokens"
+        );
+        assert_eq!(
+            rows[0]
+                .try_get::<Option<i64>, _>("completion_tokens")
+                .unwrap(),
+            Some(5)
+        );
+        assert_eq!(
+            rows[0]
+                .try_get::<Option<i64>, _>("cached_input_tokens")
+                .unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            rows[1].try_get::<Option<i64>, _>("prompt_tokens").unwrap(),
+            Some(45),
+            "the Anthropic row sums input, cache reads and cache writes"
+        );
+        assert_eq!(
+            rows[1]
+                .try_get::<Option<i64>, _>("completion_tokens")
+                .unwrap(),
+            Some(40)
+        );
+        assert_eq!(
+            rows[1]
+                .try_get::<Option<i64>, _>("cached_input_tokens")
+                .unwrap(),
+            Some(10)
+        );
+        for row in &rows {
+            assert_eq!(
+                row.try_get::<Option<i64>, _>("cached_output_tokens")
+                    .unwrap(),
+                None
+            );
+        }
     }
 }
