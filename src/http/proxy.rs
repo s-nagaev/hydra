@@ -1,21 +1,26 @@
 //! OpenAI-compatible proxy handlers.
 //!
-//! `POST /v1/chat/completions` and `GET /v1/models` resolve the client key
-//! to its bound channel, enforce the channel's model whitelist, and forward
-//! to the upstream with the client `Authorization` dropped and the upstream
-//! key substituted. The chat body is buffered once, bounded by
+//! `POST /v1/chat/completions`, `POST /v1/responses`, `POST /v1/messages`
+//! and `GET /v1/models` resolve the client key to its bound channel, enforce
+//! the channel's model whitelist, and forward to the upstream with the client
+//! credential dropped and the upstream key substituted. The three POST
+//! surfaces run one shared pipeline ([`forward_proxied`]) and differ only in
+//! the upstream path the bytes are forwarded to, in the usage shape their
+//! response is read in (see [`Surface`]) and in the header policy that puts
+//! the credential on the outbound request (see [`HeaderPolicy`]). The request
+//! body is buffered once, bounded by
 //! [`CHAT_BODY_LIMIT`] (32 MiB, well past axum's 2 MiB default because
 //! vision requests embed base64 images), so `model` and `stream` can be
 //! peeked, then the original bytes are forwarded verbatim. A body over the
-//! limit fails through the [`ChatBody`] extractor as an OpenAI-shaped 413,
-//! never axum's plain-text rejection, so client libraries always see a
-//! parseable error. Responses pass through untouched; streaming ones use
+//! limit fails through the [`ChatBody`] extractor as a 413 in the surface's
+//! error envelope, never axum's plain-text rejection, so client libraries
+//! always see a parseable error. Responses pass through untouched; streaming ones use
 //! `bytes_stream()` straight into `Body::from_stream` so SSE chunk semantics
 //! survive. The upstream-to-client response conversion lives in one place
 //! ([`upstream_to_response`]), which is also where the background request
-//! logging tee hooks in: every chat completion produces exactly one
-//! `request_logs` row written by a detached task that can never block or
-//! fail the client flow. Rejections are logged too, auth-layer ones
+//! logging tee hooks in: every proxied completion, on any POST surface,
+//! produces exactly one `request_logs` row, written by a detached task that
+//! can never block or fail the client flow. Rejections are logged too, auth-layer ones
 //! included (they resolve to no key, so their rows carry NULL ids); the
 //! only unloggable case is the 413 body-limit rejection, which happens in
 //! the body extractor before any handler code runs. A request rejected by
@@ -27,6 +32,17 @@
 //! touching the database and contributes at most one log row per window
 //! per IP. `/v1/models` is a lightweight discovery endpoint and is not
 //! logged.
+//!
+//! The Messages surface is the one whose client key need not arrive in a
+//! bearer header, whose upstream does not speak the OpenAI usage shape, and
+//! whose clients do not parse the OpenAI error shape: its key comes from
+//! `x-api-key` or from a bearer header ([`MessagesAuth`]), its upstream
+//! answers in the Anthropic usage shape (`UsageFormat::Anthropic`), its
+//! upstream needs the `anthropic-version` header, which Hydra therefore
+//! requires from the client instead of inventing one, and its own rejections
+//! are rendered in the Anthropic error envelope ([`ErrorShape`]) that its
+//! SDKs parse. The chat and Responses surfaces keep the OpenAI envelope
+//! byte-for-byte.
 
 use std::time::{Duration, Instant};
 
@@ -41,22 +57,24 @@ use utoipa::ToSchema;
 use crate::db::channels::Channel;
 use crate::flood::FloodTicket;
 use crate::http::client_ip;
-use crate::http::docs::OpenAiError;
-use crate::http::openai_error::openai_error;
-use crate::http::proxy_auth::{ProxyAuth, ProxyAuthError};
+use crate::http::docs::{AnthropicError, OpenAiError};
+use crate::http::openai_error::ErrorShape;
+use crate::http::proxy_auth::{MessagesAuth, ProxyAuth, ProxyAuthError, X_API_KEY};
 use crate::http::AppState;
-use crate::logging::{self, ChatLogContext, ChatLogInit};
+use crate::logging::{self, ChatLogContext, ChatLogInit, UsageFormat};
 
-/// Maximum accepted chat request body, in bytes (32 MiB). Vision requests
-/// embed base64-encoded images and long-context conversations run well past
-/// axum's 2 MiB default; 32 MiB covers both while still bounding memory.
-/// Applied to `/v1/chat/completions` via `DefaultBodyLimit`; an over-limit
-/// body fails into [`ProxyError::PayloadTooLarge`].
+/// Maximum accepted proxied request body, in bytes (32 MiB). Vision
+/// requests embed base64-encoded images and long-context conversations run
+/// well past axum's 2 MiB default; 32 MiB covers both while still bounding
+/// memory. Each proxied POST route mounts it via `DefaultBodyLimit`
+/// (`/v1/chat/completions`, `/v1/responses` and `/v1/messages`; the layer is
+/// per-route, so a route without it would silently fall back to axum's
+/// default); an over-limit body fails into [`ProxyError::PayloadTooLarge`].
 pub const CHAT_BODY_LIMIT: usize = 32 * 1024 * 1024;
 
-/// Total-request cap for non-streaming chat calls. Generous on purpose:
-/// reasoning models can think for minutes before the single response body
-/// arrives.
+/// Total-request cap for non-streaming proxied calls (every POST surface).
+/// Generous on purpose: reasoning models can think for minutes before the
+/// single response body arrives.
 const NON_STREAM_TIMEOUT: Duration = Duration::from_secs(300);
 /// Total-request cap for the `/v1/models` proxy path; model listings are
 /// quick and never stream.
@@ -80,27 +98,42 @@ pub enum ProxyError {
     Database(#[from] sqlx::Error),
 }
 
-impl IntoResponse for ProxyError {
-    fn into_response(self) -> Response {
+impl ProxyError {
+    /// Renders this rejection in the envelope of the surface that produced
+    /// it: same status and same message everywhere, the envelope per surface
+    /// (see [`ErrorShape`]). The pipeline renders through this, which is why
+    /// a rejection that never reaches an upstream still comes back in the
+    /// shape the caller's client library parses.
+    pub fn into_response_with(self, shape: ErrorShape) -> Response {
+        let (status, message, error_type, code) = self.parts();
+        shape.render(status, &message, error_type, code)
+    }
+
+    /// The surface-independent pieces of this rejection: its status, the
+    /// message the client reads, and its OpenAI taxonomy type and code,
+    /// which only the OpenAI envelope uses. The Database arm logs the
+    /// internal failure here, where the detail is still in hand; the client
+    /// body deliberately says no more than `internal server error`.
+    fn parts(self) -> (StatusCode, String, &'static str, Option<&'static str>) {
         match self {
-            ProxyError::BadRequest(message) => openai_error(
+            ProxyError::BadRequest(message) => (
                 StatusCode::BAD_REQUEST,
-                &message,
+                message,
                 "invalid_request_error",
                 None,
             ),
-            ProxyError::PayloadTooLarge => openai_error(
+            ProxyError::PayloadTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                &format!(
+                format!(
                     "Request body exceeds the maximum allowed size of {} MiB",
                     CHAT_BODY_LIMIT / (1024 * 1024)
                 ),
                 "invalid_request_error",
                 None,
             ),
-            ProxyError::ModelNotAllowed { model, allowed } => openai_error(
+            ProxyError::ModelNotAllowed { model, allowed } => (
                 StatusCode::NOT_FOUND,
-                &format!(
+                format!(
                     "The model `{model}` does not exist or you do not have access to it. \
                      Allowed models for this channel: {}",
                     allowed.join(", ")
@@ -108,29 +141,29 @@ impl IntoResponse for ProxyError {
                 "invalid_request_error",
                 Some("model_not_found"),
             ),
-            ProxyError::ChannelGone => openai_error(
+            ProxyError::ChannelGone => (
                 StatusCode::BAD_GATEWAY,
-                "The channel bound to this API key is unavailable",
+                "The channel bound to this API key is unavailable".to_string(),
                 "api_error",
                 None,
             ),
-            ProxyError::ChannelDisabled => openai_error(
+            ProxyError::ChannelDisabled => (
                 StatusCode::SERVICE_UNAVAILABLE,
-                "The channel bound to this API key is currently disabled",
+                "The channel bound to this API key is currently disabled".to_string(),
                 "api_error",
                 Some("channel_disabled"),
             ),
-            ProxyError::UpstreamUnavailable => openai_error(
+            ProxyError::UpstreamUnavailable => (
                 StatusCode::BAD_GATEWAY,
-                "Failed to connect to the upstream provider",
+                "Failed to connect to the upstream provider".to_string(),
                 "api_error",
                 None,
             ),
             ProxyError::Database(e) => {
                 tracing::error!(error = %e, "proxy database query failed");
-                openai_error(
+                (
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal server error",
+                    "internal server error".to_string(),
                     "server_error",
                     None,
                 )
@@ -139,10 +172,23 @@ impl IntoResponse for ProxyError {
     }
 }
 
-/// Buffered chat request body. Wrapping `Bytes` in a dedicated extractor is
-/// what makes an over-limit body surface as an OpenAI-shaped 413 (via
-/// [`ProxyError::PayloadTooLarge`]) instead of axum's default plain-text
-/// rejection, which OpenAI client libraries cannot parse.
+impl IntoResponse for ProxyError {
+    /// The OpenAI envelope, which is what a route without a surface of its
+    /// own renders: `/v1/models` and any rejection axum turns into a
+    /// response itself. The proxied POST surfaces render through
+    /// [`ProxyError::into_response_with`] with their own shape instead.
+    fn into_response(self) -> Response {
+        self.into_response_with(ErrorShape::OpenAi)
+    }
+}
+
+/// Buffered proxied request body, shared by every proxied POST route (chat,
+/// Responses, Messages). Wrapping `Bytes` in a dedicated extractor is what
+/// makes an over-limit body surface as a 413 in the route's own error
+/// envelope (via [`ProxyError::PayloadTooLarge`]) instead of axum's default
+/// plain-text rejection, which no client library can parse. The handlers
+/// take it wrapped in a `Result` so the rejection reaches the pipeline,
+/// which is the point that knows which envelope the surface renders.
 pub struct ChatBody(Bytes);
 
 impl<S> FromRequest<S> for ChatBody
@@ -171,10 +217,11 @@ where
     }
 }
 
-/// `POST /v1/chat/completions`: peek `model`/`stream`, check the whitelist,
-/// forward the original bytes with the upstream key, pass the response
-/// through byte-for-byte, and leave a background log row behind whatever
-/// the outcome (only the 413 body-limit rejection stays unlogged).
+/// `POST /v1/chat/completions`: the Chat Completions surface of the shared
+/// proxy pipeline ([`forward_proxied`]): peek `model`/`stream`, check the
+/// whitelist, forward the original bytes with the upstream key, pass the
+/// response through byte-for-byte, and leave a background log row behind
+/// whatever the outcome (only the 413 body-limit rejection stays unlogged).
 #[utoipa::path(
     post,
     path = "/v1/chat/completions",
@@ -266,9 +313,10 @@ where
         })),
         (status = 429, description = "The key's monthly spending limit is \
             reached. Enforced for a key that has a limit and whose channel \
-            is priceable (every whitelisted model carries all four prices); \
-            the verdict is recomputed in the background after each logged \
-            response, so the first requests after a restart pass", body = OpenAiError, example = json!({
+            is priceable (every whitelisted model carries a price entry, its \
+            optional cache-write rate included); the verdict is recomputed in \
+            the background after each logged response, so the first requests \
+            after a restart pass", body = OpenAiError, example = json!({
             "error": { "message": "Monthly limit reached", "type": "rate_limit_error", "code": null }
         })),
         (status = 502, description = "The bound channel is gone, or the \
@@ -306,32 +354,532 @@ pub async fn chat_completions(
     headers: HeaderMap,
     // Absent ConnectInfo (in-process oneshot requests) simply logs no IP.
     peer: client_ip::PeerAddr,
-    ChatBody(body): ChatBody,
-) -> Result<Response, ProxyError> {
-    let start = Instant::now();
-    let client_ip = client_ip::resolve(&headers, peer.0, &state.trusted_proxies);
+    // Wrapped in a Result for the same reason: an over-limit body is a
+    // rejection of this surface, so the pipeline renders it.
+    body: Result<ChatBody, ProxyError>,
+) -> Response {
+    forward_proxied(&state, auth, &headers, peer, body, CHAT_SURFACE).await
+}
+
+/// `POST /v1/responses`: the OpenAI Responses surface of the same proxy
+/// pipeline as chat ([`forward_proxied`]). Bearer auth, the 32 MiB body
+/// limit, the whitelist check and both gates are the shared ones, so an
+/// unknown key is answered 401, a disabled one 403, an unlisted model 404,
+/// an over-budget key 429 and a flood-capped IP the same 401 as everywhere
+/// else. What is specific to this route is the upstream path its bytes are
+/// forwarded to (`<base>/v1/responses`) and the usage shape its response is
+/// logged in (the Responses `input_tokens`/`output_tokens` mapping), so a
+/// Responses call prices and gates exactly like a chat call.
+#[utoipa::path(
+    post,
+    path = "/v1/responses",
+    tag = "Proxy",
+    operation_id = "responses",
+    summary = "Create a response",
+    description = "Forwards an OpenAI Responses request to the channel bound \
+        to the key, with the client Authorization dropped and the upstream key \
+        substituted. The body passes through byte-for-byte, so anything the \
+        upstream accepts works here; the two fields Hydra itself reads are \
+        `model` (whitelist check) and `stream` (streaming path). Upstream \
+        responses, errors included, come back with the upstream status and \
+        body unchanged; Hydra's own rejections use the OpenAI envelope. Hydra \
+        reads the Responses \
+        usage shape for the request log, the cost and the monthly limit gate, \
+        so a Responses call prices exactly like a chat call. Every call, \
+        rejected ones included, leaves a row in the request log; the one \
+        exception is a 413 over-limit body, which cannot be logged.",
+    security(("bearer_auth" = [])),
+    request_body(
+        content = Object,
+        description = "Any OpenAI Responses request body. `model` is required \
+            and must be admitted by the channel's whitelist (a channel \
+            without a whitelist admits any model). `stream: true` switches \
+            the response to text/event-stream, where the usage object arrives \
+            in the terminal `response.completed` or `response.incomplete` \
+            event. Bodies above 32 MiB are rejected with 413.",
+        examples(
+            ("plain" = (
+                summary = "Non-streaming request",
+                value = json!({
+                    "model": "gpt-4o",
+                    "input": "Say hello"
+                })
+            )),
+            ("streaming" = (
+                summary = "Streaming request (SSE response)",
+                value = json!({
+                    "model": "gpt-4o",
+                    "input": "Tell me a joke",
+                    "stream": true
+                })
+            )),
+            ("invalid" = (
+                summary = "Rejected with 400: no model parameter",
+                value = json!({
+                    "input": "Hi"
+                })
+            ))
+        )
+    ),
+    responses(
+        (status = 200, description = "The upstream response passed through \
+            unchanged; with `stream: true` the content type is \
+            text/event-stream and events arrive as the upstream sends them", body = Object, example = json!({
+            "id": "resp_67ccd2bed1ec8190b14f964abc0542670bb6a6b452d3795b",
+            "object": "response",
+            "created_at": 1770000000,
+            "status": "completed",
+            "model": "gpt-4o",
+            "output": [
+                {
+                    "type": "message",
+                    "id": "msg_67ccd2bf17f0819081ff3bb2cf6508e6",
+                    "status": "completed",
+                    "role": "assistant",
+                    "content": [
+                        { "type": "output_text", "text": "Hello!", "annotations": [] }
+                    ]
+                }
+            ],
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34,
+                "total_tokens": 46,
+                "input_tokens_details": { "cached_tokens": 0 }
+            }
+        })),
+        (status = 400, description = "Body is not JSON or has no string \
+            `model` parameter", body = OpenAiError, example = json!({
+            "error": { "message": "you must provide a model parameter", "type": "invalid_request_error", "code": null }
+        })),
+        (status = 401, description = "Missing, malformed, unknown or deleted \
+            key", body = OpenAiError, example = json!({
+            "error": { "message": "Invalid API key provided", "type": "invalid_request_error", "code": "invalid_api_key" }
+        })),
+        (status = 403, description = "The key exists but is disabled", body = OpenAiError, example = json!({
+            "error": { "message": "This API key has been disabled", "type": "invalid_request_error", "code": "key_disabled" }
+        })),
+        (status = 404, description = "The requested model is not in the \
+            channel's whitelist; the message lists the allowed models", body = OpenAiError, example = json!({
+            "error": {
+                "message": "The model `gpt-4` does not exist or you do not have access to it. Allowed models for this channel: gpt-4o-mini, gpt-4o",
+                "type": "invalid_request_error",
+                "code": "model_not_found"
+            }
+        })),
+        (status = 413, description = "The request body exceeds 32 MiB", body = OpenAiError, example = json!({
+            "error": { "message": "Request body exceeds the maximum allowed size of 32 MiB", "type": "invalid_request_error", "code": null }
+        })),
+        (status = 429, description = "The key's monthly spending limit is \
+            reached. Enforced for a key that has a limit and whose channel \
+            is priceable (every whitelisted model carries a price entry, its \
+            optional cache-write rate included); the verdict is recomputed in \
+            the background after each logged response, so the first requests \
+            after a restart pass", body = OpenAiError, example = json!({
+            "error": { "message": "Monthly limit reached", "type": "rate_limit_error", "code": null }
+        })),
+        (status = 502, description = "The bound channel is gone, or the \
+            upstream could not be reached; other upstream statuses pass \
+            through unchanged", body = OpenAiError, examples(
+            ("upstream_unavailable" = (
+                summary = "The upstream request failed",
+                value = json!({
+                    "error": { "message": "Failed to connect to the upstream provider", "type": "api_error", "code": null }
+                })
+            )),
+            ("channel_gone" = (
+                summary = "The channel bound to the key no longer exists",
+                value = json!({
+                    "error": { "message": "The channel bound to this API key is unavailable", "type": "api_error", "code": null }
+                })
+            ))
+        )),
+        (status = 503, description = "The channel bound to the key is \
+            disabled; the key itself stays valid", body = OpenAiError, example = json!({
+            "error": {
+                "message": "The channel bound to this API key is currently disabled",
+                "type": "api_error",
+                "code": "channel_disabled"
+            }
+        }))
+    )
+)]
+pub async fn responses(
+    State(state): State<AppState>,
+    // Buffered as a Result for the same reason as chat: a rejected request
+    // still gets its audit row with the body it carried.
+    auth: Result<ProxyAuth, ProxyAuthError>,
+    headers: HeaderMap,
+    peer: client_ip::PeerAddr,
+    body: Result<ChatBody, ProxyError>,
+) -> Response {
+    forward_proxied(&state, auth, &headers, peer, body, RESPONSES_SURFACE).await
+}
+
+/// `POST /v1/messages`: the Anthropic Messages surface of the same proxy
+/// pipeline as chat and Responses ([`forward_proxied`]). The client key is
+/// read from `x-api-key` or from a bearer header ([`MessagesAuth`]); the 32
+/// MiB body limit, the model whitelist, the flood cap and the monthly-limit
+/// gate are the shared ones, so an unknown key is answered 401, a disabled
+/// one 403, an unlisted model 404, an over-budget key 429 and a flood-capped
+/// IP the same 401 as everywhere else. What is specific to this surface is
+/// the upstream path (`<base>/v1/messages`), the header policy
+/// ([`HeaderPolicy::Anthropic`]: the upstream key rides `x-api-key`, the
+/// required `anthropic-version` and the optional `anthropic-beta` hop across),
+/// the usage shape its response is logged in, and the Anthropic error
+/// envelope every rejection of this route is rendered in ([`ErrorShape`]),
+/// which is what the Anthropic SDKs pointed at this route parse.
+#[utoipa::path(
+    post,
+    path = "/v1/messages",
+    tag = "Proxy",
+    operation_id = "messages",
+    summary = "Create a message",
+    description = "Forwards an Anthropic Messages request to the channel \
+        bound to the key, with the client credential dropped and the upstream \
+        key substituted. The client key is read from `x-api-key` or from a \
+        bearer header, which is why this operation lists both schemes. The \
+        `anthropic-version` header is required and forwarded as sent; \
+        `anthropic-beta`, when the client sends it, hops across too. The body \
+        passes through byte-for-byte, so anything the upstream accepts works \
+        here; the two fields Hydra itself reads are `model` (whitelist check) \
+        and `stream` (streaming path). Upstream responses, errors included, \
+        come back with the upstream status and body unchanged. Hydra's own \
+        rejections on this route use the Anthropic error envelope, which is \
+        what the SDKs pointed here parse. The usage shape is read for the \
+        request log, the cost and the monthly limit gate, so a Messages call \
+        prices exactly like a chat call.",
+    security(("api_key_auth" = []), ("bearer_auth" = [])),
+    request_body(
+        content = Object,
+        description = "Any Anthropic Messages request body. `model` is \
+            required and must be admitted by the channel's whitelist (a \
+            channel without a whitelist admits any model); `max_tokens` is \
+            required by the Messages API itself. `stream: true` switches the \
+            response to text/event-stream. The `anthropic-version` header is \
+            required on every call and its absence is answered 400. Bodies \
+            above 32 MiB are rejected with 413.",
+        examples(
+            ("plain" = (
+                summary = "Non-streaming request",
+                value = json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "messages": [{ "role": "user", "content": "Say hello" }]
+                })
+            )),
+            ("system_prompt" = (
+                summary = "Request with a system prompt and a cacheable prefix",
+                value = json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "system": "Answer in one short sentence.",
+                    "messages": [{ "role": "user", "content": "Say hello" }]
+                })
+            )),
+            ("streaming" = (
+                summary = "Streaming request (SSE response)",
+                value = json!({
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "messages": [{ "role": "user", "content": "Tell me a joke" }],
+                    "stream": true
+                })
+            ))
+        )
+    ),
+    responses(
+        (status = 200, description = "The upstream response passed through \
+            unchanged; with `stream: true` the content type is \
+            text/event-stream and events arrive as the upstream sends them. \
+            The cache fields of the usage object are what the request log \
+            stores as the cached and cache-write token counts", body = Object, example = json!({
+            "id": "msg_01XFDUDYJgAACzvnptvVoYEL",
+            "type": "message",
+            "role": "assistant",
+            "model": "claude-sonnet-4-5",
+            "content": [{ "type": "text", "text": "Hello!" }],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 12,
+                "output_tokens": 34,
+                "cache_read_input_tokens": 0,
+                "cache_creation_input_tokens": 0
+            }
+        })),
+        (status = 400, description = "Body is not JSON, has no string \
+            `model` parameter, or the required `anthropic-version` header is \
+            missing", body = AnthropicError, examples(
+            ("no_model" = (
+                summary = "No model parameter",
+                value = json!({
+                    "type": "error",
+                    "error": { "type": "invalid_request_error", "message": "you must provide a model parameter" }
+                })
+            )),
+            ("no_version" = (
+                summary = "Missing anthropic-version header",
+                value = json!({
+                    "type": "error",
+                    "error": { "type": "invalid_request_error", "message": "you must provide an anthropic-version header" }
+                })
+            ))
+        )),
+        (status = 401, description = "Missing, malformed, unknown or deleted \
+            key, in either credential header", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "authentication_error", "message": "Invalid API key provided" }
+        })),
+        (status = 403, description = "The key exists but is disabled", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "permission_error", "message": "This API key has been disabled" }
+        })),
+        (status = 404, description = "The requested model is not in the \
+            channel's whitelist; the message lists the allowed models", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "The model `claude-opus-4-1` does not exist or you do not have access to it. Allowed models for this channel: claude-sonnet-4-5"
+            }
+        })),
+        (status = 413, description = "The request body exceeds 32 MiB", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "invalid_request_error", "message": "Request body exceeds the maximum allowed size of 32 MiB" }
+        })),
+        (status = 429, description = "The key's monthly spending limit is \
+            reached. The limit is enforced \
+            for a key that has one and whose channel is priceable (every \
+            whitelisted model carries a price entry, its optional \
+            cache-write rate included); the verdict is recomputed in the \
+            background after each logged response, so the first requests \
+            after a restart pass", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "rate_limit_error", "message": "Monthly limit reached" }
+        })),
+        (status = 500, description = "A storage failure while resolving the \
+            key; the detail stays in the server log", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "api_error", "message": "internal server error" }
+        })),
+        (status = 502, description = "The bound channel is gone, or the \
+            upstream could not be reached; other upstream statuses pass \
+            through unchanged", body = AnthropicError, examples(
+            ("upstream_unavailable" = (
+                summary = "The upstream request failed",
+                value = json!({
+                    "type": "error",
+                    "error": { "type": "overloaded_error", "message": "Failed to connect to the upstream provider" }
+                })
+            )),
+            ("channel_gone" = (
+                summary = "The channel bound to the key no longer exists",
+                value = json!({
+                    "type": "error",
+                    "error": { "type": "overloaded_error", "message": "The channel bound to this API key is unavailable" }
+                })
+            ))
+        )),
+        (status = 503, description = "The channel bound to the key is \
+            disabled; the key itself stays valid", body = AnthropicError, example = json!({
+            "type": "error",
+            "error": { "type": "overloaded_error", "message": "The channel bound to this API key is currently disabled" }
+        }))
+    )
+)]
+pub async fn messages(
+    State(state): State<AppState>,
+    // Same Result shape as the other surfaces: an auth failure reaches the
+    // handler with the body already buffered, and the rejection still gets
+    // its audit row.
+    auth: Result<MessagesAuth, ProxyAuthError>,
+    headers: HeaderMap,
+    peer: client_ip::PeerAddr,
+    body: Result<ChatBody, ProxyError>,
+) -> Response {
+    forward_proxied(
+        &state,
+        auth.map(MessagesAuth::into_inner),
+        &headers,
+        peer,
+        body,
+        MESSAGES_SURFACE,
+    )
+    .await
+}
+
+/// What differs between the proxied POST surfaces: the upstream path the
+/// request is forwarded to, the usage shape the response is read in, the
+/// header policy that carries the credential upstream, and the error
+/// envelope Hydra's own rejections of this surface are rendered in.
+/// Everything else about a proxied POST (body limit, model whitelist, both
+/// gates, response piping, logging) is identical across surfaces and lives
+/// in [`forward_proxied`].
+struct Surface {
+    /// Path appended to the channel's base URL, with the same leading-`/v1`
+    /// semantics as chat.
+    path: &'static str,
+    /// Usage shape the surface's upstream answers in, handed to the log
+    /// context so the response body is read correctly.
+    usage_format: UsageFormat,
+    /// How this surface's upstream expects the credential, and which of the
+    /// client's own headers it needs beyond the two every surface forwards.
+    headers: HeaderPolicy,
+    /// Shape this surface's clients parse Hydra's own rejections in:
+    /// Anthropic SDKs parse `{"type":"error","error":{...}}` and would not
+    /// recognize the OpenAI envelope. An upstream error body is unaffected.
+    errors: ErrorShape,
+}
+
+/// Outbound header policy of one proxied surface: which header carries the
+/// upstream key, and which client headers hop across on top of the
+/// `Content-Type` and `Accept` every surface forwards. It is per-surface
+/// because the Messages API is the one upstream that authenticates on
+/// `x-api-key` and states its version per request through `anthropic-version`.
+/// The OpenAI surfaces keep exactly the hygiene rules chat has always had.
+enum HeaderPolicy {
+    /// OpenAI surfaces: the upstream key replaces the client Authorization
+    /// as `Authorization: Bearer`; nothing else of the client's hops across.
+    OpenAi,
+    /// Anthropic Messages: the upstream key replaces the client credentials
+    /// as `x-api-key`, and the version header the Messages API requires plus
+    /// the beta opt-in list, when the client sent one, are forwarded. The
+    /// client's own credential header is never among them, whichever header
+    /// it arrived in.
+    Anthropic,
+}
+
+/// The Messages API version header, required on every Messages request.
+const ANTHROPIC_VERSION: &str = "anthropic-version";
+/// The Messages API beta opt-in list, optional and forwarded as sent.
+const ANTHROPIC_BETA: &str = "anthropic-beta";
+
+impl HeaderPolicy {
+    /// Rejects a request this surface cannot forward upstream. Only the
+    /// Messages surface has a header contract of its own: the Messages API
+    /// requires `anthropic-version` on every request and would answer
+    /// without it only with an error, so Hydra reports the missing header at
+    /// its own boundary rather than spending an upstream round-trip to
+    /// relay it. A present value is forwarded verbatim: which versions an
+    /// account may use is the upstream's business, not the router's.
+    fn check(&self, headers: &HeaderMap) -> Result<(), ProxyError> {
+        match self {
+            HeaderPolicy::OpenAi => Ok(()),
+            HeaderPolicy::Anthropic if headers.contains_key(ANTHROPIC_VERSION) => Ok(()),
+            HeaderPolicy::Anthropic => Err(ProxyError::BadRequest(format!(
+                "you must provide an {ANTHROPIC_VERSION} header"
+            ))),
+        }
+    }
+
+    /// Puts the surface's credential header on the outbound request and
+    /// copies the surface's own extra headers across. The credential the
+    /// client sent is never forwarded: the upstream always sees the bound
+    /// channel's key under the surface's own header name.
+    fn apply(
+        &self,
+        request: reqwest::RequestBuilder,
+        headers: &HeaderMap,
+        upstream_key: &str,
+    ) -> reqwest::RequestBuilder {
+        match self {
+            HeaderPolicy::OpenAi => {
+                request.header(header::AUTHORIZATION, format!("Bearer {upstream_key}"))
+            }
+            HeaderPolicy::Anthropic => {
+                let mut request = request.header(X_API_KEY, upstream_key);
+                if let Some(version) = headers.get(ANTHROPIC_VERSION) {
+                    request = request.header(ANTHROPIC_VERSION, version);
+                }
+                if let Some(beta) = headers.get(ANTHROPIC_BETA) {
+                    request = request.header(ANTHROPIC_BETA, beta);
+                }
+                request
+            }
+        }
+    }
+}
+
+/// OpenAI Chat Completions.
+const CHAT_SURFACE: Surface = Surface {
+    path: "/v1/chat/completions",
+    usage_format: UsageFormat::Chat,
+    headers: HeaderPolicy::OpenAi,
+    errors: ErrorShape::OpenAi,
+};
+
+/// OpenAI Responses.
+const RESPONSES_SURFACE: Surface = Surface {
+    path: "/v1/responses",
+    usage_format: UsageFormat::Responses,
+    headers: HeaderPolicy::OpenAi,
+    errors: ErrorShape::OpenAi,
+};
+
+/// Anthropic Messages.
+const MESSAGES_SURFACE: Surface = Surface {
+    path: "/v1/messages",
+    usage_format: UsageFormat::Anthropic,
+    headers: HeaderPolicy::Anthropic,
+    errors: ErrorShape::Anthropic,
+};
+
+/// The thin-passthrough pipeline every proxied POST surface runs. Every
+/// rejection keeps the audit row it has always had: a flood-capped or
+/// auth-layer one carries NULL ids, a monthly-limit one names the key that
+/// asked, a raw client error keeps the caller's key id. Then the buffered
+/// bytes are forwarded verbatim to the surface's upstream path with the
+/// client credential replaced by the upstream key through the surface's
+/// header policy, and the upstream response goes back untouched through
+/// [`upstream_to_response`], which is where the response is tee'd and the
+/// surface's usage shape is read. Every rejection is rendered through the
+/// surface's own error envelope, in this one place, so a status and a
+/// message can never be shaped one way on one surface and another way on
+/// the next: the pipeline returns a response, not an error, because the
+/// caller of a surface always gets that surface's envelope.
+async fn forward_proxied(
+    state: &AppState,
+    auth: Result<ProxyAuth, ProxyAuthError>,
+    headers: &HeaderMap,
+    peer: client_ip::PeerAddr,
+    body: Result<ChatBody, ProxyError>,
+    surface: Surface,
+) -> Response {
+    // The 413 fires in the extractor, long before any handler code runs, so
+    // it arrives here as an error instead of a status: this is the first
+    // point that knows which surface was called and therefore which
+    // envelope the rejection belongs in. It stays unlogged, as it always
+    // was: no handler saw the request.
+    let body = match body {
+        Ok(ChatBody(body)) => body,
+        Err(e) => return e.into_response_with(surface.errors),
+    };
+    let facts = RejectionFacts {
+        start: Instant::now(),
+        client_ip: client_ip::resolve(headers, peer.0, &state.trusted_proxies),
+        usage_format: surface.usage_format,
+    };
     let auth = match auth {
         Ok(auth) => auth,
         Err(ProxyAuthError::FloodCapped(ticket)) => {
-            log_flood_cap_rejection(&state, start, &body, client_ip, &ticket);
-            return Ok(ProxyAuthError::FloodCapped(ticket).into_response());
+            log_flood_cap_rejection(state, &facts, &body, &ticket);
+            return ProxyAuthError::FloodCapped(ticket).into_response_with(surface.errors);
         }
         // The limit gate runs after the key resolved, so this rejection
         // knows who asked and gets its own row rather than the NULL-key one.
         Err(e @ ProxyAuthError::MonthlyLimitReached { key_id, channel_id }) => {
-            log_limit_rejection(&state, start, &body, client_ip, key_id, channel_id);
-            return Ok(e.into_response());
+            log_limit_rejection(state, &facts, &body, key_id, channel_id);
+            return e.into_response_with(surface.errors);
         }
         Err(e) => {
-            log_auth_rejection(&state, start, &body, client_ip, &e);
-            return Ok(e.into_response());
+            log_auth_rejection(state, &facts, &body, &e);
+            return e.into_response_with(surface.errors);
         }
     };
     let (model, stream_requested) = match peek_request(&body) {
         Ok(peeked) => peeked,
         Err(e) => {
-            log_rejection(&state, &auth, None, start, &body, client_ip, &e);
-            return Err(e);
+            log_rejection(state, &auth, None, &facts, &body, &e);
+            return e.into_response_with(surface.errors);
         }
     };
     let channel = match resolve_channel(&auth) {
@@ -340,21 +888,28 @@ pub async fn chat_completions(
         // log write; ChannelGone and ChannelDisabled are client-visible
         // routing failures that still get their audit row.
         Err(e @ (ProxyError::ChannelGone | ProxyError::ChannelDisabled)) => {
-            log_rejection(&state, &auth, Some(model), start, &body, client_ip, &e);
-            return Err(e);
+            log_rejection(state, &auth, Some(model), &facts, &body, &e);
+            return e.into_response_with(surface.errors);
         }
-        Err(e) => return Err(e),
+        Err(e) => return e.into_response_with(surface.errors),
     };
     if let Err(e) = ensure_model_allowed(&channel, &model) {
-        log_rejection(&state, &auth, Some(model), start, &body, client_ip, &e);
-        return Err(e);
+        log_rejection(state, &auth, Some(model), &facts, &body, &e);
+        return e.into_response_with(surface.errors);
     }
-
-    let url = join_url(&channel.base_url, "/v1/chat/completions");
-    let mut request = state
-        .client
-        .post(&url)
-        .header(header::AUTHORIZATION, format!("Bearer {}", channel.api_key));
+    // The surface's own header contract is the last gate, right where the
+    // outbound request is built: the routing rejections above keep their
+    // documented statuses (a whitelist miss stays a 404, a gone channel a
+    // 502), and this one fires only for a request that would otherwise be
+    // forwarded without a header its upstream requires.
+    if let Err(e) = surface.headers.check(headers) {
+        log_rejection(state, &auth, Some(model), &facts, &body, &e);
+        return e.into_response_with(surface.errors);
+    }
+    let url = join_url(&channel.base_url, surface.path);
+    let mut request = surface
+        .headers
+        .apply(state.client.post(&url), headers, &channel.api_key);
     if let Some(content_type) = headers.get(header::CONTENT_TYPE) {
         request = request.header(header::CONTENT_TYPE, content_type);
     }
@@ -369,21 +924,34 @@ pub async fn chat_completions(
 
     // Built before the body is handed to the forwarder: it already holds
     // whatever request bytes body logging will ever capture.
-    let ctx = chat_log_context(&state, &auth, Some(model), start, &body, client_ip);
+    let ctx = chat_log_context(
+        state,
+        &auth,
+        Some(model),
+        facts.usage_format,
+        facts.start,
+        &body,
+        facts.client_ip,
+    );
     let upstream = match request.body(body).send().await {
         Ok(upstream) => upstream,
         Err(e) => {
-            tracing::warn!(error = %e, "upstream chat request failed");
+            tracing::warn!(error = %e, "upstream proxy request failed");
             ctx.finish(
                 None,
-                logging::Usage::default(),
+                logging::UsageExtraction::default(),
                 None,
                 Some(format!("upstream request failed: {e}")),
             );
-            return Err(ProxyError::UpstreamUnavailable);
+            return ProxyError::UpstreamUnavailable.into_response_with(surface.errors);
         }
     };
-    upstream_to_response(upstream, stream_requested, Some(ctx)).await
+    // The conversion only fails when the upstream response body cannot be
+    // read, which is the same 502 the connect failure above answers with.
+    match upstream_to_response(upstream, stream_requested, Some(ctx)).await {
+        Ok(response) => response,
+        Err(e) => e.into_response_with(surface.errors),
+    }
 }
 
 /// `GET /v1/models`: a set whitelist is returned as a locally built OpenAI
@@ -627,7 +1195,7 @@ async fn upstream_to_response(
                 if let Some(ctx) = log {
                     ctx.finish(
                         Some(status_code),
-                        logging::Usage::default(),
+                        logging::UsageExtraction::default(),
                         None,
                         Some("upstream response body read failed".to_string()),
                     );
@@ -636,7 +1204,7 @@ async fn upstream_to_response(
             }
         };
         if let Some(ctx) = log {
-            let usage = logging::parse_usage(&bytes);
+            let usage = ctx.buffered_usage(&bytes);
             let response_body = ctx.capture_response_body(&bytes);
             ctx.finish(Some(status_code), usage, response_body, None);
         }
@@ -646,13 +1214,16 @@ async fn upstream_to_response(
     }
 }
 
-/// Gathers the log context for one chat request from the request's own
-/// pieces; the channel id comes from the authenticated key, which is what
-/// the log row must reference even if channel resolution later fails.
+/// Gathers the log context for one request from the request's own pieces;
+/// the channel id comes from the authenticated key, which is what the log row
+/// must reference even if channel resolution later fails. The usage format
+/// names the shape this request's upstream will answer in, so each surface's
+/// handler passes its own.
 fn chat_log_context(
     state: &AppState,
     auth: &ProxyAuth,
     model: Option<String>,
+    usage_format: UsageFormat,
     start: Instant,
     body: &Bytes,
     client_ip: Option<String>,
@@ -664,11 +1235,23 @@ fn chat_log_context(
         api_key_id: Some(auth.key.id),
         channel_id: Some(auth.key.channel_id),
         model,
+        usage_format,
         start,
         request_body: body,
         client_ip,
         flags: &state.limit_flags,
     })
+}
+
+/// The request-scoped pieces every rejection row of one proxied request
+/// needs, whichever stage rejected it: when the request started (the logged
+/// duration is measured to the finished row), the resolved client IP, and
+/// the surface's usage shape. The format is stored but never read on these
+/// rows: a rejection parses no response body, because no upstream answered.
+struct RejectionFacts {
+    start: Instant,
+    client_ip: Option<String>,
+    usage_format: UsageFormat,
 }
 
 /// Writes the audit row for a request rejected by the auth layer (401
@@ -681,9 +1264,8 @@ fn chat_log_context(
 /// the response deliberately omits.
 fn log_auth_rejection(
     state: &AppState,
-    start: Instant,
+    facts: &RejectionFacts,
     body: &Bytes,
-    client_ip: Option<String>,
     error: &ProxyAuthError,
 ) {
     let ctx = ChatLogContext::new(ChatLogInit {
@@ -693,9 +1275,10 @@ fn log_auth_rejection(
         api_key_id: None,
         channel_id: None,
         model: None,
-        start,
+        usage_format: facts.usage_format,
+        start: facts.start,
         request_body: body,
-        client_ip,
+        client_ip: facts.client_ip.clone(),
         flags: &state.limit_flags,
     });
     let (status, message) = match error {
@@ -712,7 +1295,12 @@ fn log_auth_rejection(
             (Some(429), "Monthly limit reached".to_string())
         }
     };
-    ctx.finish(status, logging::Usage::default(), None, Some(message));
+    ctx.finish(
+        status,
+        logging::UsageExtraction::default(),
+        None,
+        Some(message),
+    );
 }
 
 /// Writes the audit row for a flood-capped request: at most one row per
@@ -725,9 +1313,8 @@ fn log_auth_rejection(
 /// reset.
 fn log_flood_cap_rejection(
     state: &AppState,
-    start: Instant,
+    facts: &RejectionFacts,
     body: &Bytes,
-    client_ip: Option<String>,
     ticket: &FloodTicket,
 ) {
     if !state.flood.claim_log_slot(ticket) {
@@ -740,14 +1327,15 @@ fn log_flood_cap_rejection(
         api_key_id: None,
         channel_id: None,
         model: None,
-        start,
+        usage_format: facts.usage_format,
+        start: facts.start,
         request_body: body,
-        client_ip,
+        client_ip: facts.client_ip.clone(),
         flags: &state.limit_flags,
     });
     ctx.finish(
         Some(401),
-        logging::Usage::default(),
+        logging::UsageExtraction::default(),
         None,
         Some("flood cap: too many failed authentications from this address".to_string()),
     );
@@ -762,9 +1350,8 @@ fn log_flood_cap_rejection(
 /// already buffered request body, which was never forwarded.
 fn log_limit_rejection(
     state: &AppState,
-    start: Instant,
+    facts: &RejectionFacts,
     body: &Bytes,
-    client_ip: Option<String>,
     key_id: i64,
     channel_id: i64,
 ) {
@@ -776,36 +1363,46 @@ fn log_limit_rejection(
         api_key_id: Some(key_id),
         channel_id: Some(channel_id),
         model,
-        start,
+        usage_format: facts.usage_format,
+        start: facts.start,
         request_body: body,
-        client_ip,
+        client_ip: facts.client_ip.clone(),
         flags: &state.limit_flags,
     });
     ctx.finish(
         Some(429),
-        logging::Usage::default(),
+        logging::UsageExtraction::default(),
         None,
         Some("Monthly limit reached".to_string()),
     );
 }
 
-/// Writes the audit row for an authenticated chat request rejected before
-/// the upstream was contacted: the row keeps the caller's key id. The 413
-/// body-limit rejection happens in the extractor instead and stays
+/// Writes the audit row for an authenticated proxied request rejected
+/// before the upstream was contacted: the row keeps the caller's key id. The
+/// 413 body-limit rejection happens in the extractor instead and stays
 /// unlogged; auth-layer rejections are logged by [`log_auth_rejection`].
 fn log_rejection(
     state: &AppState,
     auth: &ProxyAuth,
     model: Option<String>,
-    start: Instant,
+    facts: &RejectionFacts,
     body: &Bytes,
-    client_ip: Option<String>,
     error: &ProxyError,
 ) {
-    let ctx = chat_log_context(state, auth, model, start, body, client_ip);
+    // No response body is ever parsed for a rejection, so this row carries
+    // no usage and the format the context stores is only a placeholder.
+    let ctx = chat_log_context(
+        state,
+        auth,
+        model,
+        facts.usage_format,
+        facts.start,
+        body,
+        facts.client_ip.clone(),
+    );
     ctx.finish(
         None,
-        logging::Usage::default(),
+        logging::UsageExtraction::default(),
         None,
         Some(error.to_string()),
     );
@@ -813,7 +1410,97 @@ fn log_rejection(
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
+
     use super::*;
+
+    fn headers_with_version() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ANTHROPIC_VERSION, HeaderValue::from_static("2023-06-01"));
+        headers
+    }
+
+    /// Builds the outbound request one policy produces, so the header rules
+    /// are asserted on what would actually leave the process.
+    fn outbound(policy: &HeaderPolicy, headers: &HeaderMap) -> reqwest::Request {
+        policy
+            .apply(
+                reqwest::Client::new().post("http://127.0.0.1:9/v1/messages"),
+                headers,
+                "sk-upstream-secret",
+            )
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn only_the_messages_policy_requires_the_version_header() {
+        assert!(HeaderPolicy::OpenAi.check(&HeaderMap::new()).is_ok());
+        assert!(matches!(
+            HeaderPolicy::Anthropic.check(&HeaderMap::new()),
+            Err(ProxyError::BadRequest(message)) if message.contains("anthropic-version")
+        ));
+        assert!(HeaderPolicy::Anthropic
+            .check(&headers_with_version())
+            .is_ok());
+    }
+
+    #[test]
+    fn the_messages_policy_substitutes_the_api_key_header() {
+        let mut headers = headers_with_version();
+        headers.insert(X_API_KEY, HeaderValue::from_static("hyd-client-key"));
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer hyd-client-key"),
+        );
+        let request = outbound(&HeaderPolicy::Anthropic, &headers);
+
+        assert_eq!(request.headers()[X_API_KEY], "sk-upstream-secret");
+        assert!(
+            !request.headers().contains_key(header::AUTHORIZATION),
+            "the client credential must not hop across: {:?}",
+            request.headers()
+        );
+        assert_eq!(request.headers()[ANTHROPIC_VERSION], "2023-06-01");
+    }
+
+    #[test]
+    fn the_messages_policy_forwards_the_beta_header_only_when_sent() {
+        assert!(!outbound(&HeaderPolicy::Anthropic, &headers_with_version())
+            .headers()
+            .contains_key(ANTHROPIC_BETA));
+
+        let mut with_beta = headers_with_version();
+        with_beta.insert(
+            ANTHROPIC_BETA,
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        assert_eq!(
+            outbound(&HeaderPolicy::Anthropic, &with_beta).headers()[ANTHROPIC_BETA],
+            "prompt-caching-2024-07-31"
+        );
+    }
+
+    /// The OpenAI policy is what chat has always done: a bearer substitution
+    /// and nothing else, whatever the client sent alongside it.
+    #[test]
+    fn the_openai_policy_keeps_the_bearer_substitution_and_forwards_nothing_else() {
+        let mut headers = headers_with_version();
+        headers.insert(X_API_KEY, HeaderValue::from_static("hyd-client-key"));
+        headers.insert(
+            ANTHROPIC_BETA,
+            HeaderValue::from_static("prompt-caching-2024-07-31"),
+        );
+        let request = outbound(&HeaderPolicy::OpenAi, &headers);
+
+        assert_eq!(
+            request.headers()[header::AUTHORIZATION],
+            "Bearer sk-upstream-secret"
+        );
+        assert!(!request.headers().contains_key(X_API_KEY));
+        assert!(!request.headers().contains_key(ANTHROPIC_VERSION));
+        assert!(!request.headers().contains_key(ANTHROPIC_BETA));
+    }
 
     #[test]
     fn join_url_handles_trailing_slashes() {
@@ -943,5 +1630,121 @@ mod tests {
         assert_eq!(value["data"][0]["created"], 0);
         assert_eq!(value["data"][0]["owned_by"], "hydra");
         assert_eq!(value["data"][1]["id"], "zeta");
+    }
+
+    /// Reads a rendered rejection back, so every assertion below is made on
+    /// the bytes a client would actually receive.
+    async fn body_of(response: Response) -> (StatusCode, serde_json::Value) {
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// The envelope is a property of the surface, not of the rejection:
+    /// every rejection of the pipeline renders in both, with the same status
+    /// and the same message, and only the shape and the error taxonomy
+    /// differ.
+    #[tokio::test]
+    async fn every_proxy_rejection_renders_in_the_surface_envelope() {
+        type Build = fn() -> ProxyError;
+        let cases: [(Build, StatusCode, &str, &str); 7] = [
+            (
+                || ProxyError::BadRequest("Invalid request body".to_string()),
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "invalid_request_error",
+            ),
+            (
+                || ProxyError::PayloadTooLarge,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "invalid_request_error",
+                "invalid_request_error",
+            ),
+            (
+                || ProxyError::ModelNotAllowed {
+                    model: "gpt-4".to_string(),
+                    allowed: vec!["gpt-4o".to_string()],
+                },
+                StatusCode::NOT_FOUND,
+                "invalid_request_error",
+                "invalid_request_error",
+            ),
+            (
+                || ProxyError::ChannelGone,
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "overloaded_error",
+            ),
+            (
+                || ProxyError::ChannelDisabled,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "api_error",
+                "overloaded_error",
+            ),
+            (
+                || ProxyError::UpstreamUnavailable,
+                StatusCode::BAD_GATEWAY,
+                "api_error",
+                "overloaded_error",
+            ),
+            (
+                || ProxyError::Database(sqlx::Error::RowNotFound),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "api_error",
+            ),
+        ];
+
+        for (build, status, openai_type, anthropic_type) in cases {
+            let (rendered_status, openai) =
+                body_of(build().into_response_with(ErrorShape::OpenAi)).await;
+            assert_eq!(rendered_status, status, "OpenAI status: {openai}");
+            assert_eq!(openai["error"]["type"], openai_type, "body: {openai}");
+            let message = openai["error"]["message"].clone();
+            assert!(
+                message.as_str().is_some_and(|message| !message.is_empty()),
+                "every rejection must carry a message: {openai}"
+            );
+
+            let (rendered_status, anthropic) =
+                body_of(build().into_response_with(ErrorShape::Anthropic)).await;
+            assert_eq!(rendered_status, status, "Anthropic status: {anthropic}");
+            assert_eq!(anthropic["type"], "error", "body: {anthropic}");
+            assert_eq!(
+                anthropic["error"]["type"], anthropic_type,
+                "body: {anthropic}"
+            );
+            assert_eq!(
+                anthropic["error"]["message"], message,
+                "the message must not depend on the envelope"
+            );
+            assert_eq!(
+                anthropic["error"].as_object().unwrap().len(),
+                2,
+                "the Anthropic error object carries type and message only: {anthropic}"
+            );
+        }
+    }
+
+    /// The `/v1/models` route has no [`Surface`], so its rejections and every
+    /// other path axum renders go through the `IntoResponse` default, which
+    /// stays the OpenAI envelope.
+    #[tokio::test]
+    async fn the_default_envelope_stays_openai() {
+        let (status, body) = body_of(ProxyError::ChannelGone.into_response()).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(body["error"]["type"], "api_error");
+        assert!(body.get("type").is_none(), "body: {body}");
+    }
+
+    /// Which envelope each surface renders, pinned where the surfaces are
+    /// declared: only the Anthropic one changes.
+    #[test]
+    fn only_the_messages_surface_renders_the_anthropic_envelope() {
+        assert_eq!(CHAT_SURFACE.errors, ErrorShape::OpenAi);
+        assert_eq!(RESPONSES_SURFACE.errors, ErrorShape::OpenAi);
+        assert_eq!(MESSAGES_SURFACE.errors, ErrorShape::Anthropic);
     }
 }

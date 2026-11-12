@@ -2,15 +2,17 @@
 
 ## What this is
 
-Hydra is a self-hosted, OpenAI-compatible API router written in Rust. An admin
-configures "channels" (upstream base URL + upstream API key + optional model
+Hydra is a self-hosted API router written in Rust, serving OpenAI- and
+Anthropic-shaped traffic. An admin configures
+"channels" (upstream base URL + upstream API key + optional model
 whitelist); the router issues its own client keys (`hyd-` prefix). A client
-calls `/v1/chat/completions` with a Hydra key; the router resolves the bound
-channel, forwards the request with the upstream key substituted (SSE streaming
+calls one of the proxied POST paths (`/v1/chat/completions`, `/v1/responses`,
+`/v1/messages`) with a Hydra key; the router resolves the bound channel,
+forwards the request with the upstream key substituted (SSE streaming
 preserved), logs to the configured database in the background, and returns the
 response.
-**Current status: POC**: Chat Completions + `/v1/models` only, single admin
-user, no failover. Beyond the proxy there is an admin UI under `/admin/ui`
+**Current status: POC**: the three proxied surfaces plus `/v1/models`, single
+admin user, no failover. Beyond the proxy there is an admin UI under `/admin/ui`
 (channels, keys, logs, a Stat tab for usage), optional prices per model on a
 channel and an optional monthly spending limit per client key. This file is
 the authority on conventions; read it before extending anything.
@@ -28,7 +30,8 @@ src/
 ├── cache.rs         in-memory key to channel resolution cache
 ├── flood.rs         in-memory flood cap on anonymous 401 spam
 ├── logging.rs       background request-log writer, body tee (opt-in, 1 MB cap),
-│                     usage tee (tail window, always on)
+│                     format-aware usage tee (tail window, plus an incremental
+│                     Anthropic event parser, always on)
 ├── cost.rs          request and month cost in integer micro-USD
 ├── prices.rs        per-channel model price table (USD input, micro-USD stored)
 ├── limits.rs        per-key monthly limit parsing and formatting
@@ -88,9 +91,12 @@ required vars abort with a clear message, never a silent default.
 migration, never hand-edited DBs.
 - `channels`: id, name, base_url, api_key, allowed_models (NULL = all models,
   otherwise JSON array, exact match, no wildcards), enabled, created_at,
-  model_prices (NULL = no prices; JSON object keyed by model, four integer
-  micro-USD-per-1M-token dimensions each; priced models must be a subset of
-  `allowed_models` when that list is set).
+  model_prices (NULL = no prices; JSON object keyed by model, integer
+  micro-USD-per-1M-token dimensions each: `input`, `output`, `cached_input`
+  and `cached_output` required, `cache_write_input` (the rate Anthropic cache
+  writes are billed at) optional, and an entry that names none bills its write
+  tokens at zero; priced models must be a subset of `allowed_models` when that
+  list is set).
 - `api_keys`: key_hash (SHA-256, **UNIQUE**), display_prefix, name,
   channel_id (FK; key→channel is 1:1 in POC), enabled, deleted_at,
   monthly_limit_micro_usd (INTEGER NULL = unlimited; decimal USD at the API
@@ -103,8 +109,9 @@ migration, never hand-edited DBs.
   soft delete); index leads with `created_at` for time-ordered pagination.
   `api_key_id` and `channel_id` are NULL for rejections that never resolved a
   key, and `client_ip` holds the resolved client address. Token columns are
-  `prompt_tokens`, `completion_tokens`, `cached_input_tokens` and
-  `cached_output_tokens`, all INTEGER NULL (NULL = the upstream reported
+  `prompt_tokens`, `completion_tokens`, `cached_input_tokens`,
+  `cached_output_tokens` and `cache_write_input_tokens` (the Anthropic
+  cache-creation count), all INTEGER NULL (NULL = the upstream reported
   nothing for that dimension, never a fabricated zero). A second index on
   `(api_key_id, created_at)` serves the per-key month-to-date aggregates; those
   queries filter with a `created_at` range, never with `substr()` in the
@@ -135,10 +142,22 @@ migration, never hand-edited DBs.
 
 ## API conventions
 
+- **Proxied surfaces:** `POST /v1/chat/completions` and `POST /v1/responses`
+  speak the OpenAI shapes and forward to the upstream path of the same name;
+  `POST /v1/messages` speaks the Anthropic shapes and forwards to
+  `/v1/messages`. All three run the one pipeline (`forward_proxied` in
+  `src/http/proxy.rs`), so the body limit, the whitelist, the flood cap, the
+  monthly-limit gate and the request log behave identically on all of them.
+  What differs per surface is declared in the `Surface` constants: upstream
+  path, usage shape, header policy and error envelope.
 - All proxy errors use the OpenAI body shape `{"error": {...}}`:
   unknown key → **401**; disabled key → **403**; model not in whitelist →
   **404 `model_not_found`**; upstream errors pass through with the original
-  status. Same mapping for `GET /v1/models`.
+  status. Same mapping for `GET /v1/models`. The one exception is
+  `/v1/messages`, whose own rejections use the Anthropic envelope
+  `{"type":"error","error":{"type","message"}}` with an error family derived
+  from the same status; statuses and messages are identical across the two
+  envelopes.
 - Whitelist semantics: `allowed_models` NULL/empty = allow all; exact match
   only. `GET /v1/models` returns the whitelist as an OpenAI list when set;
   proxies the upstream `/v1/models` when NULL.
@@ -147,6 +166,21 @@ migration, never hand-edited DBs.
   `Authorization: Bearer <upstream_key>`; echo the upstream `Content-Type`
   (e.g. `text/event-stream` for SSE). Nothing else hops across unless
   explicitly decided.
+- **Per-route auth and header exception:** chat, Responses and `/v1/models`
+  read the client key from `Authorization: Bearer` only. `/v1/messages` reads
+  it from `x-api-key` (what the Anthropic SDKs send) or from a bearer header,
+  through its own `MessagesAuth` extractor, and its outbound policy
+  (`HeaderPolicy::Anthropic`) puts the upstream key on `x-api-key` and
+  forwards the client's `anthropic-version` (required, and a request without
+  it is rejected at Hydra's boundary instead of spending an upstream
+  round-trip) and `anthropic-beta` (optional, forwarded as sent). The
+  client's own credential header is never among them. No other route reads or
+  forwards `x-api-key`.
+- **Timeouts:** the single `reqwest::Client` in app state carries the
+  connect/read timeouts, and a non-streaming proxied request additionally gets
+  a total cap of `NON_STREAM_TIMEOUT` (300 s in `src/http/proxy.rs`, global
+  for every surface and not configurable). Streaming requests get no total
+  cap, so a long generation is never cut between chunks.
 - Admin routes: HTTP Basic Auth (constant-time compare, env creds) on
   everything under `/admin` except `GET /admin/health` (public liveness).
   Admin errors are plain JSON, not OpenAI-shaped.
@@ -162,6 +196,12 @@ migration, never hand-edited DBs.
   (401 without creds), `/v1/models` both whitelist and NULL→proxy cases,
   cached-token capture on buffered and on streaming responses, and the
   monthly limit gate (an over-budget key gets 429 on both proxy routes).
+- Each proxied surface carries the same list where it applies, plus its own:
+  the Responses usage shape from `response.completed`/`response.incomplete`,
+  Anthropic auth through `x-api-key`, the `anthropic-version` rejection, the
+  `anthropic-beta` hop, the Anthropic envelope on every rejection status, and
+  the Anthropic additive prompt normalization (input plus cache read plus
+  cache write).
 - Test names state the behavior they verify, descriptive snake_case:
   `unknown_key_returns_401`. Wrap awaits in `tokio::time::timeout` so
   deadlocks fail fast instead of hanging CI; every task ends with the three

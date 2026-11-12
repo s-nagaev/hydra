@@ -40,7 +40,7 @@ pub struct PricedChannel {
 impl PricedChannel {
     /// Eligible for monthly key limits: the channel is enabled, its
     /// whitelist resolves to a finite model set, and every model in it
-    /// carries all four prices.
+    /// carries a price entry.
     pub fn limitable(&self) -> bool {
         self.channel.enabled
             && crate::prices::all_models_priced(

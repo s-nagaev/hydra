@@ -1,20 +1,24 @@
 # Hydra
 
-Hydra is a self-hosted, OpenAI-compatible API router. An admin defines upstream
-"channels" (base URL, upstream API key, optional model whitelist), and the
-router issues its own client keys so the upstream secret never leaves the
-server. Clients call `/v1/chat/completions` and `/v1/models` with a Hydra key;
-Hydra resolves the channel bound to that key, substitutes the upstream key,
-forwards the request, and passes the response through unchanged, streaming
-included.
+Hydra is a self-hosted API router for OpenAI- and Anthropic-shaped traffic. An
+admin defines upstream "channels" (base URL, upstream API key, optional model
+whitelist), and the router issues its own client keys so the upstream secret
+never leaves the
+server. Clients call `/v1/chat/completions`, `/v1/responses`, `/v1/messages` or
+`/v1/models` with a Hydra key; Hydra resolves the channel bound to that key,
+substitutes the upstream key, forwards the request, and passes the response
+through unchanged, streaming included.
 
-Status: proof of concept. Chat Completions and `/v1/models` only, one admin
-user, no failover.
+Status: proof of concept. Chat Completions, Responses and Messages passthrough
+plus `/v1/models`, one admin user, no failover.
 
 ## Features
 
 - Chat Completions passthrough, non-streaming and streaming (SSE), with the
   upstream response forwarded byte-for-byte
+- One pipeline behind three request surfaces: OpenAI Chat Completions,
+  OpenAI Responses and Anthropic Messages, each read in its own usage shape so
+  token accounting, cost and the monthly limit gate work the same way
 - `GET /v1/models`: a channel with a whitelist gets a locally built OpenAI
   model list; a channel without one proxies the upstream listing
 - Own client keys with a `hyd-` prefix; only the SHA-256 hash is stored, the
@@ -41,8 +45,8 @@ user, no failover.
   admin UI with status, token usage, duration, client IP, error text and
   the captured bodies
 - Optional prices per model on a channel (USD per 1M tokens, stored as exact
-  integer micro-USD) and an optional monthly spending limit per client key,
-  enforced with a 429 `Monthly limit reached`
+  integer micro-USD), in five rate dimensions, and an optional monthly
+  spending limit per client key, enforced with a 429 `Monthly limit reached`
 - A **Stat** admin tab with month-to-date token usage and computed cost per
   key, broken down by model and selectable by month
 
@@ -60,10 +64,13 @@ cargo run
 The whitelist is optional; omit `allowed_models` to allow every model the
 upstream serves.
 
-The `base_url` may or may not end in `/v1`: Hydra forwards to
-`<base_url>/v1/chat/completions` and drops a redundant `/v1` tail on the
-stored URL, so both `https://api.openai.com` and the OpenAI-SDK style
-`https://api.openai.com/v1` reach the same upstream path.
+The `base_url` may or may not end in `/v1`: Hydra appends the surface's own
+path (`/v1/chat/completions`, `/v1/responses` or `/v1/messages`) and drops a
+redundant `/v1` tail on the stored URL, so both `https://api.openai.com` and
+the OpenAI-SDK style
+`https://api.openai.com/v1` reach the same upstream path. The same channel can
+serve all three surfaces when its upstream does, and a call to a path the
+upstream does not serve comes back as the upstream's own 404.
 
 ```bash
 curl -u admin:change-me -X POST http://127.0.0.1:8080/admin/channels \
@@ -147,6 +154,71 @@ curl http://127.0.0.1:8080/v1/models \
   -H "Authorization: Bearer hyd-4f9dEg2xQ7..."
 ```
 
+The other two surfaces have paths of their own. Responses is OpenAI-shaped and
+authenticates like chat:
+
+```bash
+curl http://127.0.0.1:8080/v1/responses \
+  -H "Authorization: Bearer hyd-4f9dEg2xQ7..." \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "gpt-4o",
+    "input": "Say hello"
+  }'
+```
+
+Messages is Anthropic-shaped: the key rides `x-api-key` and the required
+`anthropic-version` header has to be present, because Hydra forwards the
+version the client states instead of inventing one.
+
+```bash
+curl http://127.0.0.1:8080/v1/messages \
+  -H "x-api-key: hyd-4f9dEg2xQ7..." \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "claude-sonnet-4-5",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "Say hello"}]
+  }'
+```
+
+## Proxy API
+
+| Method | Path | Credential | Upstream format |
+| --- | --- | --- | --- |
+| POST | `/v1/chat/completions` | `Authorization: Bearer hyd-...` | OpenAI Chat Completions |
+| POST | `/v1/responses` | `Authorization: Bearer hyd-...` | OpenAI Responses |
+| POST | `/v1/messages` | `x-api-key: hyd-...` or `Authorization: Bearer hyd-...`, plus the required `anthropic-version` header | Anthropic Messages |
+| GET | `/v1/models` | `Authorization: Bearer hyd-...` | OpenAI model list |
+
+The three POST routes run one pipeline. The 32 MiB body limit, the model
+whitelist, the flood cap, the monthly limit gate and the request log are shared,
+and the upstream response is passed through with its status and body untouched,
+streaming included.
+
+What each surface adds:
+
+- **Responses** forwards to `<base_url>/v1/responses` and reads the Responses
+  usage shape (`input_tokens`, `output_tokens`, `input_tokens_details`), so a
+  Responses call prices and gates like a chat call. Auth is bearer only.
+- **Messages** forwards to `<base_url>/v1/messages`. The key is read from
+  `x-api-key`, the way the Anthropic SDKs send it, or from a bearer header.
+  `anthropic-version` is required on every request and is forwarded as sent;
+  `anthropic-beta` hops across when the client sends it. A request without the
+  version header is answered 400 without an upstream round-trip.
+- Rejections Hydra itself produces on `/v1/messages` use the Anthropic envelope
+  `{"type":"error","error":{"type":"...","message":"..."}}`, because that is
+  what the Anthropic SDKs parse. Chat, Responses and `/v1/models` keep the
+  OpenAI envelope. An upstream error body is never re-shaped on any route.
+- A channel whose upstream does not serve the requested path answers with its
+  own 404, which passes through unchanged.
+
+A non-streaming proxied request is capped at 300 seconds end to end
+(`NON_STREAM_TIMEOUT` in `src/http/proxy.rs`). The value is global, the same for
+all three surfaces, and is not configurable. Streaming requests have no total
+cap, so a long generation is never cut short between chunks.
+
 ## Admin API
 
 All routes under `/admin/*` require HTTP Basic Auth except `GET /admin/health`,
@@ -176,8 +248,10 @@ The binary serves an embedded Swagger UI at
 raw OpenAPI document is at `/api-docs/openapi.json`. The page itself is
 public; authenticated calls still need credentials. Click Authorize and
 enter either the admin login and password (`basic_auth`, for the `/admin/*`
-routes) or a `hyd-` client key (`bearer_auth`, for the `/v1/*` routes), then
-"Try it out" works directly against the running instance. `GET /admin/health`
+routes) or a `hyd-` client key (`bearer_auth`, for the `/v1/*` routes;
+`/v1/messages` also accepts the key in `api_key_auth`, the `x-api-key` header
+its operation lists), then "Try it out" works directly against the running
+instance. `GET /admin/health`
 needs no auth, neither in the UI nor from a client.
 
 ## Admin UI
@@ -220,15 +294,18 @@ request and response bodies, plus a back link that restores the exact
 filters and page of the list view.
 
 Channels carry an optional price table, edited on the channels page as one
-line per model, `model: input, output, cached_input, cached_output`, each
-amount in USD per 1M tokens. The channels table marks a channel "limitable"
-when it is enabled, its model whitelist is set, and every model in that
-whitelist carries all four prices; those prices feed the per-key cost and
+line per model, `model: input, output, cached_input, cached_output,
+cache_write_input`, each amount in USD per 1M tokens. The fifth amount may be
+left off, which leaves the cache-write rate unset; the parser accepts four or
+five amounts and the form renders whatever is stored as five. The channels
+table marks a channel "limitable" when it is enabled, its model whitelist is
+set, and every model in that
+whitelist carries a price entry; those prices feed the per-key cost and
 monthly limit described below.
 
 The Stat tab (`/admin/ui/stats`) shows month-to-date token usage per key,
-grouped by model, with input, output, cached input, cached output, request
-count and computed cost, for a month chosen with a picker or the
+grouped by model, with input, output, cached input, cached output, cache-write
+input, request count and computed cost, for a month chosen with a picker or the
 previous/next links.
 
 ![Keys page](docs/screenshots/keys.png)
@@ -365,7 +442,7 @@ Details that are fixed by design:
   flood evicts an arbitrary live entry). It resets on restart, and `0` for
   `HYDRA_FLOOD_LIMIT` disables the cap entirely.
 
-One ordering caveat: the chat body is buffered (up to the 32 MiB body
+One ordering caveat: a proxied body is buffered (up to the 32 MiB body
 limit) before a missing or bad key is answered, so an unauthenticated
 request always pays the body buffering, and a request whose body exceeds
 32 MiB is rejected with 413 even when its key is also invalid. This is the
@@ -376,29 +453,59 @@ before the key lookup but after the body extractor.
 ## Token usage and monthly limits
 
 Every logged request carries the token counts the upstream reported: prompt,
-completion, and the cached shares of both when the vendor publishes them
-(OpenAI's `prompt_tokens_details.cached_tokens`, DeepSeek's
-`prompt_cache_hit_tokens`). Usage is parsed whether or not `HYDRA_LOG_BODIES`
-captures bodies, for buffered and streaming responses alike: a stream is read
-through a rolling 64 KiB tail window, so the usage object that arrives in the
-final chunk is still parsed however large the response is. A dimension the
-upstream does not report stays NULL and renders as `-` in the log views rather
-than as a zero, and a request with no usage at all is left out of the token
+completion, and the cached shares when the vendor publishes them (OpenAI's
+`prompt_tokens_details.cached_tokens`, DeepSeek's `prompt_cache_hit_tokens`,
+the Responses `input_tokens_details.cached_tokens`, Anthropic's
+`cache_read_input_tokens` and `cache_creation_input_tokens`). Which shape a
+request is read in follows the surface it was sent to: chat, Responses or
+Messages. Usage is parsed whether or not `HYDRA_LOG_BODIES` captures bodies,
+for buffered and streaming responses alike. A buffered response is parsed once;
+on a stream the chat and Responses shapes are read
+through a rolling 64 KiB tail window, so a usage object in the final chunk is
+still parsed however large the response is. The Anthropic stream numbers cannot
+be recovered from a tail, because its input and cache counts arrive in the
+first event, so those events are parsed as they flow past: the input and cache
+counts are kept from `message_start` and the output count is updated from the
+last `message_delta`. A dimension the upstream does not report stays NULL and
+renders as `-` in the log views rather than as a zero, and a request with no
+usage at all is left out of the token
 sums while still counting as a request.
 
 A channel can carry a price table, so a request can be expressed in money. The
 JSON API takes it as `model_prices`, decimal USD per 1M tokens per dimension
-(`input`, `output`, `cached_input`, `cached_output`); the admin UI takes the
-same data as one line per model,
-`model: input, output, cached_input, cached_output`. Prices are stored as
-integer micro-USD per 1M tokens and every cost is computed with integer
-arithmetic, so no float takes part in the numbers the router stores. The cost
-of a request follows OpenAI's convention that `prompt_tokens` already contains
-the cached tokens:
+(`input`, `output`, `cached_input`, `cached_output`, `cache_write_input`); the
+admin UI takes the same data as one line per model,
+`model: input, output, cached_input, cached_output, cache_write_input`. Prices
+are stored as integer micro-USD per 1M tokens and every cost is computed with
+integer arithmetic, so no float takes part in the numbers the router stores.
+
+Five dimensions, four required and one optional. `input`, `output`,
+`cached_input` and `cached_output` are the OpenAI bill. `cache_write_input` is
+the rate for Anthropic cache writes (`cache_creation_input_tokens`), set per
+model and independently of `input`: Anthropic asks more for a token it writes
+into its cache than for a plain input token, and that multiple is provider data
+rather than a constant the router should invent. Omitting it, or sending
+`null`, means the dimension is unset and cache writes are billed at zero, the
+same way a model the channel does not price costs nothing. Entries written
+before the dimension existed keep loading and read as unset.
+
+Two vendor conventions meet in the formula, and both are handled:
+
+- Chat Completions and Responses report `prompt_tokens` including the tokens
+  served from the cache, so the cache dimensions are taken out of the prompt.
+- Anthropic reports input additively: `input_tokens` excludes the cache, so
+  Hydra normalizes the prompt to `input_tokens + cache_read_input_tokens +
+  cache_creation_input_tokens` before costing the request. Without that step a
+  heavily cached call would be underbilled.
+
+Each token then carries exactly one rate: the cached read share at the read
+rate, the cache write share at the write rate, the rest of the prompt at the
+input rate.
 
 ```text
-cost = (prompt - cached_input) * input_price
+cost = (prompt - cached_input - cache_write_input) * input_price
      + cached_input * cached_input_price
+     + cache_write_input * cache_write_input_price
      + completion * output_price
      + cached_output * cached_output_price
      (prices in micro-USD per 1M tokens, the sum divided by 1M once)
@@ -413,15 +520,18 @@ reported no usage contributes nothing.
 month (UTC). The value is decimal USD with at most six decimal places and at
 most $1B, and it is stored as integer micro-USD like every other amount in the
 router; omit it, or send `null`, for an unlimited key. Once the key's
-month-to-date cost reaches the limit, `/v1/chat/completions` and `/v1/models`
-both answer
+month-to-date cost reaches the limit, every proxied route answers
 
 ```json
 {"error": {"message": "Monthly limit reached", "type": "rate_limit_error", "code": null}}
 ```
 
 with status 429, until the month rolls over: the new month starts against an
-empty budget with no timer and no sweep. Here is a key with a 50.00 USD limit
+empty budget with no timer and no sweep. That body is the OpenAI envelope,
+which `/v1/chat/completions`, `/v1/responses` and `/v1/models` use;
+`/v1/messages` answers the same status and message in the Anthropic envelope
+`{"type":"error","error":{"type":"rate_limit_error","message":"Monthly limit
+reached"}}`. Here is a key with a 50.00 USD limit
 in one call:
 
 ```bash
@@ -437,15 +547,19 @@ change to a key, its limit or its existence drops the verdict immediately, so
 a new limit is in force from the key's next logged response.
 
 A limit is enforced only when the bound channel can be priced: the channel
-must be enabled, resolve to a fixed model list, and carry all four prices for
-every model in that list. A limit on a channel that does not qualify is stored
+must be enabled, resolve to a fixed model list, and carry a price entry for
+every model in that list. The optional cache-write rate is not part of the
+precondition, so a channel priced before that dimension existed stays
+limitable; leaving it unset prices cache writes at zero. A limit on a channel
+that does not qualify is stored
 and not enforced, which the admin UI marks with `limit inactive: channel prices
 incomplete` on the keys page and the Stat tab. This is deliberate: prices are
 often filled in after the key is issued.
 
 The Stat tab (`/admin/ui/stats`) is where the numbers are visible: month-to-date
 usage per key, grouped by model, with input, output, cached input, cached output
-tokens, request count and computed cost in USD, plus a total row for all keys.
+and cache-write tokens, request count and computed cost in USD, plus a total row
+for all keys.
 The month is selectable with a picker and previous/next links.
 
 ### Known limitations
@@ -543,8 +657,8 @@ HYDRA_TEST_PG_URL=postgres://postgres:hydra@127.0.0.1:54329/postgres cargo test 
 
 ## Error semantics
 
-Every proxy error uses the OpenAI body shape, so existing client libraries
-can parse it:
+Every rejection Hydra itself produces on the proxy routes uses the OpenAI body
+shape, so existing client libraries can parse it:
 
 ```json
 {"error": {"message": "...", "type": "invalid_request_error", "code": "..."}}
@@ -552,16 +666,25 @@ can parse it:
 
 | Status | Code | When |
 | --- | --- | --- |
+| 400 | null | the body is not JSON, has no string `model`, or (on `/v1/messages`) the `anthropic-version` header is missing |
 | 401 | `invalid_api_key` | missing, malformed, unknown or deleted key |
 | 403 | `key_disabled` | key exists but is disabled |
 | 404 | `model_not_found` | requested model is not in the channel whitelist |
-| 413 | null | chat body over 32 MiB |
+| 413 | null | the proxied body is over 32 MiB |
 | 429 | null | the key reached its monthly limit (`type` is `rate_limit_error`) |
+| 500 | null | a storage failure while resolving the key (`type` is `server_error`) |
 | 502 | null | bound channel is gone, or the upstream could not be reached |
 | 503 | `channel_disabled` | the channel bound to the key is disabled |
 
+`/v1/messages` is the one route whose own rejections use a different envelope:
+the Anthropic shape `{"type":"error","error":{"type":"...","message":"..."}}`,
+because that is what the Anthropic SDKs parse. The statuses above are the same
+on that route, the Anthropic error family replaces the OpenAI `code` field, and
+its mapping runs `invalid_request_error`, `authentication_error`,
+`permission_error`, `rate_limit_error`, `overloaded_error` and `api_error`.
+
 Upstream responses, errors included, pass through with the upstream status and
-body unchanged.
+body unchanged, in whatever shape the upstream wrote.
 
 ## Docker
 
@@ -613,7 +736,6 @@ replace the file in `assets/` and update the version comment in
 
 None of this is implemented yet; it is where Hydra is meant to grow.
 
-- Anthropic Messages API and OpenAI Responses API passthrough
 - Google request and response formats
 - Multi-channel keys: one key bound to several channels with failover
 - Shared limit state across several instances instead of per-process flags

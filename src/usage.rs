@@ -11,7 +11,7 @@
 //! The verdict folds in the channel's limitability, which is the same
 //! property the admin UI badges on a key ([`crate::db::channels::PricedChannel::limitable`]):
 //! a channel is limitable when it is enabled, its whitelist resolves to a
-//! finite model set and every model in it carries all four prices. A key
+//! finite model set and every model in it carries a price entry. A key
 //! whose channel is not limitable, or which has no limit at all, stores the
 //! verdict `false`: the limit is kept but never enforced, which is the
 //! documented behavior for a channel the router cannot price.
@@ -85,6 +85,7 @@ pub fn group_cost(group: &ModelUsage, prices: Option<&ModelPrices>) -> i64 {
         completion: group.completion_tokens,
         cached_input: group.cached_input_tokens,
         cached_output: group.cached_output_tokens,
+        cache_write_input: group.cache_write_input_tokens,
     };
     cost::model_cost(group.model.as_deref(), &totals, prices)
 }
@@ -122,15 +123,22 @@ mod tests {
             }
         }))
         .unwrap();
+        seed_with_prices(db, tag, &prices, limit).await
+    }
+
+    /// The same seed with a price table of the caller's choosing: every
+    /// priced model goes into the whitelist, so the channel is limitable.
+    async fn seed_with_prices(db: &Db, tag: &str, prices: &ModelPrices, limit: Option<i64>) -> i64 {
+        let allowed: Vec<String> = prices.iter().map(|(model, _)| model.clone()).collect();
         let channel = channels::create_with_prices(
             db,
             &NewChannel {
                 name: format!("channel-{tag}"),
                 base_url: "http://127.0.0.1:9".to_string(),
                 api_key: "sk-upstream-secret".to_string(),
-                allowed_models: Some(vec!["gpt-4o".to_string()]),
+                allowed_models: Some(allowed),
             },
-            Some(&prices),
+            Some(prices),
         )
         .await
         .unwrap();
@@ -164,11 +172,24 @@ mod tests {
             completion_tokens: Some(200),
             cached_input_tokens: Some(400),
             cached_output_tokens: None,
+            cache_write_input_tokens: None,
             duration_ms: 1,
             request_body: None,
             response_body: None,
             error: None,
             client_ip: None,
+        }
+    }
+
+    /// One Anthropic request: 1000 uncached input tokens, 250 read from the
+    /// cache and 50 written to it, so the stored prompt is 1300, plus 200
+    /// completion tokens.
+    fn logged_cache_write_request(key_id: i64, channel_id: i64) -> NewRequestLog {
+        NewRequestLog {
+            prompt_tokens: Some(1300),
+            cached_input_tokens: Some(250),
+            cache_write_input_tokens: Some(50),
+            ..logged_request(key_id, channel_id)
         }
     }
 
@@ -265,6 +286,106 @@ mod tests {
             Some(false),
             "one micro-USD above the spend is not crossed"
         );
+    }
+
+    /// A table that prices the write dimension at 1.25 times the input rate,
+    /// the Anthropic shape, but as an independently set number.
+    fn write_priced_prices() -> ModelPrices {
+        ModelPrices::from_usd_json(&serde_json::json!({
+            "gpt-4o": {
+                "input": "2.50",
+                "output": "10.00",
+                "cached_input": "1.25",
+                "cached_output": "5.00",
+                "cache_write_input": "3.125"
+            }
+        }))
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cache_write_request_trips_the_gate_at_the_write_rate() {
+        let db = test_db().await;
+        let prices = write_priced_prices();
+        // The logged Anthropic request costs 1000 * 2.50 + 250 * 1.25 +
+        // 50 * 3.125 + 200 * 10.00 USD per 1M tokens: 4968.75 micro-USD,
+        // which floors to 4968. A limit of 4968 is already crossed.
+        let key_id = seed_with_prices(&db, "cache-write-gate", &prices, Some(4_968)).await;
+        let flags = LimitFlags::default();
+        request_logs::insert(&db, &logged_cache_write_request(key_id, 1))
+            .await
+            .unwrap();
+
+        // The aggregate prices the write dimension exactly as the pinned
+        // formula does, which is what makes the gate accurate for writes.
+        let groups = request_logs::month_to_date_usage(&db, key_id, &Month::current())
+            .await
+            .unwrap();
+        assert_eq!(month_cost(&groups, Some(&prices)), 4_968);
+
+        recompute(&db, &flags, key_id).await.unwrap();
+        assert_eq!(
+            flags.get(key_id, bucket_now()),
+            Some(true),
+            "the write tokens are part of the spend, so the limit is crossed"
+        );
+
+        // One micro-USD of headroom and the same request stays under the
+        // limit, pinning the exact figure the write dimension produces.
+        keys::patch(
+            &db,
+            key_id,
+            &keys::KeyPatch {
+                name: None,
+                enabled: None,
+                monthly_limit_micro_usd: Some(Some(4_969)),
+            },
+        )
+        .await
+        .unwrap();
+        recompute(&db, &flags, key_id).await.unwrap();
+        assert_eq!(flags.get(key_id, bucket_now()), Some(false));
+    }
+
+    #[tokio::test]
+    async fn a_channel_without_a_write_price_gates_a_cache_write_request_at_the_base_rate() {
+        let db = test_db().await;
+        // The same request on a table that names no write rate: the 50 write
+        // tokens contribute nothing, so the spend is 1000 * 2.50 +
+        // 250 * 1.25 + 200 * 10.00 = 4812.5, flooring to 4812. The gate is
+        // still exact for the price table in force, which is the documented
+        // reading of an unset dimension.
+        let prices = ModelPrices::from_usd_json(&serde_json::json!({
+            "gpt-4o": {
+                "input": "2.50",
+                "output": "10.00",
+                "cached_input": "1.25",
+                "cached_output": "5.00"
+            }
+        }))
+        .unwrap();
+        let key_id = seed_with_prices(&db, "no-write-price", &prices, Some(4_812)).await;
+        let flags = LimitFlags::default();
+        request_logs::insert(&db, &logged_cache_write_request(key_id, 1))
+            .await
+            .unwrap();
+
+        recompute(&db, &flags, key_id).await.unwrap();
+        assert_eq!(flags.get(key_id, bucket_now()), Some(true));
+
+        keys::patch(
+            &db,
+            key_id,
+            &keys::KeyPatch {
+                name: None,
+                enabled: None,
+                monthly_limit_micro_usd: Some(Some(4_813)),
+            },
+        )
+        .await
+        .unwrap();
+        recompute(&db, &flags, key_id).await.unwrap();
+        assert_eq!(flags.get(key_id, bucket_now()), Some(false));
     }
 
     #[tokio::test]
@@ -366,6 +487,7 @@ mod tests {
                 completion_tokens: 1000,
                 cached_input_tokens: 0,
                 cached_output_tokens: 0,
+                cache_write_input_tokens: 0,
                 requests: 1,
             },
             ModelUsage {
@@ -374,6 +496,7 @@ mod tests {
                 completion_tokens: 999_999,
                 cached_input_tokens: 0,
                 cached_output_tokens: 0,
+                cache_write_input_tokens: 0,
                 requests: 1,
             },
         ];

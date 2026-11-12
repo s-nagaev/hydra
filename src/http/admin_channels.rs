@@ -80,14 +80,16 @@ pub struct CreateChannelRequest {
     #[schema(example = json!(["gpt-4o", "gpt-4o-mini"]))]
     pub allowed_models: Option<Vec<String>>,
     /// Prices for this channel, object keyed by model name. Each model needs
-    /// all four dimensions: `input`, `output`, `cached_input` and
+    /// four dimensions, `input`, `output`, `cached_input` and
     /// `cached_output`, given in USD per 1M tokens as decimal strings (or
-    /// numbers) with at most six decimal places. Amounts that cannot be
-    /// stored exactly as a whole number of micro-USD are rejected with 400,
-    /// never rounded. Omitted or null stores no prices, and an empty object
-    /// does the same. When `allowed_models` is set, every priced model must
-    /// be part of it. Responses return the same object with the amounts
-    /// converted to integer micro-USD per 1M tokens.
+    /// numbers) with at most six decimal places; the optional fifth,
+    /// `cache_write_input`, is the rate for Anthropic cache creation tokens
+    /// and may be omitted or null, which prices those tokens at nothing.
+    /// Amounts that cannot be stored exactly as a whole number of micro-USD
+    /// are rejected with 400, never rounded. Omitted or null stores no
+    /// prices, and an empty object does the same. When `allowed_models` is
+    /// set, every priced model must be part of it. Responses return the same
+    /// object with the amounts converted to integer micro-USD per 1M tokens.
     #[serde(default)]
     #[schema(
         value_type = Object,
@@ -96,7 +98,8 @@ pub struct CreateChannelRequest {
                 "input": "2.50",
                 "output": "10.00",
                 "cached_input": "1.25",
-                "cached_output": "5.00"
+                "cached_output": "5.00",
+                "cache_write_input": "3.125"
             }
         })
     )]
@@ -134,7 +137,8 @@ pub struct PatchChannelRequest {
                 "input": "0.15",
                 "output": "0.60",
                 "cached_input": "0.075",
-                "cached_output": "0.30"
+                "cached_output": "0.30",
+                "cache_write_input": "0.375"
             }
         })
     )]
@@ -159,6 +163,11 @@ pub struct ModelPriceView {
     /// Cached prompt tokens written back to the upstream cache.
     #[schema(example = 5_000_000)]
     pub cached_output: u64,
+    /// Prompt tokens the upstream wrote into its cache, billed at this rate
+    /// instead of the input rate for those tokens; zero when the price entry
+    /// names no write rate.
+    #[schema(example = 3_125_000)]
+    pub cache_write_input: u64,
 }
 
 impl From<&ModelPrice> for ModelPriceView {
@@ -168,6 +177,7 @@ impl From<&ModelPrice> for ModelPriceView {
             output: price.output,
             cached_input: price.cached_input,
             cached_output: price.cached_output,
+            cache_write_input: price.cache_write_input,
         }
     }
 }
@@ -363,7 +373,8 @@ fn validate_common(
                             "input": "2.50",
                             "output": "10.00",
                             "cached_input": "1.25",
-                            "cached_output": "5.00"
+                            "cached_output": "5.00",
+                            "cache_write_input": "3.125"
                         },
                         "gpt-4o-mini": {
                             "input": "0.15",
@@ -567,7 +578,8 @@ pub async fn get_one(
                             "input": "2.50",
                             "output": "10.00",
                             "cached_input": "1.25",
-                            "cached_output": "5.00"
+                            "cached_output": "5.00",
+                            "cache_write_input": "3.125"
                         }
                     }
                 })
@@ -1002,7 +1014,8 @@ mod tests {
     }
 
     /// A channel with prices stored as integer micro-USD, exactly as the
-    /// API returns them.
+    /// API returns them. The write dimension is set, so the round trip
+    /// covers all five.
     fn priced_body() -> Value {
         json!({
             "name": "primary",
@@ -1014,7 +1027,8 @@ mod tests {
                     "input": "2.50",
                     "output": "10.00",
                     "cached_input": "1.25",
-                    "cached_output": "5.00"
+                    "cached_output": "5.00",
+                    "cache_write_input": "3.125"
                 }
             }
         })
@@ -1032,7 +1046,8 @@ mod tests {
                     "input": 2_500_000,
                     "output": 10_000_000,
                     "cached_input": 1_250_000,
-                    "cached_output": 5_000_000
+                    "cached_output": 5_000_000,
+                    "cache_write_input": 3_125_000
                 }
             })
         );
@@ -1108,7 +1123,8 @@ mod tests {
                     "input": 150_000,
                     "output": 600_000,
                     "cached_input": 75_000,
-                    "cached_output": 300_000
+                    "cached_output": 300_000,
+                    "cache_write_input": 0
                 }
             })
         );
@@ -1157,6 +1173,8 @@ mod tests {
             json!({ "gpt-4o": { "input": "1", "output": "1", "cached_input": "1" } }),
             json!({ "gpt-4o": { "input": "1", "output": "1", "cached_input": "1", "cached_output": "1", "extra": "1" } }),
             json!({ "gpt-4o": { "input": true, "output": "1", "cached_input": "1", "cached_output": "1" } }),
+            json!({ "gpt-4o": { "input": "1", "output": "1", "cached_input": "1", "cached_output": "1", "cache_write_input": "abc" } }),
+            json!({ "gpt-4o": { "input": "1", "output": "1", "cached_input": "1", "cached_output": "1", "cache_write_input": "0.0000005" } }),
         ] {
             let mut body = create_body();
             body["model_prices"] = prices.clone();

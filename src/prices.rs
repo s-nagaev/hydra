@@ -10,17 +10,49 @@
 //! representation instead of rounding them.
 //!
 //! A [`ModelPrices`] value can only be built through a validating
-//! constructor, so an instance in hand is always well formed: four
+//! constructor, so an instance in hand is always well formed: five
 //! dimensions per model, every amount an exact non-negative integer.
+//!
+//! Five dimensions, four required and one optional. `input`, `output`,
+//! `cached_input` and `cached_output` are the OpenAI bill: prompt tokens at
+//! the full rate, completions, prompt tokens served from the upstream cache
+//! and cached completions. `cache_write_input` is the rate for Anthropic
+//! cache WRITES (micro-USD per 1M tokens for
+//! `cache_creation_input_tokens`), the dimension the write tokens are billed
+//! at: Anthropic asks more for a write than for a plain input token, and
+//! that difference lives in the number the admin enters here rather than in
+//! a hard-coded multiple of `input`, so the table can carry the provider's
+//! real figure. A model that reports no cache writes never charges this
+//! dimension, which is why it may be omitted: an absent (or explicit `null`)
+//! `cache_write_input` means "no write price set" and contributes zero,
+//! exactly like an unpriced model costs zero. Entries stored before the
+//! dimension existed carry the other four and keep loading, with the write
+//! dimension reading as zero.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The four dimensions every priced model must define, in the order the
-/// admin UI asks for them.
-pub const DIMENSIONS: [&str; 4] = ["input", "output", "cached_input", "cached_output"];
+/// The name of the one optional price dimension: prompt tokens the upstream
+/// wrote into its cache. Absent or null means no write price is set, which
+/// contributes nothing to a cost rather than inventing a rate.
+pub const CACHE_WRITE_INPUT: &str = "cache_write_input";
+
+/// Every price dimension, in the order the admin UI asks for them. All but
+/// [`CACHE_WRITE_INPUT`] are required on a stored entry.
+pub const DIMENSIONS: [&str; 5] = [
+    "input",
+    "output",
+    "cached_input",
+    "cached_output",
+    CACHE_WRITE_INPUT,
+];
+
+/// `true` for the one dimension an entry may leave out.
+fn is_optional_dimension(dimension: &str) -> bool {
+    dimension == CACHE_WRITE_INPUT
+}
 
 /// Micro-USD per 1M tokens for one model on one channel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +62,14 @@ pub struct ModelPrice {
     pub output: u64,
     pub cached_input: u64,
     pub cached_output: u64,
+    /// The rate Anthropic cache-write tokens (`cache_creation_input_tokens`)
+    /// are billed at, independent of `input`: a write costs more than a
+    /// plain input token, and the real figure comes from here. Zero when the
+    /// entry names no write rate, which is also what a stored entry written
+    /// before the dimension existed reads as, so a four-dimension table
+    /// keeps loading unchanged.
+    #[serde(default)]
+    pub cache_write_input: u64,
 }
 
 /// The price table of one channel, keyed by model name.
@@ -37,9 +77,9 @@ pub struct ModelPrice {
 pub struct ModelPrices(BTreeMap<String, ModelPrice>);
 
 impl ModelPrices {
-    /// Reads the stored column shape: model name to four integer
-    /// dimensions. Corrupt or non-integer content is an error, never a
-    /// silently repaired table.
+    /// Reads the stored column shape: model name to integer micro-USD
+    /// dimensions, the write dimension optional. Corrupt or non-integer
+    /// content is an error, never a silently repaired table.
     pub fn from_stored_json(raw: &str) -> Result<Self, ModelPricesError> {
         let table: BTreeMap<String, ModelPrice> =
             serde_json::from_str(raw).map_err(|error| ModelPricesError::Stored {
@@ -49,7 +89,9 @@ impl ModelPrices {
     }
 
     /// Reads the external admin shape: model name to USD amounts per 1M
-    /// tokens, each an exact decimal string or number.
+    /// tokens, each an exact decimal string or number. The four OpenAI
+    /// dimensions are required; `cache_write_input` may be omitted or null,
+    /// which leaves the write price unset.
     pub fn from_usd_json(value: &Value) -> Result<Self, ModelPricesError> {
         let Value::Object(entries) = value else {
             return Err(ModelPricesError::NotAnObject);
@@ -74,12 +116,24 @@ impl ModelPrices {
             }
             let mut micro = [0u64; DIMENSIONS.len()];
             for (index, dimension) in DIMENSIONS.iter().enumerate() {
-                let Some(amount) = dimensions.get(*dimension) else {
-                    return Err(ModelPricesError::MissingDimension {
-                        model: model.clone(),
-                        dimension,
-                    });
+                let amount = match dimensions.get(*dimension) {
+                    Some(amount) => amount,
+                    // Only the write dimension may be left out: an entry
+                    // without it prices no cache writes.
+                    None if is_optional_dimension(dimension) => continue,
+                    None => {
+                        return Err(ModelPricesError::MissingDimension {
+                            model: model.clone(),
+                            dimension,
+                        })
+                    }
                 };
+                // The same dimension also takes an explicit null as "no
+                // price set", so a client can clear it without dropping the
+                // key from the object.
+                if is_optional_dimension(dimension) && amount.is_null() {
+                    continue;
+                }
                 micro[index] = parse_usd_amount(amount, model, dimension)?;
             }
             table.insert(
@@ -89,6 +143,7 @@ impl ModelPrices {
                     output: micro[1],
                     cached_input: micro[2],
                     cached_output: micro[3],
+                    cache_write_input: micro[4],
                 },
             );
         }
@@ -265,7 +320,7 @@ pub enum ModelPricesError {
     NotAnObject,
     #[error(
         "model_prices entry for \"{model}\" must be an object with input, output, cached_input \
-         and cached_output"
+         and cached_output, plus an optional cache_write_input"
     )]
     BadEntry { model: String },
     #[error("model_prices entry for \"{model}\" is missing \"{dimension}\"")]
@@ -351,8 +406,67 @@ mod tests {
         assert_eq!(entry.output, 10_000_000);
         assert_eq!(entry.cached_input, 1_250_000);
         assert_eq!(entry.cached_output, 5_000_000);
+        assert_eq!(
+            entry.cache_write_input, 0,
+            "an entry that names no write price prices no writes"
+        );
         assert_eq!(prices.len(), 1);
         assert!(!prices.is_empty());
+    }
+
+    #[test]
+    fn the_cache_write_dimension_is_read_from_the_usd_shape() {
+        let prices = usd(json!({
+            "claude-opus-4": {
+                "input": "15.00",
+                "output": 75,
+                "cached_input": "1.50",
+                "cached_output": "0.00",
+                "cache_write_input": "18.75"
+            }
+        }))
+        .unwrap();
+        let entry = prices.get("claude-opus-4").unwrap();
+        assert_eq!(entry.input, 15_000_000);
+        assert_eq!(entry.output, 75_000_000);
+        assert_eq!(entry.cached_input, 1_500_000);
+        assert_eq!(entry.cached_output, 0);
+        assert_eq!(
+            entry.cache_write_input, 18_750_000,
+            "the write price is set independently, never derived from input"
+        );
+    }
+
+    #[test]
+    fn an_absent_or_null_cache_write_price_leaves_the_dimension_unpriced() {
+        let base = json!({
+            "input": "1.00",
+            "output": "2.00",
+            "cached_input": "0.50",
+            "cached_output": "1.00"
+        });
+        let mut absent = base.clone();
+        absent["cache_write_input"] = json!(null);
+        for entry in [base, absent] {
+            let prices = usd(json!({ "m": entry })).unwrap();
+            assert_eq!(
+                prices.get("m").unwrap().cache_write_input,
+                0,
+                "no write price means this dimension contributes nothing"
+            );
+        }
+        // A null where a dimension is required is still malformed, not a
+        // silent zero.
+        let error = usd(json!({
+            "m": {
+                "input": null,
+                "output": "2.00",
+                "cached_input": "0.50",
+                "cached_output": "1.00"
+            }
+        }))
+        .unwrap_err();
+        assert!(matches!(error, ModelPricesError::BadUsd { .. }), "{error}");
     }
 
     #[test]
@@ -423,6 +537,29 @@ mod tests {
             }
         ));
 
+        // The write dimension is the one an entry may leave out; every other
+        // one missing is still an error.
+        let error = usd(json!({
+            "m": { "output": "1", "cached_input": "1", "cached_output": "1" }
+        }))
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ModelPricesError::MissingDimension {
+                dimension: "input",
+                ..
+            }
+        ));
+        assert!(usd(json!({
+            "m": {
+                "input": "1",
+                "output": "1",
+                "cached_input": "1",
+                "cached_output": "1"
+            }
+        }))
+        .is_ok());
+
         let error = usd(json!({
             "m": { "input": "1", "output": "1", "cached_input": "1", "cached_output": "1", "x": "1" }
         }))
@@ -450,16 +587,46 @@ mod tests {
     #[test]
     fn stored_json_round_trips_through_the_integer_shape() {
         let prices = usd(json!({
-            "gpt-4o": { "input": "2.5", "output": "10", "cached_input": "1.25", "cached_output": "5" }
+            "gpt-4o": {
+                "input": "2.5",
+                "output": "10",
+                "cached_input": "1.25",
+                "cached_output": "5",
+                "cache_write_input": "3.125"
+            }
         }))
         .unwrap();
         let stored = prices.to_stored_json();
         assert_eq!(
             stored,
             "{\"gpt-4o\":{\"input\":2500000,\"output\":10000000,\"cached_input\":1250000,\
-             \"cached_output\":5000000}}"
+             \"cached_output\":5000000,\"cache_write_input\":3125000}}"
         );
         assert_eq!(ModelPrices::from_stored_json(&stored).unwrap(), prices);
+    }
+
+    #[test]
+    fn a_stored_table_without_the_write_dimension_keeps_loading() {
+        // Entries written before the dimension existed carry four keys and
+        // must read back as "no write price", never as a decode failure.
+        let stored = r#"{"gpt-4o":{"input":2500000,"output":10000000,"cached_input":1250000,"cached_output":5000000}}"#;
+        let prices = ModelPrices::from_stored_json(stored).unwrap();
+        let entry = prices.get("gpt-4o").unwrap();
+        assert_eq!(entry.input, 2_500_000);
+        assert_eq!(entry.cache_write_input, 0);
+
+        // The write dimension is written back on the next store, so the
+        // table converges on the five-dimension shape.
+        assert!(prices.to_stored_json().contains("\"cache_write_input\":0"));
+        // A null in the stored shape is a corrupt entry, not a zero: the
+        // integer column is the only thing the parser accepts.
+        assert!(matches!(
+            ModelPrices::from_stored_json(
+                r#"{"gpt-4o":{"input":1,"output":1,"cached_input":1,"cached_output":1,"cache_write_input":null}}"#
+            )
+            .unwrap_err(),
+            ModelPricesError::Stored { .. }
+        ));
     }
 
     #[test]

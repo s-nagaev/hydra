@@ -149,6 +149,21 @@ pub fn router(state: AppState) -> Router {
                 // `ChatBody` extractor inside the handler.
                 .layer(DefaultBodyLimit::max(proxy::CHAT_BODY_LIMIT)),
         )
+        // The Responses surface runs the same passthrough pipeline as chat
+        // and needs its own copy of the layer, `DefaultBodyLimit` being
+        // per-route: without it this route would answer requests between 2
+        // and 32 MiB with a 413 the chat route accepts.
+        .route(
+            "/v1/responses",
+            post(proxy::responses).layer(DefaultBodyLimit::max(proxy::CHAT_BODY_LIMIT)),
+        )
+        // The Anthropic Messages surface: the same pipeline again, with its
+        // own body limit for the same reason and its credential in the
+        // `x-api-key` header the Messages SDKs send.
+        .route(
+            "/v1/messages",
+            post(proxy::messages).layer(DefaultBodyLimit::max(proxy::CHAT_BODY_LIMIT)),
+        )
         .route("/v1/models", get(proxy::models))
         .with_state(state)
         .merge(swagger)
