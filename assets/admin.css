@@ -761,29 +761,109 @@ td.key-cell {
   max-width: 260px;
 }
 
+/* The clipped box is the span, and it may not be wider than the cell that
+   holds it: a fixed cap that is wider than the column (the 260px this used to
+   be) adds its excess to the page, which then scrolls sideways. */
 .error-cell span {
   display: inline-block;
-  max-width: 260px;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   vertical-align: bottom;
 }
 
+/* The logs table carries eleven columns, and with every cell a single
+   unbreakable line it does not fit the card: at 14px the longest token of each
+   column alone sums to 1519px against 990px of card, and the table measured
+   1844px, which pushed the page 719-899px wider than the viewport because the
+   card is not a scroll container. It now uses the same fixed layout as the
+   channels and keys tables, so the table is exactly as wide as the card at
+   every viewport and the values wrap or clip inside their own column. */
+.logs-table {
+  table-layout: fixed;
+}
+
+/* Each share is what its column needs at 1000px, where the card content is
+   910px, so the sum is exactly 100%. Two rules decide a share: the value must
+   not lose its tail to the clip, and the header label must stay on one line
+   (measured: the 20-char timestamp needs 93.6px of cell content, the 16-char
+   key prefix 124.8px, an IPv4 address 62.4px, and the `Cached in/out` label
+   alone needs 106.1px of column). */
+.logs-table th:nth-child(1) {
+  width: 11.8%; /* Time (UTC) */
+}
+
+.logs-table th:nth-child(2) {
+  width: 15.3%; /* Key */
+}
+
+.logs-table th:nth-child(3) {
+  width: 7.8%; /* Channel */
+}
+
+.logs-table th:nth-child(4) {
+  width: 7.8%; /* Model */
+}
+
+.logs-table th:nth-child(5) {
+  width: 6.2%; /* Status */
+}
+
+.logs-table th:nth-child(6) {
+  width: 8%; /* Tokens */
+}
+
+.logs-table th:nth-child(7) {
+  width: 11.8%; /* Cached in/out */
+}
+
+.logs-table th:nth-child(8) {
+  width: 8.3%; /* Duration */
+}
+
+.logs-table th:nth-child(9) {
+  width: 8.3%; /* Client IP */
+}
+
+.logs-table th:nth-child(10) {
+  width: 7.4%; /* Bodies */
+}
+
+.logs-table th:nth-child(11) {
+  width: 7.3%; /* Error */
+}
+
+/* The shares above are sized for this padding. */
+.logs-table th,
 .logs-table td {
-  white-space: nowrap;
+  padding: 8px 6px;
 }
 
-/* A column with more data than the card can hold is squeezed to fit, and a
-   header cell wraps in that squeeze: the two longest labels used to stack over
-   two and three lines and left a tall band above the rows. The labels are
-   short now, and a header cell never wraps, so the band is one line tall
-   whatever the columns do. */
+/* A value that contains a space or a hyphen wraps; one that contains neither
+   (an IPv6 address, a long number) has no break opportunity and is clipped by
+   the cell instead of widening it. */
+.logs-table td {
+  white-space: normal;
+  overflow: hidden;
+}
+
+/* Values that are one long word: a key label, a channel name, a model id.
+   They break inside the word rather than lose their tail to the clip. */
+.logs-table td.cell-wrap {
+  overflow-wrap: anywhere;
+}
+
+/* An IPv6 address has no break opportunity at all, so this column wraps
+   nowhere and ellipsizes what does not fit. */
+.logs-table td.ip-cell {
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* The labels are short now, so a header cell wraps inside a narrow column
+   rather than holding the table wider than the card. */
 .logs-table thead th {
-  white-space: nowrap;
-}
-
-.logs-table td.error-cell {
   white-space: normal;
 }
 

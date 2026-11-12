@@ -511,7 +511,7 @@ async fn client_ip_column_renders_the_ip_or_a_dash() {
     assert!(body.contains("Client IP"));
     assert!(body.contains("198.51.100.5"));
     // The row without a captured IP shows the muted dash placeholder.
-    assert!(body.contains(r#"<td class="mono"><span class="text-muted">-</span></td>"#));
+    assert!(body.contains(r#"<td class="mono ip-cell"><span class="text-muted">-</span></td>"#));
 }
 
 #[tokio::test]
