@@ -50,68 +50,66 @@
     </div>
   </form>
   {% endif %}
-  <div class="table-scroll">
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>Prefix</th>
-          <th>Name</th>
-          <th>Channel</th>
-          <th>Monthly limit</th>
-          <th>State</th>
-          <th>Created</th>
-          <th class="actions-col">Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% if rows.is_empty() %}
-        <tr>
-          <td colspan="7" class="empty-state">No keys yet. Issue one to start routing requests.</td>
-        </tr>
-        {% else %}
-        {% for row in rows %}
-        <tr>
-          <td class="mono">{{ row.display_prefix }}</td>
-          <td>{% if let Some(name) = row.name %}{{ name }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
-          <td>{{ row.channel_name }}</td>
-          <td>
-            {% match row.monthly_limit %}
-            {% when Some with (limit) %}
-            <span class="mono">{{ limit }}</span>
-            {% if row.limit_inactive %}<span class="badge off" title="the limit is stored but not enforced while the channel has no complete price list">limit inactive: channel prices incomplete</span>{% endif %}
-            {% when None %}<span class="text-muted">-</span>{% endmatch %}
-          </td>
-          <td>
-            {% if row.deleted %}<span class="badge deleted">deleted</span>
-            {% else %}{% if row.enabled %}<span class="badge ok">enabled</span>
-            {% else %}<span class="badge off">disabled</span>{% endif %}{% endif %}
-          </td>
-          <td>{{ row.created_at }}</td>
-          <td class="actions-col">
-            {% if row.deleted %}
-            <span class="text-muted">-</span>
-            {% else %}
-            <button type="button"
-              hx-get="/admin/ui/keys/{{ row.id }}/edit"
-              hx-target="#keys-panel"
-              hx-swap="outerHTML">Edit</button>
-            <form class="inline" hx-post="/admin/ui/keys/{{ row.id }}/toggle"
-              hx-target="#keys-panel" hx-swap="outerHTML">
-              <input type="hidden" name="enabled" value="{% if row.enabled %}false{% else %}true{% endif %}">
-              <button type="submit">{% if row.enabled %}Disable{% else %}Enable{% endif %}</button>
-            </form>
-            <form class="inline" hx-post="/admin/ui/keys/{{ row.id }}/delete"
-              hx-target="#keys-panel" hx-swap="outerHTML"
-              hx-confirm="Delete this key? Request logs referencing it are preserved.">
-              <button type="submit" class="danger">Delete</button>
-            </form>
-            {% endif %}
-          </td>
-        </tr>
-        {% endfor %}
-        {% endif %}
-      </tbody>
-    </table>
-  </div>
+  <table class="data-table keys-table">
+    <thead>
+      <tr>
+        <th>Prefix</th>
+        <th>Name</th>
+        <th>Channel</th>
+        <th>Monthly limit</th>
+        <th>State</th>
+        <th>Created</th>
+        <th class="actions-col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if rows.is_empty() %}
+      <tr>
+        <td colspan="7" class="empty-state">No keys yet. Issue one to start routing requests.</td>
+      </tr>
+      {% else %}
+      {% for row in rows %}
+      <tr>
+        <td class="mono">{{ row.display_prefix }}</td>
+        <td class="cell-wrap">{% if let Some(name) = row.name %}{{ name }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+        <td class="cell-wrap">{{ row.channel_name }}</td>
+        <td>
+          {% match row.monthly_limit %}
+          {% when Some with (limit) %}
+          <span class="mono">{{ limit }}</span>
+          {% if row.limit_inactive %}<span class="badge off" title="the limit is stored but not enforced while the channel has no complete price list">limit inactive: channel prices incomplete</span>{% endif %}
+          {% when None %}<span class="text-muted">-</span>{% endmatch %}
+        </td>
+        <td>
+          {% if row.deleted %}<span class="badge deleted">deleted</span>
+          {% else %}{% if row.enabled %}<span class="badge ok">enabled</span>
+          {% else %}<span class="badge off">disabled</span>{% endif %}{% endif %}
+        </td>
+        <td>{{ row.created_at }}</td>
+        <td class="actions-col">
+          {% if row.deleted %}
+          <span class="text-muted">-</span>
+          {% else %}
+          <button type="button"
+            hx-get="/admin/ui/keys/{{ row.id }}/edit"
+            hx-target="#keys-panel"
+            hx-swap="outerHTML">Edit</button>
+          <form class="inline" hx-post="/admin/ui/keys/{{ row.id }}/toggle"
+            hx-target="#keys-panel" hx-swap="outerHTML">
+            <input type="hidden" name="enabled" value="{% if row.enabled %}false{% else %}true{% endif %}">
+            <button type="submit">{% if row.enabled %}Disable{% else %}Enable{% endif %}</button>
+          </form>
+          <form class="inline" hx-post="/admin/ui/keys/{{ row.id }}/delete"
+            hx-target="#keys-panel" hx-swap="outerHTML"
+            hx-confirm="Delete this key? Request logs referencing it are preserved.">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+    </tbody>
+  </table>
   {% include "partials/reveal_modal.html" %}
 </section>

@@ -143,13 +143,6 @@ body {
   background: #fafbfc;
 }
 
-/* A table whose nowrap columns need more room than the card has scrolls inside
-   it. Without this the auto layout keeps the table at its minimum content width
-   and the rows, the header rule and the buttons spill past the card border. */
-.table-scroll {
-  overflow-x: auto;
-}
-
 .actions-col {
   text-align: right;
   white-space: nowrap;
@@ -180,6 +173,114 @@ td.actions-col > * {
 
 .actions-col form.inline {
   margin-left: 8px;
+}
+
+/* The channels and keys tables take the card's width and never more: a fixed
+   layout puts every column on a share of that width, so the tables follow the
+   viewport instead of outgrowing it, and no scroll container is needed. The
+   shares are the width each column needs for its own content at the narrowest
+   supported viewport (1000px): the masked key, the badges and the action
+   buttons stay on one line, and the wrapping cells (base URL, price runs,
+   names) take the rest. */
+
+.channels-table,
+.keys-table {
+  table-layout: fixed;
+}
+
+.channels-table th:nth-child(1) {
+  width: 8.5%;
+}
+
+.channels-table th:nth-child(2) {
+  width: 8%;
+}
+
+.channels-table th:nth-child(3) {
+  width: 11.5%;
+}
+
+.channels-table th:nth-child(4) {
+  width: 11%;
+}
+
+.channels-table th:nth-child(5) {
+  width: 14%;
+}
+
+.channels-table th:nth-child(6) {
+  width: 11.5%;
+}
+
+.channels-table th:nth-child(7) {
+  width: 9.5%;
+}
+
+.channels-table th:nth-child(8) {
+  width: 26%;
+}
+
+.keys-table th:nth-child(1) {
+  width: 12%;
+}
+
+.keys-table th:nth-child(2) {
+  width: 13.5%;
+}
+
+.keys-table th:nth-child(3) {
+  width: 12%;
+}
+
+.keys-table th:nth-child(4) {
+  width: 14.5%;
+}
+
+.keys-table th:nth-child(5) {
+  width: 9.5%;
+}
+
+.keys-table th:nth-child(6) {
+  width: 12%;
+}
+
+.keys-table th:nth-child(7) {
+  width: 26.5%;
+}
+
+/* Cells whose content has no wrap opportunity of its own (a channel name, a
+   base URL, a key's name): break inside the value rather than widen the
+   column. */
+.cell-wrap {
+  overflow-wrap: anywhere;
+}
+
+/* The rate run `15.00/75.00/1.50/75.00/18.75` is a single word, so a narrow
+   column would hold the table wider than the card; it wraps onto a
+   continuation line instead. */
+.prices-cell {
+  overflow-wrap: anywhere;
+}
+
+/* Narrower viewports keep the same shares with tighter cell padding and
+   tighter action controls, so the buttons stay on one line. Only these two
+   tables are affected: the shares above are sized for this padding, and the
+   logs and stats tables keep the roomier cells. */
+@media (max-width: 1100px) {
+  .channels-table th,
+  .channels-table td,
+  .keys-table th,
+  .keys-table td {
+    padding: 8px 6px;
+  }
+
+  td.actions-col button {
+    padding: 7px 12px;
+  }
+
+  .actions-col form.inline {
+    margin-left: 6px;
+  }
 }
 
 .empty-state {
@@ -426,14 +527,12 @@ td.key-cell {
   white-space: nowrap;
 }
 
-/* One model per line, five rates on that one line. At the default cell size the
-   rate run reads as a wall of digits, and the browser breaks it across three
-   sub-lines; a slightly smaller face with more leading, held on a single line
-   per model, keeps a multi-model channel scannable. */
+/* One model per line, five rates on that line. The line wraps when the column
+   is narrower than the run of rates: keeping the table inside the card matters
+   more than holding each rate run on a single line. */
 .price-line {
   font-size: 12.5px;
   line-height: 1.6;
-  white-space: nowrap;
 }
 
 .model-badge {
@@ -444,7 +543,9 @@ td.key-cell {
   padding: 1px 6px;
   font-size: 12.5px;
   margin: 1px 2px 1px 0;
-  white-space: nowrap;
+  /* A model name carries hyphens, so a narrow column wraps it inside the badge
+     instead of pushing the column wider. */
+  overflow-wrap: anywhere;
 }
 
 /* Reveal modal extras: copy button state, checkbox gating */
@@ -639,12 +740,23 @@ td.key-cell {
 
 /* Log detail drill-down */
 
+/* The time cell anchor stretches over the whole row, so the row itself is the
+   link to the detail page. The overlay is absolutely positioned, so its box is
+   the row's only when the row is its containing block. Relative positioning on
+   a table row is not a defined containing block (CSS 2.1 leaves positioning of
+   internal table boxes undefined, and an engine that ignores it lets the
+   overlay escape to the viewport, where it swallows every click on the page).
+   A transform does establish one on a row: CSS Transforms excludes table
+   columns and column groups from the transformable boxes, and any transform
+   other than `none` makes the element a containing block for absolute
+   descendants. Measured in Chromium: with the row's relative positioning
+   neutralized the overlay still covers exactly its own row, and without the
+   transform it covered the whole viewport. */
 .logs-table tbody tr {
   position: relative;
+  transform: translate(0, 0);
 }
 
-/* The time cell anchor stretches over the whole row, so the row itself
-   is the link to the detail page. */
 .logs-table .row-link {
   color: inherit;
   text-decoration: none;

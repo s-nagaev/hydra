@@ -61,69 +61,67 @@
   </form>
   {% endif %}
   <p class="field-hint">limitable = eligible for monthly key limits: the channel is enabled, its allowed models are a fixed list, and every model in that list carries a price entry.</p>
-  <div class="table-scroll">
-    <table class="data-table">
-      <thead>
-        <tr>
-          <th>Name</th>
-          <th>Base URL</th>
-          <th>API key</th>
-          <th>Allowed models</th>
-          <th>Prices</th>
-          <th>Limitable</th>
-          <th>Enabled</th>
-          <th class="actions-col">Actions</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% if rows.is_empty() %}
-        <tr>
-          <td colspan="8" class="empty-state">No channels yet. Create one to route client keys through it.</td>
-        </tr>
-        {% else %}
-        {% for row in rows %}
-        <tr>
-          <td>{{ row.name }}</td>
-          <td>{{ row.base_url }}</td>
-          <td class="mono key-cell">{{ row.api_key_masked }}</td>
-          <td>
-            {% match row.allowed_models %}
-            {% when Some with (models) %}
-            {% for model in models %}<span class="model-badge">{{ model }}</span> {% endfor %}
-            {% when None %}<span class="text-muted">all</span>{% endmatch %}
-          </td>
-          <td class="mono prices-cell">
-            {% if row.prices_display.is_empty() %}<span class="text-muted">none</span>
-            {% else %}{% for line in row.prices_display %}<div class="price-line">{{ line }}</div>{% endfor %}{% endif %}
-          </td>
-          <td>
-            {% if row.limitable %}<span class="badge ok" title="limitable = eligible for monthly key limits">limitable</span>
-            {% else %}<span class="badge off" title="limitable = eligible for monthly key limits">not limitable</span>{% endif %}
-          </td>
-          <td>
-            {% if row.enabled %}<span class="badge ok">enabled</span>
-            {% else %}<span class="badge off">disabled</span>{% endif %}
-          </td>
-          <td class="actions-col">
-            <button type="button"
-              hx-get="/admin/ui/channels/{{ row.id }}/edit"
-              hx-target="#channels-panel"
-              hx-swap="outerHTML">Edit</button>
-            <form class="inline" hx-post="/admin/ui/channels/{{ row.id }}/toggle"
-              hx-target="#channels-panel" hx-swap="outerHTML">
-              <input type="hidden" name="enabled" value="{% if row.enabled %}false{% else %}true{% endif %}">
-              <button type="submit">{% if row.enabled %}Disable{% else %}Enable{% endif %}</button>
-            </form>
-            <form class="inline" hx-post="/admin/ui/channels/{{ row.id }}/delete"
-              hx-target="#channels-panel" hx-swap="outerHTML"
-              hx-confirm="Delete this channel?">
-              <button type="submit" class="danger">Delete</button>
-            </form>
-          </td>
-        </tr>
-        {% endfor %}
-        {% endif %}
-      </tbody>
-    </table>
-  </div>
+  <table class="data-table channels-table">
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Base URL</th>
+        <th>API key</th>
+        <th>Allowed models</th>
+        <th>Prices</th>
+        <th>Limitable</th>
+        <th>Enabled</th>
+        <th class="actions-col">Actions</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% if rows.is_empty() %}
+      <tr>
+        <td colspan="8" class="empty-state">No channels yet. Create one to route client keys through it.</td>
+      </tr>
+      {% else %}
+      {% for row in rows %}
+      <tr>
+        <td class="cell-wrap">{{ row.name }}</td>
+        <td class="cell-wrap">{{ row.base_url }}</td>
+        <td class="mono key-cell">{{ row.api_key_masked }}</td>
+        <td>
+          {% match row.allowed_models %}
+          {% when Some with (models) %}
+          {% for model in models %}<span class="model-badge">{{ model }}</span> {% endfor %}
+          {% when None %}<span class="text-muted">all</span>{% endmatch %}
+        </td>
+        <td class="mono prices-cell">
+          {% if row.prices_display.is_empty() %}<span class="text-muted">none</span>
+          {% else %}{% for line in row.prices_display %}<div class="price-line">{{ line }}</div>{% endfor %}{% endif %}
+        </td>
+        <td>
+          {% if row.limitable %}<span class="badge ok" title="limitable = eligible for monthly key limits">limitable</span>
+          {% else %}<span class="badge off" title="limitable = eligible for monthly key limits">not limitable</span>{% endif %}
+        </td>
+        <td>
+          {% if row.enabled %}<span class="badge ok">enabled</span>
+          {% else %}<span class="badge off">disabled</span>{% endif %}
+        </td>
+        <td class="actions-col">
+          <button type="button"
+            hx-get="/admin/ui/channels/{{ row.id }}/edit"
+            hx-target="#channels-panel"
+            hx-swap="outerHTML">Edit</button>
+          <form class="inline" hx-post="/admin/ui/channels/{{ row.id }}/toggle"
+            hx-target="#channels-panel" hx-swap="outerHTML">
+            <input type="hidden" name="enabled" value="{% if row.enabled %}false{% else %}true{% endif %}">
+            <button type="submit">{% if row.enabled %}Disable{% else %}Enable{% endif %}</button>
+          </form>
+          <form class="inline" hx-post="/admin/ui/channels/{{ row.id }}/delete"
+            hx-target="#channels-panel" hx-swap="outerHTML"
+            hx-confirm="Delete this channel?">
+            <button type="submit" class="danger">Delete</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+      {% endif %}
+    </tbody>
+  </table>
 </section>
