@@ -137,13 +137,17 @@ fn parse_allowed_models_text(raw: Option<&str>) -> Vec<String> {
 }
 
 /// Parses the prices textarea: one model per line, in the form
-/// `model: input, output, cached_input, cached_output`, each amount USD per
-/// 1M tokens with at most six decimal places. Blank lines are skipped and
-/// an empty textarea yields an empty table, which clears the stored prices
-/// exactly like an explicit null in the JSON API. Every error names the
-/// line it came from.
+/// `model: input, output, cached_input, cached_output[, cache_write_input]`,
+/// each amount USD per 1M tokens with at most six decimal places. The fifth,
+/// cache-write amount is optional and reads as zero when it is left out, so
+/// a line written before the dimension existed keeps working. Blank lines
+/// are skipped and an empty textarea yields an empty table, which clears the
+/// stored prices exactly like an explicit null in the JSON API. Every error
+/// names the line it came from.
 fn parse_model_prices_text(raw: Option<&str>) -> Result<ModelPrices, String> {
-    let expected = "expected \"model: input, output, cached_input, cached_output\"";
+    let required = DIMENSIONS.len() - 1;
+    let expected =
+        "expected \"model: input, output, cached_input, cached_output[, cache_write_input]\"";
     let mut entries: Vec<(String, ModelPrice)> = Vec::new();
     for (index, raw_line) in raw.unwrap_or_default().lines().enumerate() {
         let line = raw_line.trim();
@@ -159,9 +163,9 @@ fn parse_model_prices_text(raw: Option<&str>) -> Result<ModelPrices, String> {
             return Err(format!("line {number}: the model name is empty"));
         }
         let amounts: Vec<&str> = amounts.split(',').map(str::trim).collect();
-        if amounts.len() != DIMENSIONS.len() {
+        if amounts.len() < required || amounts.len() > DIMENSIONS.len() {
             return Err(format!(
-                "line {number}: {model} needs {} amounts, got {}",
+                "line {number}: {model} needs {required} or {} amounts, got {}",
                 DIMENSIONS.len(),
                 amounts.len()
             ));
@@ -169,6 +173,8 @@ fn parse_model_prices_text(raw: Option<&str>) -> Result<ModelPrices, String> {
         if entries.iter().any(|(existing, _)| existing == model) {
             return Err(format!("line {number}: {model} is listed twice"));
         }
+        // An omitted write amount leaves the slot at zero, which is what
+        // "no write price set" means.
         let mut micro = [0u64; DIMENSIONS.len()];
         for (slot, (dimension, amount)) in micro.iter_mut().zip(DIMENSIONS.iter().zip(amounts)) {
             *slot = match prices::parse_usd(amount) {
@@ -194,6 +200,7 @@ fn parse_model_prices_text(raw: Option<&str>) -> Result<ModelPrices, String> {
                 output: micro[1],
                 cached_input: micro[2],
                 cached_output: micro[3],
+                cache_write_input: micro[4],
             },
         ));
     }
@@ -201,17 +208,20 @@ fn parse_model_prices_text(raw: Option<&str>) -> Result<ModelPrices, String> {
 }
 
 /// Renders a stored table back into the textarea format, so the edit form
-/// opens with exactly what the parser accepts.
+/// opens with exactly what the parser accepts. Every dimension is written
+/// out, the write one included, so an entry that carries no write price is
+/// visible as the zero it is.
 fn prices_text(prices: &ModelPrices) -> String {
     prices
         .iter()
         .map(|(model, price)| {
             format!(
-                "{model}: {}, {}, {}, {}",
+                "{model}: {}, {}, {}, {}, {}",
                 prices::format_usd(price.input),
                 prices::format_usd(price.output),
                 prices::format_usd(price.cached_input),
-                prices::format_usd(price.cached_output)
+                prices::format_usd(price.cached_output),
+                prices::format_usd(price.cache_write_input)
             )
         })
         .collect::<Vec<String>>()
@@ -219,17 +229,19 @@ fn prices_text(prices: &ModelPrices) -> String {
 }
 
 /// Renders a stored table for the channels table: one compact line per
-/// model, `gpt-4o: 2.50/10.00/1.25/5.00 $/1M`.
+/// model, `gpt-4o: 2.50/10.00/1.25/5.00/3.13 $/1M`, the last amount being
+/// the cache-write rate.
 fn prices_display(prices: &ModelPrices) -> Vec<String> {
     prices
         .iter()
         .map(|(model, price)| {
             format!(
-                "{model}: {}/{}/{}/{} $/1M",
+                "{model}: {}/{}/{}/{}/{} $/1M",
                 prices::format_usd(price.input),
                 prices::format_usd(price.output),
                 prices::format_usd(price.cached_input),
-                prices::format_usd(price.cached_output)
+                prices::format_usd(price.cached_output),
+                prices::format_usd(price.cache_write_input)
             )
         })
         .collect()
@@ -690,12 +702,27 @@ mod tests {
         assert_eq!(full.output, 10_000_000);
         assert_eq!(full.cached_input, 1_250_000);
         assert_eq!(full.cached_output, 5_000_000);
+        assert_eq!(
+            full.cache_write_input, 0,
+            "a four-amount line names no write price"
+        );
         let mini = prices.get("gpt-4o-mini").unwrap();
         assert_eq!(mini.input, 150_000);
         assert_eq!(mini.output, 600_000);
         assert_eq!(mini.cached_input, 75_000);
         assert_eq!(mini.cached_output, 300_000);
         assert_eq!(prices.len(), 2);
+    }
+
+    #[test]
+    fn parse_model_prices_text_reads_the_optional_cache_write_amount() {
+        let prices = parse_model_prices_text(Some("claude: 15, 75, 1.50, 0, 18.75\n")).unwrap();
+        let entry = prices.get("claude").unwrap();
+        assert_eq!(entry.input, 15_000_000);
+        assert_eq!(entry.output, 75_000_000);
+        assert_eq!(entry.cached_input, 1_500_000);
+        assert_eq!(entry.cached_output, 0);
+        assert_eq!(entry.cache_write_input, 18_750_000);
     }
 
     #[test]
@@ -710,11 +737,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             error,
-            "line 2: expected \"model: input, output, cached_input, cached_output\""
+            "line 2: expected \"model: input, output, cached_input, cached_output[, \
+             cache_write_input]\""
         );
 
         let error = parse_model_prices_text(Some("gpt-4o: 2.50, 10.00, 1.25")).unwrap_err();
-        assert_eq!(error, "line 1: gpt-4o needs 4 amounts, got 3");
+        assert_eq!(error, "line 1: gpt-4o needs 4 or 5 amounts, got 3");
+
+        // A sixth amount is one too many: an unknown dimension is never
+        // silently dropped.
+        let error = parse_model_prices_text(Some("gpt-4o: 1, 1, 1, 1, 1, 1")).unwrap_err();
+        assert_eq!(error, "line 1: gpt-4o needs 4 or 5 amounts, got 6");
 
         let error = parse_model_prices_text(Some(": 1, 1, 1, 1")).unwrap_err();
         assert_eq!(error, "line 1: the model name is empty");
@@ -744,18 +777,35 @@ mod tests {
 
     #[test]
     fn prices_text_round_trips_through_the_parser() {
-        let prices = parse_model_prices_text(Some("gpt-4o: 2.50, 10, 1.25, 5")).unwrap();
+        let prices = parse_model_prices_text(Some("gpt-4o: 2.50, 10, 1.25, 5, 3.13")).unwrap();
         let text = prices_text(&prices);
-        assert_eq!(text, "gpt-4o: 2.50, 10.00, 1.25, 5.00");
+        assert_eq!(text, "gpt-4o: 2.50, 10.00, 1.25, 5.00, 3.13");
         assert_eq!(parse_model_prices_text(Some(&text)).unwrap(), prices);
+
+        // A four-amount line opens as five: the dimension the entry does not
+        // price is written out as the zero it reads as.
+        let without_writes = parse_model_prices_text(Some("gpt-4o: 2.50, 10, 1.25, 5")).unwrap();
+        assert_eq!(
+            prices_text(&without_writes),
+            "gpt-4o: 2.50, 10.00, 1.25, 5.00, 0.00"
+        );
+        assert_eq!(
+            parse_model_prices_text(Some(&prices_text(&without_writes))).unwrap(),
+            without_writes
+        );
     }
 
     #[test]
     fn prices_display_is_compact_and_complete() {
-        let prices = parse_model_prices_text(Some("gpt-4o: 2.50, 10, 1.25, 5")).unwrap();
+        let prices = parse_model_prices_text(Some("gpt-4o: 2.50, 10, 1.25, 5, 3.125")).unwrap();
         assert_eq!(
             prices_display(&prices),
-            vec!["gpt-4o: 2.50/10.00/1.25/5.00 $/1M".to_string()]
+            vec!["gpt-4o: 2.50/10.00/1.25/5.00/3.125 $/1M".to_string()]
+        );
+        let four_only = parse_model_prices_text(Some("gpt-4o: 2.50, 10, 1.25, 5")).unwrap();
+        assert_eq!(
+            prices_display(&four_only),
+            vec!["gpt-4o: 2.50/10.00/1.25/5.00/0.00 $/1M".to_string()]
         );
     }
 
@@ -802,11 +852,11 @@ mod tests {
         let row = priced_channel(
             true,
             Some(vec!["gpt-4o".to_string()]),
-            Some("gpt-4o: 2.50, 10, 1.25, 5"),
+            Some("gpt-4o: 2.50, 10, 1.25, 5, 3.13"),
         );
         assert_eq!(
             row.prices_display,
-            vec!["gpt-4o: 2.50/10.00/1.25/5.00 $/1M".to_string()]
+            vec!["gpt-4o: 2.50/10.00/1.25/5.00/3.13 $/1M".to_string()]
         );
         assert!(row.limitable);
 

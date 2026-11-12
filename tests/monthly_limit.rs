@@ -49,7 +49,7 @@ fn db(pool: &SqlitePool) -> Db {
 }
 
 /// The price table the limitable channel carries: every whitelisted model
-/// priced in all four dimensions.
+/// priced, with no write rate, which is what a Chat-only channel needs.
 fn price_table() -> ModelPrices {
     ModelPrices::from_usd_json(&json!({
         "gpt-4o": {
@@ -128,6 +128,7 @@ fn usage_row(key_id: i64, channel_id: i64) -> NewRequestLog {
         completion_tokens: Some(200),
         cached_input_tokens: Some(400),
         cached_output_tokens: None,
+        cache_write_input_tokens: None,
         duration_ms: 1,
         request_body: None,
         response_body: None,

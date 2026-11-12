@@ -33,6 +33,12 @@ pub struct NewRequestLog {
     /// `completion_tokens_details.cached_tokens`); NULL when the vendor
     /// reports none.
     pub cached_output_tokens: Option<i64>,
+    /// Prompt tokens the upstream wrote into its cache (Anthropic
+    /// `cache_creation_input_tokens`), already counted inside
+    /// `prompt_tokens`. NULL when the upstream reported no cache writes: the
+    /// Chat and Responses surfaces never produce them, which is not the same
+    /// as a reported zero.
+    pub cache_write_input_tokens: Option<i64>,
     pub duration_ms: i64,
     pub request_body: Option<String>,
     pub response_body: Option<String>,
@@ -52,7 +58,7 @@ pub async fn insert(db: &Db, log: &NewRequestLog) -> sqlx::Result<()> {
 /// exists for callers that must place a row at a chosen time.
 pub async fn insert_at(db: &Db, log: &NewRequestLog, created_at: &str) -> sqlx::Result<()> {
     let mut sql = Sql::for_db(db);
-    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, cached_input_tokens, cached_output_tokens, duration_ms, request_body, response_body, error, client_ip, created_at) VALUES (")
+    sql.push("INSERT INTO request_logs (api_key_id, channel_id, model, status, prompt_tokens, completion_tokens, cached_input_tokens, cached_output_tokens, cache_write_input_tokens, duration_ms, request_body, response_body, error, client_ip, created_at) VALUES (")
         .bind(Arg::OptInt(log.api_key_id))
         .push(", ")
         .bind(Arg::OptInt(log.channel_id))
@@ -68,6 +74,8 @@ pub async fn insert_at(db: &Db, log: &NewRequestLog, created_at: &str) -> sqlx::
         .bind(Arg::OptInt(log.cached_input_tokens))
         .push(", ")
         .bind(Arg::OptInt(log.cached_output_tokens))
+        .push(", ")
+        .bind(Arg::OptInt(log.cache_write_input_tokens))
         .push(", ")
         .bind(Arg::Int(log.duration_ms))
         .push(", ")
@@ -104,6 +112,9 @@ pub struct RequestLog {
     /// Cached completion tokens the upstream reported; NULL when it
     /// reported none or the row predates the column.
     pub cached_output_tokens: Option<i64>,
+    /// Prompt tokens the upstream wrote into its cache, reported only by
+    /// Anthropic; NULL when it reported none or the row predates the column.
+    pub cache_write_input_tokens: Option<i64>,
     pub duration_ms: i64,
     pub request_body: Option<String>,
     pub response_body: Option<String>,
@@ -208,6 +219,7 @@ fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
         completion_tokens: row.opt_int("completion_tokens")?,
         cached_input_tokens: row.opt_int("cached_input_tokens")?,
         cached_output_tokens: row.opt_int("cached_output_tokens")?,
+        cache_write_input_tokens: row.opt_int("cache_write_input_tokens")?,
         duration_ms: row.int("duration_ms")?,
         request_body: row.opt_text("request_body")?,
         response_body: row.opt_text("response_body")?,
@@ -220,8 +232,8 @@ fn map_row(row: &Row) -> sqlx::Result<RequestLog> {
 /// Column list shared by the listing and the per-row lookup so both stay in
 /// sync with `map_row`.
 const SELECT_COLUMNS: &str = "id, api_key_id, channel_id, model, status, prompt_tokens, \
-     completion_tokens, cached_input_tokens, cached_output_tokens, duration_ms, \
-     request_body, response_body, error, client_ip, created_at";
+     completion_tokens, cached_input_tokens, cached_output_tokens, cache_write_input_tokens, \
+     duration_ms, request_body, response_body, error, client_ip, created_at";
 
 /// Fetches one log row by id; `None` when no row carries this id. Backs the
 /// admin detail endpoint, which needs the stored bodies alongside the
@@ -274,6 +286,9 @@ pub struct ModelUsage {
     pub completion_tokens: i64,
     pub cached_input_tokens: i64,
     pub cached_output_tokens: i64,
+    /// Prompt tokens the key's requests wrote into the upstream cache, the
+    /// dimension the write price applies to.
+    pub cache_write_input_tokens: i64,
     /// Number of logged requests in the group, whatever their status.
     pub requests: i64,
 }
@@ -300,6 +315,9 @@ pub async fn month_to_date_usage(
         .push("CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS completion_tokens, ")
         .push("CAST(COALESCE(SUM(cached_input_tokens), 0) AS BIGINT) AS cached_input_tokens, ")
         .push("CAST(COALESCE(SUM(cached_output_tokens), 0) AS BIGINT) AS cached_output_tokens, ")
+        .push(
+            "CAST(COALESCE(SUM(cache_write_input_tokens), 0) AS BIGINT) AS cache_write_input_tokens, ",
+        )
         .push("COUNT(*) AS request_count FROM request_logs ")
         .push("WHERE api_key_id IS NOT NULL AND api_key_id = ")
         .bind(Arg::Int(key_id))
@@ -319,6 +337,7 @@ fn map_usage(row: &Row) -> sqlx::Result<ModelUsage> {
         completion_tokens: row.int("completion_tokens")?,
         cached_input_tokens: row.int("cached_input_tokens")?,
         cached_output_tokens: row.int("cached_output_tokens")?,
+        cache_write_input_tokens: row.int("cache_write_input_tokens")?,
         requests: row.int("request_count")?,
     })
 }
@@ -385,11 +404,27 @@ mod tests {
             completion_tokens: completion,
             cached_input_tokens: cached_input,
             cached_output_tokens: cached_output,
+            cache_write_input_tokens: None,
             duration_ms: 1,
             request_body: None,
             response_body: None,
             error: None,
             client_ip: None,
+        }
+    }
+
+    /// The same row with a cache-write count, which only the Anthropic
+    /// surface reports.
+    fn row_with_cache_writes(
+        model: Option<&str>,
+        prompt: Option<i64>,
+        completion: Option<i64>,
+        cached_input: Option<i64>,
+        cache_write_input: Option<i64>,
+    ) -> NewRequestLog {
+        NewRequestLog {
+            cache_write_input_tokens: cache_write_input,
+            ..row(model, prompt, completion, cached_input, None)
         }
     }
 
@@ -458,6 +493,7 @@ mod tests {
         assert_eq!(usage[0].completion_tokens, 30);
         assert_eq!(usage[0].cached_input_tokens, 40);
         assert_eq!(usage[0].cached_output_tokens, 5);
+        assert_eq!(usage[0].cache_write_input_tokens, 0);
         assert_eq!(usage[0].requests, 2);
     }
 
@@ -543,6 +579,7 @@ mod tests {
         assert_eq!(usage[0].completion_tokens, 0);
         assert_eq!(usage[0].cached_input_tokens, 0);
         assert_eq!(usage[0].cached_output_tokens, 0);
+        assert_eq!(usage[0].cache_write_input_tokens, 0);
         assert_eq!(usage[0].requests, 1);
     }
 
@@ -559,6 +596,68 @@ mod tests {
             1,
             "the per-key month-to-date index must be migrated in"
         );
+    }
+
+    #[tokio::test]
+    async fn the_cache_write_column_is_migrated_in() {
+        let db = test_db().await;
+        let mut sql = Sql::for_db(&db);
+        sql.push(
+            "SELECT COUNT(*) FROM pragma_table_info('request_logs') \
+             WHERE name = 'cache_write_input_tokens'",
+        );
+        assert_eq!(
+            db.scalar(sql).await.unwrap(),
+            1,
+            "the cache-write token column must be migrated in"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cache_write_column_round_trips_and_sums_into_the_month_aggregate() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "cache-write").await;
+        // An Anthropic row: 1300 prompt tokens made of 1000 uncached, 250
+        // read and 50 written, 20 completions.
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_cache_writes(Some("claude"), Some(1300), Some(20), Some(250), Some(50)),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        // A row the upstream reported no write count for adds nothing to the
+        // sum but keeps the group alive.
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_cache_writes(Some("claude"), Some(100), Some(5), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+
+        let id: i64 = {
+            let mut sql = Sql::for_db(&db);
+            sql.push("SELECT MIN(id) FROM request_logs");
+            db.scalar(sql).await.unwrap()
+        };
+        let stored = find(&db, id).await.unwrap().expect("the row exists");
+        assert_eq!(stored.cache_write_input_tokens, Some(50));
+        assert_eq!(stored.cached_input_tokens, Some(250));
+        assert_eq!(stored.prompt_tokens, Some(1300));
+
+        let usage = month_to_date_usage(&db, key_id, &november()).await.unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].prompt_tokens, 1400);
+        assert_eq!(usage[0].cached_input_tokens, 250);
+        assert_eq!(usage[0].cached_output_tokens, 0);
+        assert_eq!(
+            usage[0].cache_write_input_tokens, 50,
+            "the write count is summed per model like the other dimensions"
+        );
+        assert_eq!(usage[0].requests, 2);
     }
 
     #[tokio::test]

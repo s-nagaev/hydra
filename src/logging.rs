@@ -201,6 +201,7 @@ impl ChatLogContext {
                 completion_tokens: usage.completion_tokens,
                 cached_input_tokens: usage.cached_input_tokens,
                 cached_output_tokens: usage.cached_output_tokens,
+                cache_write_input_tokens: usage.cache_write_input_tokens,
                 duration_ms: elapsed_ms(self.start),
                 request_body: self.request_body,
                 response_body,
@@ -391,10 +392,9 @@ pub enum UsageFormat {
 }
 
 /// Token counts extracted from one upstream response, in Hydra's own
-/// vocabulary: the four dimensions the `request_logs` row stores, plus the
-/// Anthropic cache-write count that no column prices yet (the fifth price
-/// dimension is a later migration). A dimension the upstream did not report
-/// stays NULL, never a fabricated zero.
+/// vocabulary: the five dimensions the `request_logs` row stores, one per
+/// price dimension. A dimension the upstream did not report stays NULL,
+/// never a fabricated zero.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct UsageExtraction {
     pub prompt_tokens: Option<i64>,
@@ -403,7 +403,7 @@ pub struct UsageExtraction {
     pub cached_output_tokens: Option<i64>,
     /// Prompt tokens the upstream wrote into its cache (Anthropic
     /// `cache_creation_input_tokens`), already counted inside
-    /// `prompt_tokens` and kept separately because it stays unpriced for now.
+    /// `prompt_tokens` and priced at its own per-model write rate.
     pub cache_write_input_tokens: Option<i64>,
 }
 
@@ -1016,6 +1016,7 @@ mod tests {
                 completion_tokens: Some(5),
                 cached_input_tokens: Some(2),
                 cached_output_tokens: None,
+                cache_write_input_tokens: Some(1),
                 duration_ms: 7,
                 request_body: None,
                 response_body: None,
@@ -1029,7 +1030,7 @@ mod tests {
 
         let row = sqlx::query(
             "SELECT model, status, prompt_tokens, cached_input_tokens, \
-             cached_output_tokens, client_ip FROM request_logs",
+             cached_output_tokens, cache_write_input_tokens, client_ip FROM request_logs",
         )
         .fetch_one(&pool)
         .await
@@ -1055,6 +1056,12 @@ mod tests {
             "an upstream that reports no cached output leaves the column null"
         );
         assert_eq!(
+            row.try_get::<Option<i64>, _>("cache_write_input_tokens")
+                .unwrap(),
+            Some(1),
+            "the write count travels from the row builder to the column"
+        );
+        assert_eq!(
             row.try_get::<Option<String>, _>("client_ip").unwrap(),
             Some("198.51.100.5".to_string())
         );
@@ -1078,6 +1085,7 @@ mod tests {
                 completion_tokens: None,
                 cached_input_tokens: None,
                 cached_output_tokens: None,
+                cache_write_input_tokens: None,
                 duration_ms: 1,
                 request_body: None,
                 response_body: None,
@@ -1356,6 +1364,62 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_buffered_anthropic_response_persists_the_cache_write_count() {
+        let pool = seeded_pool().await;
+        let tracker = LogTracker::default();
+        let db = Db::from(pool.clone());
+        let flags = crate::limit_flags::LimitFlags::default();
+        let ctx = ChatLogContext::new(ChatLogInit {
+            db: &db,
+            tracker: &tracker,
+            log_bodies: false,
+            api_key_id: Some(1),
+            channel_id: Some(1),
+            model: Some("claude".to_string()),
+            usage_format: UsageFormat::Anthropic,
+            start: Instant::now(),
+            request_body: b"{}",
+            client_ip: None,
+            flags: &flags,
+        });
+        // The same counters the streaming test reads from `message_start`
+        // and `message_delta`, here in one buffered body.
+        let body = br#"{"usage":{"input_tokens":10,"output_tokens":7,"cache_read_input_tokens":4,"cache_creation_input_tokens":2}}"#;
+        let usage = ctx.buffered_usage(body);
+        assert_eq!(usage.cache_write_input_tokens, Some(2));
+        ctx.finish(Some(200), usage, None, None);
+        wait_until_drained(&tracker).await;
+        wait_for_rows(&pool, 1).await;
+
+        let row = sqlx::query(
+            "SELECT prompt_tokens, completion_tokens, cached_input_tokens, \
+             cache_write_input_tokens FROM request_logs",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row.try_get::<Option<i64>, _>("cache_write_input_tokens")
+                .unwrap(),
+            Some(2),
+            "the buffered Anthropic path persists the cache-write count"
+        );
+        assert_eq!(
+            row.try_get::<Option<i64>, _>("prompt_tokens").unwrap(),
+            Some(16)
+        );
+        assert_eq!(
+            row.try_get::<Option<i64>, _>("cached_input_tokens")
+                .unwrap(),
+            Some(4)
+        );
+        assert_eq!(
+            row.try_get::<Option<i64>, _>("completion_tokens").unwrap(),
+            Some(7)
+        );
+    }
+
     /// Feeds raw SSE chunks through the same streaming capture the tee uses
     /// and returns the reading it would have logged.
     fn observe_stream_chunks(format: UsageFormat, chunks: &[&str]) -> UsageExtraction {
@@ -1420,7 +1484,7 @@ mod tests {
 
         let rows = sqlx::query(
             "SELECT prompt_tokens, completion_tokens, cached_input_tokens, \
-             cached_output_tokens FROM request_logs ORDER BY id",
+             cached_output_tokens, cache_write_input_tokens FROM request_logs ORDER BY id",
         )
         .fetch_all(&pool)
         .await
@@ -1467,5 +1531,19 @@ mod tests {
                 None
             );
         }
+        assert_eq!(
+            rows[1]
+                .try_get::<Option<i64>, _>("cache_write_input_tokens")
+                .unwrap(),
+            Some(5),
+            "the Anthropic row persists the cache-write count it extracted"
+        );
+        assert_eq!(
+            rows[0]
+                .try_get::<Option<i64>, _>("cache_write_input_tokens")
+                .unwrap(),
+            None,
+            "the Responses surface reports no cache writes, so the column stays null"
+        );
     }
 }

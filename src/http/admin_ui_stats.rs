@@ -83,6 +83,7 @@ pub struct DisplaySums {
     pub completion_tokens: String,
     pub cached_input_tokens: String,
     pub cached_output_tokens: String,
+    pub cache_write_input_tokens: String,
     pub requests: String,
     pub cost: String,
 }
@@ -114,6 +115,7 @@ struct Sums {
     completion: i64,
     cached_input: i64,
     cached_output: i64,
+    cache_write_input: i64,
     requests: i64,
     cost: i64,
 }
@@ -126,6 +128,7 @@ impl Sums {
             group.completion_tokens,
             group.cached_input_tokens,
             group.cached_output_tokens,
+            group.cache_write_input_tokens,
             group.requests,
         );
     }
@@ -138,6 +141,7 @@ impl Sums {
             other.completion,
             other.cached_input,
             other.cached_output,
+            other.cache_write_input,
             other.requests,
         );
     }
@@ -153,12 +157,14 @@ impl Sums {
         completion: i64,
         cached_input: i64,
         cached_output: i64,
+        cache_write_input: i64,
         requests: i64,
     ) {
         self.prompt = self.prompt.saturating_add(prompt);
         self.completion = self.completion.saturating_add(completion);
         self.cached_input = self.cached_input.saturating_add(cached_input);
         self.cached_output = self.cached_output.saturating_add(cached_output);
+        self.cache_write_input = self.cache_write_input.saturating_add(cache_write_input);
         self.requests = self.requests.saturating_add(requests);
     }
 
@@ -168,6 +174,7 @@ impl Sums {
             completion_tokens: thousands(self.completion),
             cached_input_tokens: thousands(self.cached_input),
             cached_output_tokens: thousands(self.cached_output),
+            cache_write_input_tokens: thousands(self.cache_write_input),
             requests: thousands(self.requests),
             cost: cost_display(self.cost),
         }
@@ -363,6 +370,7 @@ fn build_page(data: StatsData, error: Option<String>) -> StatsPage {
                     completion_tokens: thousands(group.completion_tokens),
                     cached_input_tokens: thousands(group.cached_input_tokens),
                     cached_output_tokens: thousands(group.cached_output_tokens),
+                    cache_write_input_tokens: thousands(group.cache_write_input_tokens),
                     requests: thousands(group.requests),
                     cost: cost_display(cost),
                 },
@@ -427,6 +435,7 @@ mod tests {
             completion_tokens: completion,
             cached_input_tokens: 0,
             cached_output_tokens: 0,
+            cache_write_input_tokens: 0,
             requests,
         }
     }
@@ -440,6 +449,24 @@ mod tests {
                 "output": "10.00",
                 "cached_input": "1.25",
                 "cached_output": "5.00"
+            }
+        }))
+        .unwrap();
+        ChannelInfo {
+            prices: Some(prices),
+            limitable: true,
+        }
+    }
+
+    /// The same channel with the cache-write dimension priced too.
+    fn channel_info_write_priced() -> ChannelInfo {
+        let prices = ModelPrices::from_usd_json(&serde_json::json!({
+            "claude": {
+                "input": "2.50",
+                "output": "10.00",
+                "cached_input": "1.25",
+                "cached_output": "5.00",
+                "cache_write_input": "3.125"
             }
         }))
         .unwrap();
@@ -560,13 +587,53 @@ mod tests {
         assert_eq!(total.sums.cost, "$0.0045");
         assert_eq!(total.sums.prompt_tokens, "1,500");
         assert_eq!(total.sums.completion_tokens, "300");
+        assert_eq!(
+            total.sums.cache_write_input_tokens, "0",
+            "a request that writes no cache shows the column at zero"
+        );
         assert_eq!(total.sums.requests, "3");
         assert_eq!(total.key_label, "hyd-4f9dEg2x");
         assert!(!total.limit_inactive);
 
         assert_eq!(page.grand.cost, "$0.0045");
         assert_eq!(page.grand.prompt_tokens, "1,500");
+        assert_eq!(page.grand.cache_write_input_tokens, "0");
         assert_eq!(page.grand.requests, "3");
+    }
+
+    #[test]
+    fn a_cache_write_group_shows_its_token_column_and_is_priced_at_the_write_rate() {
+        // An Anthropic row: 1300 prompt tokens (1000 uncached, 250 read, 50
+        // written) and 200 completions. At 2.50/1.25/3.125/10.00 USD per 1M
+        // tokens the pinned formula charges 1000 * 2.50 + 250 * 1.25 +
+        // 50 * 3.125 + 200 * 10.00 = 4968.75 micro-USD, floored to 4968.
+        let mut group = usage("claude", 1300, 200, 1);
+        group.cached_input_tokens = 250;
+        group.cache_write_input_tokens = 50;
+        let data = StatsData {
+            month: Month::from_parts(2026, 11).unwrap(),
+            keys: vec![KeyUsage {
+                key: stored_key(None),
+                groups: vec![group],
+            }],
+            channels: HashMap::from([(7, channel_info_write_priced())]),
+        };
+        let page = build_page(data, None);
+        let row = &page.rows[0];
+        assert_eq!(row.model_label, "claude");
+        assert_eq!(row.sums.cache_write_input_tokens, "50");
+        assert_eq!(row.sums.cached_input_tokens, "250");
+        assert_eq!(row.sums.prompt_tokens, "1,300");
+        assert_eq!(row.sums.cost, "$0.004968");
+
+        // The key total and the grand total carry the same figure and the
+        // same token column.
+        let total = &page.rows[1];
+        assert!(total.is_total);
+        assert_eq!(total.sums.cache_write_input_tokens, "50");
+        assert_eq!(total.sums.cost, "$0.004968");
+        assert_eq!(page.grand.cache_write_input_tokens, "50");
+        assert_eq!(page.grand.cost, "$0.004968");
     }
 
     #[test]

@@ -1,0 +1,13 @@
+-- PostgreSQL twin of the sqlite usage-cache-write-tokens migration.
+--
+-- BIGINT to match prompt_tokens and completion_tokens: the shared row mapper
+-- reads every integer column as i64 on both backends.
+--
+-- Prompt tokens the upstream WROTE into its cache, as reported by Anthropic
+-- Messages in `cache_creation_input_tokens`. They are already counted inside
+-- `prompt_tokens` (the Anthropic input side is normalized additively) and the
+-- column keeps them separable, because the write share is billed at its own
+-- per-model price dimension rather than at the base input price.
+-- NULL means the upstream reported no cache writes, which is not the same as
+-- a reported zero.
+ALTER TABLE request_logs ADD COLUMN cache_write_input_tokens BIGINT NULL;

@@ -147,6 +147,7 @@ async fn log_at(
             completion_tokens: completion,
             cached_input_tokens: cached_input,
             cached_output_tokens: None,
+            cache_write_input_tokens: None,
             duration_ms: 1,
             request_body: None,
             response_body: None,
@@ -464,6 +465,7 @@ async fn usage_rejected_before_a_key_resolved_is_attributed_to_no_key() {
             completion_tokens: None,
             cached_input_tokens: None,
             cached_output_tokens: None,
+            cache_write_input_tokens: None,
             duration_ms: 1,
             request_body: None,
             response_body: None,
@@ -485,5 +487,92 @@ async fn usage_rejected_before_a_key_resolved_is_attributed_to_no_key() {
     assert!(
         html.contains(">All keys<") && !html.contains("unknown key"),
         "the NULL-key rejection never becomes a row: {html}"
+    );
+}
+// --- Cache writes ---------------------------------------------------------
+
+/// A channel whitelisted to `claude` and priced for it with the cache-write
+/// dimension set at 1.25 times the input rate.
+async fn seed_write_priced_channel(db: &SqlitePool) -> i64 {
+    let prices = ModelPrices::from_usd_json(&serde_json::json!({
+        "claude": {
+            "input": "2.50",
+            "output": "10.00",
+            "cached_input": "1.25",
+            "cached_output": "5.00",
+            "cache_write_input": "3.125"
+        }
+    }))
+    .unwrap();
+    within(channels::create_with_prices(
+        &Db::from(db.clone()),
+        &NewChannel {
+            name: "write-priced".to_string(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            api_key: common::UPSTREAM_KEY.to_string(),
+            allowed_models: Some(vec!["claude".to_string()]),
+        },
+        Some(&prices),
+    ))
+    .await
+    .unwrap()
+    .channel
+    .id
+}
+
+#[tokio::test]
+async fn the_cache_write_column_shows_the_written_tokens_and_their_cost() {
+    let db = test_pool().await;
+    let channel_id = seed_write_priced_channel(&db).await;
+    let (key_id, prefix) = seed_key(&db, channel_id, "anthropic", None).await;
+    // An Anthropic row: 1300 prompt tokens (1000 uncached, 250 read, 50
+    // written) and 200 completions. At 2.50/1.25/3.125/10.00 USD per 1M
+    // tokens the pinned formula charges 4968 micro-USD, against 4812 if the
+    // write dimension were ignored.
+    within(request_logs::insert_at(
+        &Db::from(db.clone()),
+        &NewRequestLog {
+            api_key_id: Some(key_id),
+            channel_id: Some(channel_id),
+            model: Some("claude".to_string()),
+            status: Some(200),
+            prompt_tokens: Some(1300),
+            completion_tokens: Some(200),
+            cached_input_tokens: Some(250),
+            cached_output_tokens: None,
+            cache_write_input_tokens: Some(50),
+            duration_ms: 1,
+            request_body: None,
+            response_body: None,
+            error: None,
+            client_ip: None,
+        },
+        "2026-08-01 10:00:00",
+    ))
+    .await
+    .unwrap();
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-08").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(&prefix), "{html}");
+    assert!(
+        html.contains("<th>Cache write</th>"),
+        "the column has its own header: {html}"
+    );
+    assert!(
+        html.contains(">50<"),
+        "the written tokens are shown: {html}"
+    );
+    assert!(
+        html.contains(">1,300<"),
+        "the prompt total still includes the writes: {html}"
+    );
+    assert!(
+        html.contains(">$0.004968<"),
+        "the cost is the write-aware figure: {html}"
+    );
+    assert!(
+        !html.contains(">$0.004812<"),
+        "the write-blind figure must not appear: {html}"
     );
 }

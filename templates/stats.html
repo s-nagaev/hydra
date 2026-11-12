@@ -42,6 +42,7 @@
         <th>Output tokens</th>
         <th>Cached input</th>
         <th>Cached output</th>
+        <th>Cache write</th>
         <th>Requests</th>
         <th>Cost (USD)</th>
       </tr>
@@ -49,7 +50,7 @@
     <tbody>
       {% if rows.is_empty() %}
       <tr>
-        <td colspan="8" class="empty-state">{{ empty_message }}</td>
+        <td colspan="9" class="empty-state">{{ empty_message }}</td>
       </tr>
       {% else %}
       {% for row in rows %}
@@ -63,6 +64,7 @@
         <td class="mono">{{ row.sums.completion_tokens }}</td>
         <td class="mono">{{ row.sums.cached_input_tokens }}</td>
         <td class="mono">{{ row.sums.cached_output_tokens }}</td>
+        <td class="mono">{{ row.sums.cache_write_input_tokens }}</td>
         <td class="mono">{{ row.sums.requests }}</td>
         <td class="mono">{{ row.sums.cost }}</td>
       </tr>
@@ -77,6 +79,7 @@
         <td class="mono">{{ grand.completion_tokens }}</td>
         <td class="mono">{{ grand.cached_input_tokens }}</td>
         <td class="mono">{{ grand.cached_output_tokens }}</td>
+        <td class="mono">{{ grand.cache_write_input_tokens }}</td>
         <td class="mono">{{ grand.requests }}</td>
         <td class="mono">{{ grand.cost }}</td>
       </tr>
@@ -88,7 +91,10 @@
     Requests without reported usage are not counted in the token sums: they add no
     tokens here while still counting as requests. Requests rejected before a key
     resolved belong to no key at all. Cost is computed from the price list of the
-    key's channel, so a model that channel does not price costs zero.
+    key's channel, so a model that channel does not price costs zero. Cache write
+    counts come only from upstreams that report them (Anthropic's cache creation
+    tokens) and are billed at the write rate of the model, which is zero when its
+    price entry names none.
   </p>
 </section>
 {% endblock %}

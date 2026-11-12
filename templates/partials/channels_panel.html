@@ -48,7 +48,7 @@
     <div>
       <label for="channel-prices">Prices</label>
       <textarea id="channel-prices" name="model_prices" rows="4">{{ form.model_prices_text }}</textarea>
-      <div class="field-hint">One model per line: <span class="mono">model: input, output, cached_input, cached_output</span>, in USD per 1M tokens. Leave empty for no prices.</div>
+      <div class="field-hint">One model per line: <span class="mono">model: input, output, cached_input, cached_output[, cache_write_input]</span>, in USD per 1M tokens. Leave empty for no prices. The last amount is the cache-write rate (Anthropic cache creation tokens) and may be left out, which prices them at nothing.</div>
       {% if let Some(error) = form.errors.model_prices %}<div class="field-error">{{ error }}</div>{% endif %}
     </div>
     <div class="form-actions">
@@ -60,7 +60,7 @@
     </div>
   </form>
   {% endif %}
-  <p class="field-hint">limitable = eligible for monthly key limits: the channel is enabled, its allowed models are a fixed list, and every model in that list has all four prices.</p>
+  <p class="field-hint">limitable = eligible for monthly key limits: the channel is enabled, its allowed models are a fixed list, and every model in that list carries a price entry.</p>
   <table class="data-table">
     <thead>
       <tr>
