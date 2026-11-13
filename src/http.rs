@@ -4,6 +4,8 @@
 //! admin UI pages accept a session cookie as well (`ui_auth`), and only the
 //! liveness check is public. Proxy routes under `/v1/*` authenticate client
 //! keys through `proxy_auth` and forward to the bound channel's upstream.
+//! The site root is the one navigation route: it redirects to the admin UI
+//! and shares no handler with anything else.
 
 mod admin_auth;
 mod admin_channels;
@@ -26,6 +28,7 @@ mod ui_auth;
 use std::time::Duration;
 
 use axum::extract::DefaultBodyLimit;
+use axum::response::Redirect;
 use axum::routing::{get, patch, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -116,6 +119,18 @@ pub fn upstream_client() -> reqwest::Client {
         .expect("client construction only fails when the TLS backend fails to initialize")
 }
 
+/// Where the site root sends a browser; the admin UI decides on its own
+/// whether the visitor has a session (login page) or not (default tab).
+const ADMIN_UI_PATH: &str = "/admin/ui";
+
+/// The site root: a browser landing on the bare host gets the admin UI
+/// instead of a 404. It is a navigation aid, so it is public like the login
+/// page, sends a 303 (the same status the UI auth flow uses), and writes no
+/// request-log row, being no proxied call.
+async fn root() -> Redirect {
+    Redirect::to(ADMIN_UI_PATH)
+}
+
 #[utoipa::path(
     get,
     path = "/admin/health",
@@ -137,6 +152,10 @@ pub fn router(state: AppState) -> Router {
     let swagger =
         SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", docs::ApiDoc::openapi());
     Router::new()
+        // The site root matches the root path alone: the proxied surfaces,
+        // the admin JSON API, the UI pages and its static assets keep their
+        // own routes and are untouched by it.
+        .route("/", get(root))
         .route("/admin/health", get(health))
         .route(
             "/admin/channels",

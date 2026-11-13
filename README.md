@@ -261,7 +261,9 @@ needs no auth, neither in the UI nor from a client.
 
 A server-rendered admin UI lives at `/admin/ui`: open
 [http://127.0.0.1:8080/admin/ui](http://127.0.0.1:8080/admin/ui) and sign in
-on the login page with the same credentials as the JSON API. The login sets a
+on the login page with the same credentials as the JSON API. The site root
+redirects there, so a browser opening `http://127.0.0.1:8080/` lands on the
+UI as well. The login sets a
 session cookie (7 days, `HttpOnly`, `Secure`, `SameSite=Lax`, scoped to
 `/admin/ui`), which is what keeps the browser from asking for a password on
 every request; Basic Auth keeps working, for example from `curl`. A request
