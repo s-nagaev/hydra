@@ -26,7 +26,8 @@ src/
 ├── config.rs        env-driven config struct, fail-fast validation
 ├── db/              pool init, migrations runner, runtime sqlx queries
 ├── http.rs          AppState and the router; http/ holds the handlers
-├── http/            admin JSON CRUD, admin UI pages, proxy, auth, CSRF, client IP
+├── http/            admin JSON CRUD, admin UI pages, proxy, auth (Basic, session
+│                     cookies), CSRF, client IP
 ├── cache.rs         in-memory key to channel resolution cache
 ├── flood.rs         in-memory flood cap on anonymous 401 spam
 ├── logging.rs       background request-log writer, body tee (opt-in, 1 MB cap),
@@ -181,9 +182,27 @@ migration, never hand-edited DBs.
   a total cap of `NON_STREAM_TIMEOUT` (300 s in `src/http/proxy.rs`, global
   for every surface and not configurable). Streaming requests get no total
   cap, so a long generation is never cut between chunks.
-- Admin routes: HTTP Basic Auth (constant-time compare, env creds) on
-  everything under `/admin` except `GET /admin/health` (public liveness).
-  Admin errors are plain JSON, not OpenAI-shaped.
+- JSON admin routes (`/admin/*`): HTTP Basic Auth (constant-time compare, env
+  creds) on everything except `GET /admin/health` (public liveness). Admin
+  errors are plain JSON, not OpenAI-shaped. The JSON API answers a session
+  cookie with 401 and the `WWW-Authenticate` challenge, exactly like no
+  credentials at all.
+- Admin UI routes (`/admin/ui/*`): a session cookie or the same Basic
+  credentials (`src/http/ui_auth.rs`). Without either, a page request gets a
+  303 to `/admin/ui/login` and never a challenge, because a challenge is what
+  makes the browser pop its Basic Auth dialog; an htmx request gets
+  `HX-Redirect` instead so the fragment target is not replaced with a login
+  page.
+- Session cookies (`src/http/admin_session.rs`): an HMAC-SHA256 signed
+  `{"exp", "nonce"}` payload, 7 day TTL, `HttpOnly; Secure; SameSite=Lax;
+  Path=/admin/ui`. The signing key is HKDF-SHA256 over `HYDRA_ADMIN_PASSWORD`,
+  or over `HYDRA_SESSION_SECRET` when set: rotating the password invalidates
+  every session unless the secret pins the key. Nothing is stored server-side,
+  so sessions are revoked only by expiry or by a key change. Signature
+  verification is constant-time and runs before the payload is parsed.
+- Session-exempt `/admin/ui` routes, deliberately: `GET`/`POST
+  /admin/ui/login`, `POST /admin/ui/logout`, and the static assets, which the
+  login page itself needs. They still sit behind the CSRF guard.
 
 ## Testing conventions
 
@@ -193,7 +212,10 @@ migration, never hand-edited DBs.
 - Suite must cover: unknown key → 401, disabled key → 403, non-whitelisted
   model → 404, SSE passthrough integrity, non-stream forwarding, upstream
   5xx passthrough, log rows for stream and non-stream cases, admin auth
-  (401 without creds), `/v1/models` both whitelist and NULL→proxy cases,
+  (401 without creds on the JSON API, a 303 to the login page on the UI), the
+  admin UI login flow (cookie issued, accepted on the UI, rejected on the JSON
+  API, cleared by logout, invalidated by a password change),
+  `/v1/models` both whitelist and NULL→proxy cases,
   cached-token capture on buffered and on streaming responses, and the
   monthly limit gate (an over-budget key gets 429 on both proxy routes).
 - Each proxied surface carries the same list where it applies, plus its own:

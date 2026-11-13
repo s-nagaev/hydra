@@ -50,7 +50,7 @@
     </div>
   </form>
   {% endif %}
-  <table class="data-table">
+  <table class="data-table keys-table">
     <thead>
       <tr>
         <th>Prefix</th>
@@ -71,8 +71,8 @@
       {% for row in rows %}
       <tr>
         <td class="mono">{{ row.display_prefix }}</td>
-        <td>{% if let Some(name) = row.name %}{{ name }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
-        <td>{{ row.channel_name }}</td>
+        <td class="cell-wrap">{% if let Some(name) = row.name %}{{ name }}{% else %}<span class="text-muted">-</span>{% endif %}</td>
+        <td class="cell-wrap">{{ row.channel_name }}</td>
         <td>
           {% match row.monthly_limit %}
           {% when Some with (limit) %}

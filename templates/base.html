@@ -6,6 +6,7 @@
   <title>{% block title %}Admin{% endblock %} · Hydra</title>
   <link rel="stylesheet" href="/admin/ui/static/admin.css">
   <script src="/admin/ui/static/htmx.min.js" defer></script>
+  <script src="/admin/ui/static/admin.js" defer></script>
 </head>
 <body>
   <header class="topbar">
@@ -22,6 +23,9 @@
           {%- if section == "stats" %} class="active"{% endif %}>Stat</a>
       </nav>
       <a class="api-link" href="/swagger-ui">API</a>
+      <form class="logout-form" method="post" action="/admin/ui/logout">
+        <button type="submit">Log out</button>
+      </form>
     </div>
   </header>
   <main class="page">

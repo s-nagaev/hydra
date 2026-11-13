@@ -60,17 +60,23 @@
     </tbody>
   </table>
 
-  <h2 class="snippet-label">Request body</h2>
   {% if let Some(body) = request_body %}
-  <pre class="code-snippet">{{ body }}</pre>
+  <details class="body-block" open>
+    <summary class="snippet-label">Request body</summary>
+    <pre class="code-snippet">{{ body }}</pre>
+  </details>
   {% else %}
+  <h2 class="snippet-label">Request body</h2>
   <p class="text-muted">Bodies were not captured for this request. Body capture is opt-in via HYDRA_LOG_BODIES=1.</p>
   {% endif %}
 
-  <h2 class="snippet-label">Response body</h2>
   {% if let Some(body) = response_body %}
-  <pre class="code-snippet">{{ body }}</pre>
+  <details class="body-block">
+    <summary class="snippet-label">Response body</summary>
+    <pre class="code-snippet">{{ body }}</pre>
+  </details>
   {% else %}
+  <h2 class="snippet-label">Response body</h2>
   <p class="text-muted">Bodies were not captured for this request. Body capture is opt-in via HYDRA_LOG_BODIES=1.</p>
   {% endif %}
 </section>

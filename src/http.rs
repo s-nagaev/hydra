@@ -1,6 +1,7 @@
 //! Axum routers and handlers.
 //!
-//! Admin routes carry the Basic Auth extractor from `admin_auth`; only the
+//! JSON admin routes carry the Basic Auth extractor from `admin_auth`; the
+//! admin UI pages accept a session cookie as well (`ui_auth`), and only the
 //! liveness check is public. Proxy routes under `/v1/*` authenticate client
 //! keys through `proxy_auth` and forward to the bound channel's upstream.
 
@@ -8,6 +9,7 @@ mod admin_auth;
 mod admin_channels;
 mod admin_keys;
 mod admin_logs;
+mod admin_session;
 mod admin_ui;
 mod admin_ui_channels;
 mod admin_ui_keys;
@@ -19,6 +21,7 @@ mod docs;
 mod openai_error;
 mod proxy;
 mod proxy_auth;
+mod ui_auth;
 
 use std::time::Duration;
 
@@ -55,14 +58,18 @@ pub struct AppState {
     /// In-memory verdicts of the monthly key limits; see `crate::limit_flags`
     /// and `crate::usage` for how they are computed.
     pub limit_flags: crate::limit_flags::LimitFlags,
+    /// Signing key of the admin UI session cookies; see
+    /// `crate::http::admin_session` for how it is derived.
+    pub(crate) session: admin_session::SessionKey,
 }
 
 impl AppState {
     /// Builds state with the production wiring for everything that is not a
     /// parameter: one shared upstream client, a fresh resolution cache, an
-    /// empty log tracker and an empty monthly-limit flag store. Every
-    /// construction site goes through this, so a future state field lands
-    /// here once instead of at each call site.
+    /// empty log tracker, an empty monthly-limit flag store, and the session
+    /// key derived from the admin password. Every construction site goes
+    /// through this, so a future state field lands here once instead of at
+    /// each call site.
     pub fn new(
         db: crate::db::Db,
         admin_login: String,
@@ -71,6 +78,7 @@ impl AppState {
         trusted_proxies: crate::config::TrustedProxies,
         flood: crate::flood::FloodCap,
     ) -> Self {
+        let session = admin_session::SessionKey::derive(admin_password.as_bytes());
         AppState {
             db,
             admin_login,
@@ -82,7 +90,18 @@ impl AppState {
             trusted_proxies,
             flood,
             limit_flags: crate::limit_flags::LimitFlags::default(),
+            session,
         }
+    }
+
+    /// Replaces the password-derived session key with one derived from
+    /// `HYDRA_SESSION_SECRET`, keeping sessions valid across an admin
+    /// password rotation when the operator asked for that.
+    pub fn with_session_secret(mut self, session_secret: Option<&str>) -> Self {
+        if let Some(secret) = session_secret.filter(|secret| !secret.is_empty()) {
+            self.session = admin_session::SessionKey::derive(secret.as_bytes());
+        }
+        self
     }
 }
 

@@ -7,9 +7,9 @@
 //! browser-provided metadata marks them as cross-site: a `Sec-Fetch-Site`
 //! header other than `same-origin`, or an `Origin` header that disagrees
 //! with the request `Host`. Requests carrying neither header (plain HTTP
-//! clients) pass through; `AdminAuth` still gates them. The guard is
+//! clients) pass through; the auth extractors still gate them. The guard is
 //! applied to the whole `/admin/ui` router, so every mutating route added
-//! there is covered without per-handler wiring.
+//! there is covered without per-handler wiring, the login form included.
 
 use axum::extract::Request;
 use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};

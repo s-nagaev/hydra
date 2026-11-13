@@ -38,6 +38,9 @@ body {
   border-bottom: 1px solid var(--border);
 }
 
+/* The header and the page body share one width cap so their content edges
+   line up. It stays at 1080px: the logs list is down to seven columns, so
+   the widest table on the page fits the card without a wider panel. */
 .topbar-inner {
   max-width: 1080px;
   margin: 0 auto;
@@ -91,6 +94,7 @@ body {
 
 /* Page */
 
+/* Same cap as `.topbar-inner`: one width for the header and the content. */
 .page {
   flex: 1;
   width: 100%;
@@ -145,6 +149,142 @@ body {
 
 .actions-col {
   text-align: right;
+  white-space: nowrap;
+  /* Shrink to the width the controls need; the other columns absorb the rest. */
+  width: 1%;
+}
+
+/* `.data-table th` is one class plus one element and outbids the bare
+   .actions-col class, so the header would otherwise sit left of the button
+   group it labels. Same selector weight, later in the sheet, so it wins. */
+th.actions-col {
+  text-align: right;
+}
+
+.actions-col > * {
+  vertical-align: middle;
+}
+
+/* Collapse the inline whitespace between the controls. Body cells only: the restore
+   rule below matches elements, and the header cell holds a bare text node. */
+td.actions-col {
+  font-size: 0;
+}
+
+td.actions-col > * {
+  font-size: 14px;
+}
+
+.actions-col form.inline {
+  margin-left: 8px;
+}
+
+/* The channels and keys tables take the card's width and never more: a fixed
+   layout puts every column on a share of that width, so the tables follow the
+   viewport instead of outgrowing it, and no scroll container is needed. The
+   shares are the width each column needs for its own content at the narrowest
+   supported viewport (1000px): the masked key, the badges and the action
+   buttons stay on one line, and the wrapping cells (base URL, price runs,
+   names) take the rest. */
+
+.channels-table,
+.keys-table {
+  table-layout: fixed;
+}
+
+.channels-table th:nth-child(1) {
+  width: 8.5%;
+}
+
+.channels-table th:nth-child(2) {
+  width: 8%;
+}
+
+.channels-table th:nth-child(3) {
+  width: 11.5%;
+}
+
+.channels-table th:nth-child(4) {
+  width: 11%;
+}
+
+.channels-table th:nth-child(5) {
+  width: 14%;
+}
+
+.channels-table th:nth-child(6) {
+  width: 11.5%;
+}
+
+.channels-table th:nth-child(7) {
+  width: 9.5%;
+}
+
+.channels-table th:nth-child(8) {
+  width: 26%;
+}
+
+.keys-table th:nth-child(1) {
+  width: 12%;
+}
+
+.keys-table th:nth-child(2) {
+  width: 13.5%;
+}
+
+.keys-table th:nth-child(3) {
+  width: 12%;
+}
+
+.keys-table th:nth-child(4) {
+  width: 14.5%;
+}
+
+.keys-table th:nth-child(5) {
+  width: 9.5%;
+}
+
+.keys-table th:nth-child(6) {
+  width: 12%;
+}
+
+.keys-table th:nth-child(7) {
+  width: 26.5%;
+}
+
+/* Cells whose content has no wrap opportunity of its own (a channel name, a
+   base URL, a key's name): break inside the value rather than widen the
+   column. */
+.cell-wrap {
+  overflow-wrap: anywhere;
+}
+
+/* The rate run `15.00/75.00/1.50/75.00/18.75` is a single word, so a narrow
+   column would hold the table wider than the card; it wraps onto a
+   continuation line instead. */
+.prices-cell {
+  overflow-wrap: anywhere;
+}
+
+/* Narrower viewports keep the same shares with tighter cell padding and
+   tighter action controls, so the buttons stay on one line. Only these two
+   tables are affected: the shares above are sized for this padding, and the
+   logs and stats tables keep the roomier cells. */
+@media (max-width: 1100px) {
+  .channels-table th,
+  .channels-table td,
+  .keys-table th,
+  .keys-table td {
+    padding: 8px 6px;
+  }
+
+  td.actions-col button {
+    padding: 7px 12px;
+  }
+
+  .actions-col form.inline {
+    margin-left: 6px;
+  }
 }
 
 .empty-state {
@@ -384,6 +524,21 @@ form.inline {
   font-size: 13px;
 }
 
+/* A masked upstream key carries a hyphen, and a hyphen is a wrap opportunity:
+   the browser would break it after the `sk-` prefix and the cell reads as two
+   values. The mask is short, so holding it on one line costs almost nothing. */
+td.key-cell {
+  white-space: nowrap;
+}
+
+/* One model per line, five rates on that line. The line wraps when the column
+   is narrower than the run of rates: keeping the table inside the card matters
+   more than holding each rate run on a single line. */
+.price-line {
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
 .model-badge {
   display: inline-block;
   background: #eaf1fe;
@@ -392,7 +547,9 @@ form.inline {
   padding: 1px 6px;
   font-size: 12.5px;
   margin: 1px 2px 1px 0;
-  white-space: nowrap;
+  /* A model name carries hyphens, so a narrow column wraps it inside the badge
+     instead of pushing the column wider. */
+  overflow-wrap: anywhere;
 }
 
 /* Reveal modal extras: copy button state, checkbox gating */
@@ -427,6 +584,45 @@ form.inline {
   margin: 14px 0 0;
 }
 
+/* Log detail: one collapsible block per captured body, with the JSON
+   colors the highlighter in admin.js wraps around values. */
+.body-block {
+  margin: 14px 0 0;
+}
+
+.body-block > summary.snippet-label {
+  margin: 0;
+  cursor: pointer;
+}
+
+.body-block > summary.snippet-label:hover {
+  color: var(--text);
+}
+
+.body-block > .code-snippet {
+  margin: 8px 0 0;
+}
+
+.json-key {
+  color: #0550ae;
+}
+
+.json-string {
+  color: #0a7d33;
+}
+
+.json-number {
+  color: #a13d00;
+}
+
+.json-literal {
+  color: #8250df;
+}
+
+.json-punct {
+  color: var(--text-muted);
+}
+
 /* Logs page: filter bar, pagination strip, status badges */
 
 .filter-bar {
@@ -451,6 +647,46 @@ form.inline {
 .filter-field select {
   width: auto;
   min-width: 130px;
+}
+
+/* The logs bar (`.filter-grid`) is a grid of equal tracks instead of a flex
+   line: a flex line gave every field its own width, so the text input took its
+   intrinsic width while the selects fell back to their minimum, and the
+   native-height date inputs (21px against the 38px of a select) dropped their
+   labels out of line with the rest. 190px is the narrowest track that still
+   shows a whole `datetime-local` value, which settles the bar on four tracks
+   at the supported viewport widths. Fields stretch to the tallest one in their
+   row and their content sits at the bottom of that box, so each row of the bar
+   has one label line and one control line. */
+.filter-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px 14px;
+  align-items: stretch;
+}
+
+.filter-grid .filter-field {
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.filter-grid .filter-field input,
+.filter-grid .filter-field select {
+  width: 100%;
+  min-width: 0;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font: inherit;
+  background: var(--surface);
+}
+
+/* The submit control keeps the width of its label instead of filling the
+   track it is placed in. */
+.filter-grid .filter-field button,
+.filter-grid .filter-field .button {
+  align-self: flex-start;
 }
 
 .table-meta {
@@ -519,41 +755,109 @@ form.inline {
   background: var(--bg);
 }
 
-.badge.bodies {
-  color: var(--accent-dark);
-  background: #eaf1fe;
-  font-size: 11.5px;
+/* The logs table carries the seven columns of the list, and with the fixed
+   layout it is exactly as wide as the card at every viewport, so a value that
+   does not fit wraps or clips inside its own column instead of widening the
+   page. Channel, cached tokens, bodies and the error text are not columns
+   here: they live on the drill-down page, which has no column budget. */
+.logs-table {
+  table-layout: fixed;
 }
 
-.error-cell {
-  max-width: 260px;
+/* Each share is what its column needs when the card is at its narrowest: a
+   1000px viewport leaves 910px of card content, and the shares sum to exactly
+   100% of it. A value that has to stay on one line has to fit, and so does
+   every header label (measured at 15px: the 20-char timestamp needs 169px of
+   cell content, the 16-char masked key prefix 137px, an IPv4 address 129px,
+   the `Duration` label with an 8-digit duration 75px; the longest header,
+   `Time (UTC)`, needs 86px). The key and model columns get the rest of their
+   share because their values wrap instead of clipping. */
+.logs-table th:nth-child(1) {
+  width: 19%; /* Time (UTC) */
 }
 
-.error-cell span {
-  display: inline-block;
-  max-width: 260px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  vertical-align: bottom;
+.logs-table th:nth-child(2) {
+  width: 18%; /* Key */
 }
 
+.logs-table th:nth-child(3) {
+  width: 15.2%; /* Model */
+}
+
+.logs-table th:nth-child(4) {
+  width: 6.8%; /* Status */
+}
+
+.logs-table th:nth-child(5) {
+  width: 12.4%; /* Tokens */
+}
+
+.logs-table th:nth-child(6) {
+  width: 20%; /* Client IP */
+}
+
+.logs-table th:nth-child(7) {
+  width: 8.6%; /* Duration */
+}
+
+/* The shares above are sized for this padding. */
+.logs-table th,
 .logs-table td {
+  padding: 8px 6px;
+}
+
+/* A value that contains a space or a hyphen wraps; one that contains neither
+   (an IPv6 address, a long number) has no break opportunity and is clipped by
+   the cell instead of widening it. */
+.logs-table td {
+  white-space: normal;
+  overflow: hidden;
+}
+
+/* The timestamp is one fixed-shape value whose halves are both shorter than
+   the column, and it would otherwise split every row over two lines. */
+.logs-table td.time-cell {
   white-space: nowrap;
 }
 
-.logs-table td.error-cell {
+/* Values that are one long word: a key name, a model id. They break inside the
+   word rather than lose their tail to the clip. */
+.logs-table td.cell-wrap {
+  overflow-wrap: anywhere;
+}
+
+/* An IPv6 address has no break opportunity at all, so this column wraps
+   nowhere and ellipsizes what does not fit. */
+.logs-table td.ip-cell {
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* The labels are short now, so a header cell wraps inside a narrow column
+   rather than holding the table wider than the card. */
+.logs-table thead th {
   white-space: normal;
 }
 
 /* Log detail drill-down */
 
+/* The time cell anchor stretches over the whole row, so the row itself is the
+   link to the detail page. The overlay is absolutely positioned, so its box is
+   the row's only when the row is its containing block. Relative positioning on
+   a table row is not a defined containing block (CSS 2.1 leaves positioning of
+   internal table boxes undefined, and an engine that ignores it lets the
+   overlay escape to the viewport, where it swallows every click on the page).
+   A transform does establish one on a row: CSS Transforms excludes table
+   columns and column groups from the transformable boxes, and any transform
+   other than `none` makes the element a containing block for absolute
+   descendants. Measured in Chromium: with the row's relative positioning
+   neutralized the overlay still covers exactly its own row, and without the
+   transform it covered the whole viewport. */
 .logs-table tbody tr {
   position: relative;
+  transform: translate(0, 0);
 }
 
-/* The time cell anchor stretches over the whole row, so the row itself
-   is the link to the detail page. */
 .logs-table .row-link {
   color: inherit;
   text-decoration: none;
@@ -597,4 +901,62 @@ form.inline {
   border-top: 2px solid var(--border);
   border-bottom: none;
   color: var(--text-muted);
+}
+
+/* Session login: the page shown before a session exists, and the logout
+   button in the header nav. */
+
+.logout-form {
+  margin: 0;
+}
+
+.logout-form button {
+  padding: 5px 12px;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.login-page {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 360px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.login-brand {
+  font-size: 20px;
+  margin: 0;
+}
+
+.login-hint {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin: 0 0 6px;
+}
+
+.login-error {
+  background: var(--danger-bg);
+  color: var(--danger);
+  border: 1px solid #e5b4b4;
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin: 0;
+  font-size: 14px;
+}
+
+.login-card button {
+  margin-top: 6px;
 }

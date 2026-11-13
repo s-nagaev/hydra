@@ -29,8 +29,8 @@ plus `/v1/models`, one admin user, no failover.
   PostgreSQL): status, token usage including cached tokens, duration,
   errors; bodies are opt-in via `HYDRA_LOG_BODIES` and capped at 1 MB per
   side, while token usage is parsed with or without that flag
-- Single admin over HTTP Basic Auth on `/admin/*`; upstream keys are masked in
-  every response
+- Single admin over HTTP Basic Auth on the JSON API and a session login page
+  for the admin UI; upstream keys are masked in every response
 - SQLite in WAL mode by default, PostgreSQL via `HYDRA_DATABASE_URL`; migrations
   apply automatically at startup for both backends
 - In-memory resolution cache: a fresh hit serves a proxy call without touching
@@ -221,8 +221,11 @@ cap, so a long generation is never cut short between chunks.
 
 ## Admin API
 
-All routes under `/admin/*` require HTTP Basic Auth except `GET /admin/health`,
-which is public liveness. Admin errors use a plain `{"error": "..."}` body.
+The JSON routes under `/admin/*` require HTTP Basic Auth; only `GET /admin/health`
+is public liveness. Admin errors use a plain `{"error": "..."}` body. A
+session cookie issued by the admin UI login does not open the JSON API: it
+answers 401 and the `WWW-Authenticate` challenge, so scripts keep sending
+credentials.
 
 | Method | Path | Purpose |
 | --- | --- | --- |
@@ -257,8 +260,19 @@ needs no auth, neither in the UI nor from a client.
 ## Admin UI
 
 A server-rendered admin UI lives at `/admin/ui`: open
-[http://127.0.0.1:8080/admin/ui](http://127.0.0.1:8080/admin/ui) and
-authenticate with the same Basic Auth credentials as the JSON API. Pages are
+[http://127.0.0.1:8080/admin/ui](http://127.0.0.1:8080/admin/ui) and sign in
+on the login page with the same credentials as the JSON API. The login sets a
+session cookie (7 days, `HttpOnly`, `Secure`, `SameSite=Lax`, scoped to
+`/admin/ui`), which is what keeps the browser from asking for a password on
+every request; Basic Auth keeps working, for example from `curl`. A request
+without a session is sent to the login page instead of being challenged, so
+the browser's Basic Auth dialog never appears. The header carries a Log out
+button for the reverse. The cookie is signed with a key derived from
+`HYDRA_ADMIN_PASSWORD`, so changing the password ends every session; set
+`HYDRA_SESSION_SECRET` to keep sessions across a rotation. The cookie is
+marked `Secure`, which browsers honour on https and on `localhost` and
+`127.0.0.1`; an instance reached over plain HTTP by some other host name or
+IP should get TLS. Pages are
 compiled from askama templates with vendored htmx 2.0.11 (self-hosted, no
 CDN, no JavaScript build step) and a small custom stylesheet, desktop-first
 by design. Every mutating UI request is checked against same-origin browser
@@ -326,8 +340,9 @@ normally get their configuration through `docker run -e` or compose instead.
 | `HYDRA_BIND_ADDR` | `127.0.0.1:8080` | HTTP listener address |
 | `HYDRA_DATABASE_URL` | unset | Database target, see below |
 | `HYDRA_DB_PATH` | `./hydra.db` | SQLite file path, created on first run; used only when `HYDRA_DATABASE_URL` is absent |
-| `HYDRA_ADMIN_LOGIN` | required | admin user for `/admin/*` Basic Auth |
-| `HYDRA_ADMIN_PASSWORD` | required | admin password, compared in constant time |
+| `HYDRA_ADMIN_LOGIN` | required | admin user for `/admin/*` Basic Auth and the admin UI login |
+| `HYDRA_ADMIN_PASSWORD` | required | admin password, compared in constant time; also derives the admin UI session signing key |
+| `HYDRA_SESSION_SECRET` | unset | overrides the session signing key, so admin UI sessions survive a password rotation; an empty value counts as unset |
 | `HYDRA_LOG_BODIES` | `false` | store request and response bodies in logs, 1 MB cap per side |
 | `HYDRA_CACHE_TTL_SECS` | `3600` | lifetime of the key→channel resolution cache, in seconds; `0` disables the cache |
 | `HYDRA_TRUSTED_PROXIES` | unset | comma-separated IPv4/IPv6 CIDR networks of reverse proxies in front of Hydra; a request from one of them has its client IP taken from `X-Forwarded-For`. Invalid entries abort startup |
@@ -391,7 +406,8 @@ list that is not part of the trusted set. When clients reach Hydra
 directly, leave the variable unset: a client-sent `X-Forwarded-For` header
 is then ignored entirely, and the direct peer address is recorded. Invalid
 entries abort startup. The flood cap counts failures against the same
-resolved address, so clients behind one proxy are capped individually.
+resolved address, so clients behind one proxy are capped individually. The
+Docker section has a worked Caddy example and the trust-boundary note.
 
 ## Flood cap
 
@@ -708,6 +724,33 @@ credentials and run `docker compose up -d`; the compose file overrides the
 bind address and DB path for the container. The default compose run is
 SQLite-only; see the PostgreSQL section above for the `--profile postgres`
 variant.
+
+### Behind a reverse proxy
+
+A reverse proxy in front of Hydra (Caddy, Nginx, ...) is the direct peer of
+every request, so `request_logs.client_ip` and the flood cap would see the
+proxy's address for every client. List the network that proxy lives in:
+
+```bash
+# Caddy and Hydra in the same compose network: the subnet shown by
+# `docker network inspect <network>`, e.g. 10.0.4.0/24 on an overlay
+HYDRA_TRUSTED_PROXIES=10.0.4.0/24
+
+# Caddy installed on the same host instead of in a container
+HYDRA_TRUSTED_PROXIES=127.0.0.1/32
+```
+
+For a request whose direct peer falls inside a trusted network, the client IP
+is taken from `X-Forwarded-For`: the first entry of the chain that is not
+inside a trusted network. Caddy's `reverse_proxy` sends that header with no
+extra configuration. Requests from every other peer keep their own address,
+and their `X-Forwarded-For` is ignored entirely. The variable is unset by
+default, and an empty value behaves the same, which is the right setting for a
+Hydra that clients reach directly.
+
+Trust the narrowest network that covers your proxy, and only proxies you
+control: any caller able to open a connection from inside a trusted network
+chooses the address Hydra logs and counts against the flood cap.
 
 ## Development
 

@@ -26,7 +26,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         cfg.log_bodies,
         cfg.trusted_proxies,
         hydra::flood::FloodCap::new(cfg.flood_limit, cfg.flood_window_secs),
-    );
+    )
+    // Session cookies are signed with a key derived from the admin password
+    // unless an explicit secret pins them across password rotations.
+    .with_session_secret(cfg.session_secret.as_deref());
     let app = http::router(state.clone());
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await?;
 

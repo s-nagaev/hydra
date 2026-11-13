@@ -8,12 +8,20 @@
 - Anthropic Messages passthrough at `POST /v1/messages`: the key may arrive in `x-api-key` or in a bearer header, the required `anthropic-version` and the optional `anthropic-beta` are forwarded as sent, and the request body and upstream response pass through untouched.
 - A fifth per-model price dimension, `cache_write_input`, for the tokens an upstream writes into its cache. It is set independently of the input price, so the provider's own figure is entered rather than derived, and a table that names no such rate keeps working and bills those tokens at zero.
 - Cache-write tokens are now stored per request and shown in the admin UI Stat tab next to the input, output and cached columns.
+- Admin UI session login: `/admin/ui` asks for the admin credentials on a login page and sets a 7-day session cookie (`HttpOnly`, `Secure`, `SameSite=Lax`, scoped to `/admin/ui`), signed with a key derived from `HYDRA_ADMIN_PASSWORD`; `HYDRA_SESSION_SECRET` overrides that key, so sessions survive a password rotation. Basic Auth still works for the JSON API and for scripts.
+- Request and response bodies on the admin log detail page open in collapsible blocks, with JSON pretty-printed, streaming frames listed one per line and unicode escapes decoded to their characters.
+- A "Behind a reverse proxy" README section with a worked Caddy example and the trust-boundary note, plus `HYDRA_TRUSTED_PROXIES` documented in `.env.example` and `docker-compose.yml`.
 
 ### Changed
 
 - Cost accounting on Messages no longer undercounts cached calls: the Anthropic prompt counts input plus cache reads plus cache writes before it is priced, so the read share is charged at the read rate and the write share at the write rate.
 - Hydra's own rejections on `/v1/messages` use the Anthropic error envelope, with the error family derived from the status. Chat, Responses and model listing keep the OpenAI envelope.
 - Model prices may be given with four or five dimensions, in the JSON API and in the admin UI price editor, which renders five amounts and accepts either.
+- The admin UI sends a browser without a session to the login page instead of the Basic Auth dialog; the JSON API keeps the `WWW-Authenticate` challenge and the session cookie does not open it.
+
+### Fixed
+
+- The action buttons in an admin table row stay on one line instead of wrapping when the row is narrow.
 
 ## 1.0.0 (2026-11-09)
 
