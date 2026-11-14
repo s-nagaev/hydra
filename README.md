@@ -290,8 +290,11 @@ of those keys and an offer to disable it instead, which preserves the keys
 and their request logs). On the keys page, issue client keys, toggle them,
 and soft-delete them (request logs referencing a deleted key are preserved).
 
-Every interaction swaps a server-rendered fragment into the page; no action
-navigates away. When a key is issued, a modal shows the full key exactly
+Channel rows are links: a click opens that channel's own page
+(`/admin/ui/channels/{id}`) with its metadata, the edit form, the
+enable/disable toggle and the delete action behind a confirmation. Creating a
+channel still happens in place, the form swapping a server-rendered fragment
+into the list page. When a key is issued, a modal shows the full key exactly
 once: a clipboard copy button, a ready-made curl snippet, and a required "I
 have stored the key" checkbox before the modal can be closed. Only a SHA-256
 hash of the key is stored, so after that modal there is no way to display

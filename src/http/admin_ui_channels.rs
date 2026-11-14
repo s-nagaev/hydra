@@ -1,19 +1,23 @@
-//! Admin UI handlers for the channels page.
+//! Admin UI handlers for the channels list and the per-channel detail page.
 //!
-//! Submission pattern: one uniform htmx flow for every interaction. Each
-//! request (open form, save, enable/disable, delete) targets the page's
-//! `#channels-panel` element with an `outerHTML` swap, and the server always
-//! answers with the freshly rendered panel fragment. Successful mutations
-//! re-render the table, failed validations re-render the form with the
-//! submitted values and per-field errors, and refused actions render the
-//! error banner. Validation reuses the JSON API's helpers and every
-//! mutation goes through the same db layer, so the UI cannot drift from
-//! the API's behavior.
+//! Two submission patterns live here. The list keeps the htmx flow: the "New
+//! channel" action and the create form target the page's `#channels-panel`
+//! element with an `outerHTML` swap, and the server answers with the freshly
+//! rendered panel fragment. A row click leaves the list for the full detail
+//! page (`GET /admin/ui/channels/{id}`), which carries no htmx: its edit,
+//! toggle and delete forms post back to the same page (or to the list after
+//! a successful delete) in a plain browser round trip. Successful mutations
+//! re-render the detail page, failed validations re-render its form with the
+//! submitted values and per-field errors, and a refused delete renders the
+//! banner with its "disable instead" action. Validation reuses the JSON
+//! API's helpers and every mutation goes through the same db layer, so the
+//! UI cannot drift from the API's behavior.
 
 use askama::Template;
 use askama_web::WebTemplate;
 use axum::extract::rejection::FormRejection;
 use axum::extract::{Path, State};
+use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
@@ -75,16 +79,15 @@ pub struct ChannelForm {
     pub errors: ChannelFormErrors,
 }
 
-/// The panel fragment: every handler on this page renders it. On the
-/// delete-refused path `disable_instead` carries the channel id so the
-/// banner can offer the disable action.
+/// The panel fragment: the list page's table plus the optional create form
+/// and its error banner. Only the create flow renders it now; the
+/// per-channel actions live on the detail page.
 #[derive(Template, WebTemplate)]
 #[template(path = "partials/channels_panel.html")]
 pub struct ChannelsPanel {
     pub rows: Vec<ChannelRow>,
     pub form: Option<ChannelForm>,
     pub error: Option<String>,
-    pub disable_instead: Option<i64>,
 }
 
 /// Full page wrapper around the same panel for direct navigation and
@@ -96,6 +99,34 @@ pub struct ChannelsPage {
     pub section: &'static str,
     pub rows: Vec<ChannelRow>,
     pub form: Option<ChannelForm>,
+    pub error: Option<String>,
+}
+
+/// The metadata block of one channel's detail page; every value is
+/// display-ready, so the template stays logic-free.
+pub struct ChannelDetail {
+    pub name: String,
+    pub base_url: String,
+    pub api_key_masked: String,
+    pub allowed_models: Option<Vec<String>>,
+    pub prices_display: Vec<String>,
+    pub limitable: bool,
+    pub enabled: bool,
+}
+
+/// The per-channel detail page. A missing channel renders the same page with
+/// a not-found banner and no forms, the convention the old edit route set.
+/// `notice` carries a successful-mutation message, `error` a failure banner
+/// which may offer the "disable instead" action named in `disable_instead`.
+#[derive(Template, WebTemplate)]
+#[template(path = "channel_detail.html")]
+pub struct ChannelDetailPage {
+    pub version: &'static str,
+    pub section: &'static str,
+    pub id: i64,
+    pub channel: Option<ChannelDetail>,
+    pub form: Option<ChannelForm>,
+    pub notice: Option<String>,
     pub error: Option<String>,
     pub disable_instead: Option<i64>,
 }
@@ -306,7 +337,6 @@ async fn panel(
     state: &AppState,
     form: Option<ChannelForm>,
     error: Option<String>,
-    disable_instead: Option<i64>,
 ) -> ChannelsPanel {
     let rows = match rows(state).await {
         Ok(rows) => rows,
@@ -315,28 +345,21 @@ async fn panel(
                 rows: Vec::new(),
                 form,
                 error: Some(internal_error(&e)),
-                disable_instead: None,
             }
         }
     };
-    ChannelsPanel {
-        rows,
-        form,
-        error,
-        disable_instead,
-    }
+    ChannelsPanel { rows, form, error }
 }
 
 /// Renders the full channels page for GET /admin/ui/channels.
 pub async fn page(State(state): State<AppState>, _auth: UiAuth) -> ChannelsPage {
-    let panel = panel(&state, None, None, None).await;
+    let panel = panel(&state, None, None).await;
     ChannelsPage {
         version: env!("CARGO_PKG_VERSION"),
         section: "channels",
         rows: panel.rows,
         form: panel.form,
         error: panel.error,
-        disable_instead: panel.disable_instead,
     }
 }
 
@@ -354,52 +377,104 @@ async fn new_form(State(state): State<AppState>, _auth: UiAuth) -> ChannelsPanel
             errors: ChannelFormErrors::default(),
         }),
         None,
-        None,
     )
     .await
 }
 
-/// "Edit" action: opens the form prefilled with the channel's current
-/// values; the upstream key field stays empty so the stored secret never
-/// crosses the wire. The prices textarea carries the stored table in the
-/// line format the parser reads back.
-async fn edit_form(
+/// Splits a stored channel into the detail page's metadata block and its
+/// prefilled edit form. The upstream key field stays empty so the stored
+/// secret never crosses the wire; the prices textarea carries the stored
+/// table in the line format the parser reads back.
+fn detail_view(priced: PricedChannel) -> (ChannelDetail, ChannelForm) {
+    let limitable = priced.limitable();
+    let PricedChannel {
+        channel,
+        model_prices,
+    } = priced;
+    let Channel {
+        id,
+        name,
+        base_url,
+        api_key,
+        allowed_models,
+        enabled,
+        created_at: _,
+    } = channel;
+    let allowed_models_text = allowed_models.clone().unwrap_or_default().join("\n");
+    let form = ChannelForm {
+        action: edit_action(id),
+        editing: true,
+        name: name.clone(),
+        base_url: base_url.clone(),
+        allowed_models_text,
+        model_prices_text: model_prices.as_ref().map(prices_text).unwrap_or_default(),
+        errors: ChannelFormErrors::default(),
+    };
+    let detail = ChannelDetail {
+        api_key_masked: mask_api_key(&api_key),
+        name,
+        base_url,
+        allowed_models,
+        prices_display: model_prices
+            .as_ref()
+            .map(prices_display)
+            .unwrap_or_default(),
+        limitable,
+        enabled,
+    };
+    (detail, form)
+}
+
+/// Renders the reference detail page for one id: metadata plus the prefilled
+/// edit form. Handlers add a notice, an error or the disable-instead action
+/// on top of it. A missing row yields the not-found banner with no forms.
+async fn detail_page(state: &AppState, id: i64) -> ChannelDetailPage {
+    match channels::find_priced(&state.db, id).await {
+        Ok(Some(priced)) => {
+            let (channel, form) = detail_view(priced);
+            ChannelDetailPage {
+                version: env!("CARGO_PKG_VERSION"),
+                section: "channels",
+                id,
+                channel: Some(channel),
+                form: Some(form),
+                notice: None,
+                error: None,
+                disable_instead: None,
+            }
+        }
+        Ok(None) => not_found_page(id),
+        Err(e) => ChannelDetailPage {
+            error: Some(internal_error(&e)),
+            ..not_found_page(id)
+        },
+    }
+}
+
+/// The detail page shape with no channel loaded: not-found banner, no
+/// metadata, no forms. `detail_page` fills the block in when the row exists.
+fn not_found_page(id: i64) -> ChannelDetailPage {
+    ChannelDetailPage {
+        version: env!("CARGO_PKG_VERSION"),
+        section: "channels",
+        id,
+        channel: None,
+        form: None,
+        notice: None,
+        error: Some("channel not found".to_string()),
+        disable_instead: None,
+    }
+}
+
+/// GET /admin/ui/channels/{id}: the drill-down page for one channel, a full
+/// render rather than a fragment. Its edit, toggle and delete forms post
+/// back to this page (or to the list after a delete), so it carries no htmx.
+async fn detail(
     State(state): State<AppState>,
     _auth: UiAuth,
     Path(id): Path<i64>,
-) -> ChannelsPanel {
-    match channels::find_priced(&state.db, id).await {
-        Ok(Some(priced)) => {
-            let allowed_models_text = priced
-                .channel
-                .allowed_models
-                .clone()
-                .unwrap_or_default()
-                .join("\n");
-            let model_prices_text = priced
-                .model_prices
-                .as_ref()
-                .map(prices_text)
-                .unwrap_or_default();
-            panel(
-                &state,
-                Some(ChannelForm {
-                    action: edit_action(id),
-                    editing: true,
-                    name: priced.channel.name,
-                    base_url: priced.channel.base_url,
-                    allowed_models_text,
-                    model_prices_text,
-                    errors: ChannelFormErrors::default(),
-                }),
-                None,
-                None,
-            )
-            .await
-        }
-        Ok(None) => panel(&state, None, Some("channel not found".to_string()), None).await,
-        Err(e) => panel(&state, None, Some(internal_error(&e)), None).await,
-    }
+) -> ChannelDetailPage {
+    detail_page(&state, id).await
 }
 
 fn field_error(error: AdminError) -> String {
@@ -466,13 +541,7 @@ async fn create(
     payload: Result<axum::Form<ChannelCreateForm>, FormRejection>,
 ) -> ChannelsPanel {
     let Ok(submitted) = payload else {
-        return panel(
-            &state,
-            None,
-            Some("invalid form submission".to_string()),
-            None,
-        )
-        .await;
+        return panel(&state, None, Some("invalid form submission".to_string())).await;
     };
     let submitted = submitted.0;
     let parsed_models = parse_allowed_models_text(submitted.allowed_models.as_deref());
@@ -497,7 +566,7 @@ async fn create(
             model_prices_text: submitted.model_prices.unwrap_or_default(),
             errors,
         };
-        return panel(&state, Some(form), None, None).await;
+        return panel(&state, Some(form), None).await;
     }
     match channels::create_with_prices(
         &state.db,
@@ -511,28 +580,26 @@ async fn create(
     )
     .await
     {
-        Ok(_) => panel(&state, None, None, None).await,
-        Err(e) => panel(&state, None, Some(internal_error(&e)), None).await,
+        Ok(_) => panel(&state, None, None).await,
+        Err(e) => panel(&state, None, Some(internal_error(&e))).await,
     }
 }
 
 /// Edit-channel form POST. An empty key field keeps the stored key; the
 /// allowed-models textarea always carries the full intended list, empty
 /// meaning allow-all (matching the JSON API's `Some(Some([]))` semantics).
+/// Validation failures re-render the prefilled form with the submitted
+/// values and per-field errors; success re-renders the detail page.
 async fn update(
     State(state): State<AppState>,
     _auth: UiAuth,
     Path(id): Path<i64>,
     payload: Result<axum::Form<ChannelEditForm>, FormRejection>,
-) -> ChannelsPanel {
+) -> Response {
     let Ok(submitted) = payload else {
-        return panel(
-            &state,
-            None,
-            Some("invalid form submission".to_string()),
-            None,
-        )
-        .await;
+        let mut page = detail_page(&state, id).await;
+        page.error = Some("invalid form submission".to_string());
+        return page.into_response();
     };
     let submitted = submitted.0;
     // Empty or absent key input means "keep the current key".
@@ -554,7 +621,8 @@ async fn update(
         errors.model_prices = Some(message);
     }
     if errors.any() {
-        let form = ChannelForm {
+        let mut page = detail_page(&state, id).await;
+        page.form = Some(ChannelForm {
             action: edit_action(id),
             editing: true,
             name: submitted.name,
@@ -562,8 +630,8 @@ async fn update(
             allowed_models_text: parsed_models.join("\n"),
             model_prices_text: submitted.model_prices.unwrap_or_default(),
             errors,
-        };
-        return panel(&state, Some(form), None, None).await;
+        });
+        return page.into_response();
     }
     // Invalidate every entry bound to the channel before and after: the
     // edit form can rotate base_url and the upstream api_key together.
@@ -584,29 +652,31 @@ async fn update(
     {
         Ok(Some(_)) => {
             state.cache.invalidate_channel(id);
-            panel(&state, None, None, None).await
+            let mut page = detail_page(&state, id).await;
+            page.notice = Some("channel updated".to_string());
+            page.into_response()
         }
-        Ok(None) => panel(&state, None, Some("channel not found".to_string()), None).await,
-        Err(e) => panel(&state, None, Some(internal_error(&e)), None).await,
+        Ok(None) => detail_page(&state, id).await.into_response(),
+        Err(e) => {
+            let mut page = detail_page(&state, id).await;
+            page.error = Some(internal_error(&e));
+            page.into_response()
+        }
     }
 }
 
-/// Enable/disable toggle. The form carries the target state, so no read
-/// of the current row is needed.
+/// Enable/disable toggle. The form carries the target state, so no read of
+/// the current row is needed; success re-renders the detail page.
 async fn toggle(
     State(state): State<AppState>,
     _auth: UiAuth,
     Path(id): Path<i64>,
     payload: Result<axum::Form<ToggleForm>, FormRejection>,
-) -> ChannelsPanel {
+) -> Response {
     let Ok(submitted) = payload else {
-        return panel(
-            &state,
-            None,
-            Some("invalid form submission".to_string()),
-            None,
-        )
-        .await;
+        let mut page = detail_page(&state, id).await;
+        page.error = Some("invalid form submission".to_string());
+        return page.into_response();
     };
     state.cache.invalidate_channel(id);
     match channels::update(
@@ -624,42 +694,59 @@ async fn toggle(
     {
         Ok(Some(_)) => {
             state.cache.invalidate_channel(id);
-            panel(&state, None, None, None).await
+            let mut page = detail_page(&state, id).await;
+            page.notice = Some(
+                if submitted.enabled {
+                    "channel enabled"
+                } else {
+                    "channel disabled"
+                }
+                .to_string(),
+            );
+            page.into_response()
         }
-        Ok(None) => panel(&state, None, Some("channel not found".to_string()), None).await,
-        Err(e) => panel(&state, None, Some(internal_error(&e)), None).await,
+        Ok(None) => detail_page(&state, id).await.into_response(),
+        Err(e) => {
+            let mut page = detail_page(&state, id).await;
+            page.error = Some(internal_error(&e));
+            page.into_response()
+        }
     }
 }
 
-/// Delete with the 409 flow: when keys are still bound the panel comes
-/// back with their count in the banner and a "disable instead" action,
-/// because disabling preserves the keys and their request logs.
-async fn delete(
-    State(state): State<AppState>,
-    _auth: UiAuth,
-    Path(id): Path<i64>,
-) -> ChannelsPanel {
+/// Delete with the 409 flow: a hard delete redirects to the list, because
+/// the entity is gone; a channel that still has keys bound re-renders its
+/// detail page with their count in the banner and a "disable instead"
+/// action, because disabling preserves the keys and their request logs.
+async fn delete(State(state): State<AppState>, _auth: UiAuth, Path(id): Path<i64>) -> Response {
     state.cache.invalidate_channel(id);
-    match channels::delete(&state.db, id).await {
+    let page = match channels::delete(&state.db, id).await {
         Ok(DeleteOutcome::Deleted) => {
             state.cache.invalidate_channel(id);
-            panel(&state, None, None, None).await
+            return Redirect::to("/admin/ui/channels").into_response();
         }
-        Ok(DeleteOutcome::NotFound) => {
-            panel(&state, None, Some("channel not found".to_string()), None).await
-        }
-        Ok(DeleteOutcome::HasBoundKeys) => match channels::bound_key_count(&state.db, id).await {
-            Ok(count) => {
-                let error = format!(
-                    "cannot delete this channel: {count} client keys are still bound to it. \
-                     Disabling preserves those keys and their request logs."
-                );
-                panel(&state, None, Some(error), Some(id)).await
+        Ok(DeleteOutcome::NotFound) => detail_page(&state, id).await,
+        Ok(DeleteOutcome::HasBoundKeys) => {
+            let mut page = detail_page(&state, id).await;
+            match channels::bound_key_count(&state.db, id).await {
+                Ok(count) => {
+                    page.error = Some(format!(
+                        "cannot delete this channel: {count} client keys are still bound to it. \
+                         Disabling preserves those keys and their request logs."
+                    ));
+                    page.disable_instead = Some(id);
+                }
+                Err(e) => page.error = Some(internal_error(&e)),
             }
-            Err(e) => panel(&state, None, Some(internal_error(&e)), None).await,
-        },
-        Err(e) => panel(&state, None, Some(internal_error(&e)), None).await,
-    }
+            page
+        }
+        Err(e) => {
+            let mut page = detail_page(&state, id).await;
+            page.error = Some(internal_error(&e));
+            page
+        }
+    };
+    page.into_response()
 }
 
 /// Channel routes for the `/admin/ui` nest. They are merged into the UI
@@ -669,8 +756,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/channels", get(page).post(create))
         .route("/channels/form", get(new_form))
-        .route("/channels/{id}/edit", get(edit_form))
-        .route("/channels/{id}", post(update))
+        .route("/channels/{id}", get(detail).post(update))
         .route("/channels/{id}/toggle", post(toggle))
         .route("/channels/{id}/delete", post(delete))
 }

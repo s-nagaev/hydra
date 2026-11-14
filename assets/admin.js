@@ -1,11 +1,14 @@
 // Admin UI helpers, self-hosted like admin.css and htmx.min.js: no build
 // step, no dependencies, embedded into the binary with include_bytes!.
 //
-// The log detail page shows captured bodies inside <pre class="code-snippet">
-// elements. A body is attacker-influenced input, so the highlighter reads
-// the element with textContent, tokenizes the JSON in that string, and
-// rebuilds the element out of text nodes and <span> elements. Raw body text
-// never becomes an HTML string.
+// Two behaviors live here. The log detail page shows captured bodies inside
+// <pre class="code-snippet"> elements. A body is attacker-influenced input, so
+// the highlighter reads the element with textContent, tokenizes the JSON in
+// that string, and rebuilds the element out of text nodes and <span>
+// elements. Raw body text never becomes an HTML string. Forms on the detail
+// pages carry no htmx, so a destructive one names its question in
+// data-confirm and the submit listener asks the browser's own confirm dialog
+// before the request leaves.
 (function () {
   "use strict";
 
@@ -78,4 +81,18 @@
   } else {
     run();
   }
+
+  // Confirmation for a destructive form on a page without htmx: the form
+  // carries the question, the browser handles the dialog, a declined answer
+  // cancels the submit.
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (!(form instanceof HTMLFormElement)) {
+      return;
+    }
+    var message = form.getAttribute("data-confirm");
+    if (message && !window.confirm(message)) {
+      event.preventDefault();
+    }
+  });
 })();

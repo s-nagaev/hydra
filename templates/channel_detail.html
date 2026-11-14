@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+
+{% block title %}Channel #{{ id }}{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>Channel #{{ id }}</h1>
+    <a class="button" href="/admin/ui/channels">Back to channels</a>
+  </div>
+
+  {% if let Some(message) = notice %}
+  <div class="notice-banner" role="status">{{ message }}</div>
+  {% endif %}
+
+  {% if let Some(message) = error %}
+  <div class="error-banner" role="alert">
+    {{ message }}
+    {% if let Some(channel_id) = disable_instead %}
+    <form class="inline" method="post" action="/admin/ui/channels/{{ channel_id }}/toggle">
+      <input type="hidden" name="enabled" value="false">
+      <button type="submit" class="danger">Disable instead</button>
+    </form>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {% if let Some(channel) = channel %}
+  <table class="data-table detail-meta">
+    <tbody>
+      <tr>
+        <th scope="row">Name</th>
+        <td>{{ channel.name }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Base URL</th>
+        <td class="mono">{{ channel.base_url }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Upstream API key</th>
+        <td class="mono">{{ channel.api_key_masked }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Allowed models</th>
+        <td>
+          {% match channel.allowed_models %}
+          {% when Some with (models) %}
+          {% for model in models %}<span class="model-badge">{{ model }}</span> {% endfor %}
+          {% when None %}<span class="text-muted">all</span>{% endmatch %}
+        </td>
+      </tr>
+      <tr>
+        <th scope="row">Prices</th>
+        <td class="mono">
+          {% if channel.prices_display.is_empty() %}<span class="text-muted">none</span>
+          {% else %}{% for line in channel.prices_display %}<div class="price-line">{{ line }}</div>{% endfor %}{% endif %}
+        </td>
+      </tr>
+      <tr>
+        <th scope="row">Monthly limits</th>
+        <td>
+          {% if channel.limitable %}<span class="badge ok">limitable</span>
+          {% else %}<span class="badge off">not limitable</span>{% endif %}
+          <div class="field-hint">limitable = eligible for monthly key limits: the channel is enabled, its allowed models are a fixed list, and every model in that list carries a price entry.</div>
+        </td>
+      </tr>
+      <tr>
+        <th scope="row">State</th>
+        <td>
+          {% if channel.enabled %}<span class="badge ok">enabled</span>
+          {% else %}<span class="badge off">disabled</span>{% endif %}
+        </td>
+      </tr>
+    </tbody>
+  </table>
+
+  {% if let Some(form) = form %}
+  <h2 class="detail-heading">Edit channel</h2>
+  <form class="stack channel-form" method="post" action="{{ form.action }}">
+    <div>
+      <label for="channel-name">Name</label>
+      <input type="text" id="channel-name" name="name" value="{{ form.name }}">
+      {% if let Some(error) = form.errors.name %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div>
+      <label for="channel-base-url">Base URL</label>
+      <input type="text" id="channel-base-url" name="base_url" value="{{ form.base_url }}">
+      {% if let Some(error) = form.errors.base_url %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div>
+      <label for="channel-api-key">Upstream API key</label>
+      <input type="password" id="channel-api-key" name="api_key" autocomplete="new-password">
+      {% if form.editing %}<div class="field-hint">Leave empty to keep the current key.</div>{% endif %}
+      {% if let Some(error) = form.errors.api_key %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div>
+      <label for="channel-models">Allowed models</label>
+      <textarea id="channel-models" name="allowed_models" rows="3">{{ form.allowed_models_text }}</textarea>
+      <div class="field-hint">One model per line; leave empty to allow every model.</div>
+      {% if let Some(error) = form.errors.allowed_models %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div>
+      <label for="channel-prices">Prices</label>
+      <textarea id="channel-prices" name="model_prices" rows="4">{{ form.model_prices_text }}</textarea>
+      <div class="field-hint">One model per line: <span class="mono">model: input, output, cached_input, cached_output[, cache_write_input]</span>, in USD per 1M tokens. Leave empty for no prices. The last amount is the cache-write rate (Anthropic cache creation tokens) and may be left out, which prices them at nothing.</div>
+      {% if let Some(error) = form.errors.model_prices %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="primary">Save channel</button>
+    </div>
+  </form>
+  {% endif %}
+
+  <h2 class="detail-heading">Manage</h2>
+  <div class="form-actions">
+    <form method="post" action="/admin/ui/channels/{{ id }}/toggle">
+      <input type="hidden" name="enabled" value="{% if channel.enabled %}false{% else %}true{% endif %}">
+      <button type="submit">{% if channel.enabled %}Disable{% else %}Enable{% endif %}</button>
+    </form>
+    <form method="post" action="/admin/ui/channels/{{ id }}/delete" data-confirm="Delete this channel?">
+      <button type="submit" class="danger">Delete</button>
+    </form>
+  </div>
+  {% endif %}
+</section>
+{% endblock %}
