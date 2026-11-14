@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added: Detail pages for channels and keys
+- Added: Switching a key's channel from its detail page
+- Changed: Rows in the channels and keys tables link to the detail page
+- Removed: Actions columns in the channels and keys tables and the /admin/ui/{channels,keys}/{id}/edit routes
+
 ## 1.1.0 (2026-11-13)
 
 ### Added

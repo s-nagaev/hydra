@@ -82,8 +82,36 @@ async fn get_page(db: &SqlitePool, uri: &str) -> Send {
     send(db, "GET", uri, None, None, Some(&auth_header())).await
 }
 
+/// Sends a POST and returns its status together with the `Location` header,
+/// for the routes that answer with a redirect instead of a page.
+async fn post_redirect(db: &SqlitePool, uri: &str, body: &str) -> (StatusCode, Option<String>) {
+    let app = test_app(db.clone());
+    let request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("Authorization", auth_header())
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(Body::from(body.to_string()))
+        .unwrap();
+    let response = within(hydra::http::router(app).oneshot(request))
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get("location")
+        .map(|value| value.to_str().unwrap().to_string());
+    (status, location)
+}
+
 /// Creates a channel through the admin JSON API and returns its id.
 async fn create_channel(db: &SqlitePool) -> i64 {
+    create_channel_named(db, "primary").await
+}
+
+/// Creates a channel with the given name through the admin JSON API and
+/// returns its id, for tests that need more than one bindable channel.
+async fn create_channel_named(db: &SqlitePool, name: &str) -> i64 {
     let app = test_app(db.clone());
     let request = Request::builder()
         .method("POST")
@@ -92,7 +120,7 @@ async fn create_channel(db: &SqlitePool) -> i64 {
         .header("Content-Type", "application/json")
         .body(Body::from(
             serde_json::json!({
-                "name": "primary",
+                "name": name,
                 "base_url": "https://api.example.com",
                 "api_key": "sk-upstream-secret-1234567890",
             })
@@ -131,6 +159,16 @@ async fn key_id_for_channel(db: &SqlitePool, channel_id: i64) -> i64 {
     .unwrap()
 }
 
+async fn key_channel(db: &SqlitePool, key_id: i64) -> i64 {
+    within(
+        sqlx::query_scalar::<_, i64>("SELECT channel_id FROM api_keys WHERE id = ?")
+            .bind(key_id)
+            .fetch_one(db),
+    )
+    .await
+    .unwrap()
+}
+
 // --- Channels page -------------------------------------------------------
 
 #[tokio::test]
@@ -153,7 +191,26 @@ async fn channel_create_form_post_renders_new_row_with_masked_key() {
     assert!(body.contains("sk-u...7890"));
     assert!(!body.contains("sk-upstream-secret-1234567890"));
     assert!(body.contains("gpt-4o"));
-    assert!(body.contains("/admin/ui/channels/1/toggle"));
+    assert!(
+        body.contains("href=\"/admin/ui/channels/1\""),
+        "the row must link to the detail page: {body}"
+    );
+    assert!(
+        !body.contains("/toggle") && !body.contains("actions-col"),
+        "the list carries no row actions any more: {body}"
+    );
+}
+
+#[tokio::test]
+async fn channels_list_empty_state_spans_the_seven_columns() {
+    let db = test_pool().await;
+    let (status, body) = get_page(&db, "/admin/ui/channels").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("No channels yet"), "{body}");
+    assert!(
+        body.contains("colspan=\"7\"") && !body.contains("colspan=\"8\""),
+        "the empty state spans the whole row once the actions column is gone: {body}"
+    );
 }
 
 #[tokio::test]
@@ -254,6 +311,19 @@ async fn channel_delete_with_bound_keys_shows_count_and_disable_instead_flow() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("1 client keys are still bound"));
     assert!(body.contains("Disable instead"));
+    // The refusal renders on the detail page, whose banner carries a plain
+    // form that turns the channel off.
+    assert!(
+        body.contains(&format!(
+            "action=\"/admin/ui/channels/{channel_id}/toggle\""
+        )),
+        "{body}"
+    );
+    assert!(body.contains("value=\"false\""), "{body}");
+    assert!(
+        body.contains(&format!("action=\"/admin/ui/channels/{channel_id}\"")),
+        "the detail page form stays available: {body}"
+    );
     // The channel survives the refused delete.
     assert!(channel_enabled(&db, channel_id).await);
 
@@ -269,19 +339,167 @@ async fn channel_delete_with_bound_keys_shows_count_and_disable_instead_flow() {
 }
 
 #[tokio::test]
-async fn channel_delete_clean_path_removes_the_row() {
+async fn channel_delete_clean_path_redirects_to_the_list() {
     let db = test_pool().await;
     let channel_id = create_channel(&db).await;
-    let (status, body) =
-        post_form(&db, &format!("/admin/ui/channels/{channel_id}/delete"), "").await;
-    assert_eq!(status, StatusCode::OK);
-    // The row is gone (its base_url only ever renders inside a row).
-    assert!(!body.contains("api.example.com"));
-    assert!(body.contains("No channels yet"));
+    let (status, location) =
+        post_redirect(&db, &format!("/admin/ui/channels/{channel_id}/delete"), "").await;
+    assert_eq!(
+        status,
+        StatusCode::SEE_OTHER,
+        "a hard delete sends the browser back to the list"
+    );
+    assert_eq!(location.as_deref(), Some("/admin/ui/channels"));
     let count: i64 = within(sqlx::query_scalar("SELECT COUNT(*) FROM channels").fetch_one(&db))
         .await
         .unwrap();
     assert_eq!(count, 0);
+    // The list renders the empty state again.
+    let (status, body) = get_page(&db, "/admin/ui/channels").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("No channels yet"), "{body}");
+}
+
+// --- Channel detail page --------------------------------------------------
+
+#[tokio::test]
+async fn channel_detail_page_renders_metadata_the_edit_form_and_the_actions() {
+    let db = test_pool().await;
+    let channel_id = create_channel(&db).await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/channels/{channel_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Metadata, with the upstream key masked as everywhere else.
+    assert!(body.contains("primary"), "{body}");
+    assert!(body.contains("https://api.example.com"), "{body}");
+    assert!(body.contains("sk-u...7890"), "{body}");
+    assert!(!body.contains("sk-upstream-secret-1234567890"), "{body}");
+
+    // The edit form posts back to the same page.
+    assert!(
+        body.contains(&format!("action=\"/admin/ui/channels/{channel_id}\"")),
+        "{body}"
+    );
+    assert!(body.contains("Save channel"), "{body}");
+
+    // Enable/disable and delete live here, with the confirm on the delete.
+    assert!(
+        body.contains(&format!(
+            "action=\"/admin/ui/channels/{channel_id}/toggle\""
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "action=\"/admin/ui/channels/{channel_id}/delete\""
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains("data-confirm=\"Delete this channel?\""),
+        "{body}"
+    );
+
+    // A plain link back to the list.
+    assert!(body.contains("href=\"/admin/ui/channels\""), "{body}");
+
+    // The detail page carries no htmx: plain forms and a plain link only.
+    assert!(!body.contains("hx-"), "{body}");
+}
+
+#[tokio::test]
+async fn channel_detail_page_for_an_unknown_id_shows_the_not_found_banner() {
+    let db = test_pool().await;
+    let (status, body) = get_page(&db, "/admin/ui/channels/999").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a missing channel is a banner page, not a rejection"
+    );
+    assert!(body.contains("channel not found"), "{body}");
+    assert!(
+        !body.contains("Save channel"),
+        "no form for a channel that is not there: {body}"
+    );
+    assert!(!body.contains("/999/toggle"), "{body}");
+}
+
+#[tokio::test]
+async fn channel_detail_edit_post_rejects_invalid_values_and_keeps_them_in_the_form() {
+    let db = test_pool().await;
+    let channel_id = create_channel(&db).await;
+    let (status, body) = post_form(
+        &db,
+        &format!("/admin/ui/channels/{channel_id}"),
+        &form(&[
+            ("name", "broken"),
+            ("base_url", "not a url"),
+            ("api_key", ""),
+            ("allowed_models", ""),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("invalid base_url: not a url"), "{body}");
+    assert!(body.contains("field-error"), "{body}");
+    // The rejected submission stays in the form for correction.
+    assert!(body.contains("value=\"not a url\""), "{body}");
+    // Nothing was stored: the created name survives.
+    let name: String = within(
+        sqlx::query_scalar("SELECT name FROM channels WHERE id = ?")
+            .bind(channel_id)
+            .fetch_one(&db),
+    )
+    .await
+    .unwrap();
+    assert_eq!(name, "primary");
+}
+
+#[tokio::test]
+async fn channel_detail_edit_post_success_rerenders_the_page_with_a_notice() {
+    let db = test_pool().await;
+    let channel_id = create_channel(&db).await;
+    let (status, body) = post_form(
+        &db,
+        &format!("/admin/ui/channels/{channel_id}"),
+        &form(&[
+            ("name", "renamed"),
+            ("base_url", "https://api.example.com/v1"),
+            ("api_key", ""),
+            ("allowed_models", "gpt-4o"),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("channel updated"), "{body}");
+    assert!(body.contains("value=\"renamed\""), "{body}");
+    assert!(body.contains("https://api.example.com/v1"), "{body}");
+    // The saved values are the stored ones.
+    let base_url: String = within(
+        sqlx::query_scalar("SELECT base_url FROM channels WHERE id = ?")
+            .bind(channel_id)
+            .fetch_one(&db),
+    )
+    .await
+    .unwrap();
+    assert_eq!(base_url, "https://api.example.com/v1");
+}
+
+#[tokio::test]
+async fn channel_detail_toggle_renders_the_new_state_on_the_detail_page() {
+    let db = test_pool().await;
+    let channel_id = create_channel(&db).await;
+    let (status, body) = post_form(
+        &db,
+        &format!("/admin/ui/channels/{channel_id}/toggle"),
+        &form(&[("enabled", "false")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("channel disabled"), "{body}");
+    assert!(body.contains("badge off"), "{body}");
+    assert!(!channel_enabled(&db, channel_id).await);
 }
 
 // --- Keys page ------------------------------------------------------------
@@ -297,6 +515,18 @@ fn full_key_from(body: &str) -> String {
         .next()
         .expect("key value must be closed")
         .to_string()
+}
+
+#[tokio::test]
+async fn keys_list_empty_state_spans_the_six_columns() {
+    let db = test_pool().await;
+    let (status, body) = get_page(&db, "/admin/ui/keys").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("No keys yet"), "{body}");
+    assert!(
+        body.contains("colspan=\"6\"") && !body.contains("colspan=\"7\""),
+        "the empty state spans the whole row once the actions column is gone: {body}"
+    );
 }
 
 #[tokio::test]
@@ -361,6 +591,10 @@ async fn key_toggle_flips_enabled_state_both_ways() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("badge off"));
+    assert!(
+        body.contains("key disabled"),
+        "the toggle answers on the key's detail page: {body}"
+    );
 
     let (status, body) = post_form(
         &db,
@@ -370,6 +604,7 @@ async fn key_toggle_flips_enabled_state_both_ways() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("badge ok"));
+    assert!(body.contains("key enabled"), "{body}");
     let enabled: i64 = within(
         sqlx::query_scalar::<_, i64>("SELECT enabled FROM api_keys WHERE id = ?")
             .bind(key_id)
@@ -381,15 +616,21 @@ async fn key_toggle_flips_enabled_state_both_ways() {
 }
 
 #[tokio::test]
-async fn key_delete_renders_deleted_badge_and_second_delete_shows_banner() {
+async fn key_delete_renders_the_read_only_detail_page_and_keeps_the_row() {
     let db = test_pool().await;
     let channel_id = create_channel(&db).await;
     common::seed_key(&db, channel_id).await;
     let key_id = key_id_for_channel(&db, channel_id).await;
 
+    // A soft delete answers with the key's own page, not a redirect: the row
+    // still exists.
     let (status, body) = post_form(&db, &format!("/admin/ui/keys/{key_id}/delete"), "").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("badge deleted"));
+    assert!(
+        body.contains("key is deleted and cannot be edited"),
+        "the deleted state explains itself: {body}"
+    );
     let deleted_at: Option<String> = within(
         sqlx::query_scalar("SELECT deleted_at FROM api_keys WHERE id = ?")
             .bind(key_id)
@@ -399,7 +640,13 @@ async fn key_delete_renders_deleted_badge_and_second_delete_shows_banner() {
     .unwrap();
     assert!(deleted_at.is_some());
 
-    // A deleted key shows no actions and stays immutable.
+    // The read-only page carries no mutation form of any kind.
+    assert!(
+        !body.contains("Save key") && !body.contains("/toggle") && !body.contains("/delete"),
+        "a deleted key offers no edit, toggle or delete form: {body}"
+    );
+
+    // A second delete and a toggle both refuse with the shared message.
     let (status, body) = post_form(&db, &format!("/admin/ui/keys/{key_id}/delete"), "").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("key is already deleted"));
@@ -411,6 +658,15 @@ async fn key_delete_renders_deleted_badge_and_second_delete_shows_banner() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("key is deleted and cannot be edited"));
+    let (status, body) = post_form(
+        &db,
+        &format!("/admin/ui/keys/{key_id}"),
+        &form(&[("name", "x"), ("monthly_limit_usd", "1")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("key is deleted and cannot be edited"));
+    assert_eq!(key_name(&db, key_id).await, None);
 }
 
 #[tokio::test]
@@ -502,13 +758,20 @@ async fn key_create_form_post_stores_the_limit_and_shows_it_with_the_inactive_ba
     assert!(body.contains("$50.00"), "{body}");
     // A channel without prices cannot limit, so the stored limit is flagged
     // as inactive in the row.
+    assert!(body.contains("limit inactive"), "{body}");
+    // The row opens the detail page; the row actions are gone, and so is the
+    // tooltip that explained the inactive limit (the detail page states it).
     assert!(
-        body.contains("limit inactive: channel prices incomplete"),
-        "{body}"
+        body.contains(&format!("href=\"/admin/ui/keys/{key_id}\"")),
+        "the row must link to the detail page: {body}"
     );
     assert!(
-        body.contains(&format!("/admin/ui/keys/{key_id}/edit")),
-        "the row must offer the edit form"
+        !body.contains("actions-col") && !body.contains("/toggle") && !body.contains("/edit"),
+        "the list carries no row actions any more: {body}"
+    );
+    assert!(
+        !body.contains("title=\"the limit is stored but not enforced"),
+        "the inactive-limit tooltip is unreachable under the row overlay: {body}"
     );
 }
 
@@ -584,32 +847,165 @@ async fn key_create_form_rejects_a_bad_limit_without_issuing_a_key() {
     assert_eq!(count, 0);
 }
 
+// --- Key detail page ------------------------------------------------------
+
+/// The key id of the single seeded key.
+async fn only_key_id(db: &SqlitePool) -> i64 {
+    within(
+        sqlx::query_scalar::<_, i64>("SELECT id FROM api_keys ORDER BY id LIMIT 1").fetch_one(db),
+    )
+    .await
+    .unwrap()
+}
+
 #[tokio::test]
-async fn key_edit_form_opens_prefilled_with_the_label_and_the_limit() {
+async fn key_detail_page_renders_metadata_the_edit_form_and_the_actions() {
     let db = test_pool().await;
     let channel_id = create_channel(&db).await;
     let (status, _) = issue_key(&db, channel_id, "ci-bot", "50.00").await;
     assert_eq!(status, StatusCode::OK);
     let key_id = key_id_for_channel(&db, channel_id).await;
 
-    let (status, body) = get_page(&db, &format!("/admin/ui/keys/{key_id}/edit")).await;
+    let (status, body) = get_page(&db, &format!("/admin/ui/keys/{key_id}")).await;
     assert_eq!(status, StatusCode::OK);
+
+    // Metadata: the display prefix, the label, the stored limit, the creation
+    // stamp.
+    let prefix: String = within(
+        sqlx::query_scalar("SELECT display_prefix FROM api_keys WHERE id = ?")
+            .bind(key_id)
+            .fetch_one(&db),
+    )
+    .await
+    .unwrap();
+    assert!(body.contains(&prefix), "{body}");
+    assert!(body.contains("ci-bot"), "{body}");
+    assert!(body.contains("$50.00"), "{body}");
+    assert!(body.contains("2026-"), "{body}");
+
+    // The bound channel is visible text and a link to its own page.
     assert!(
-        body.contains(&format!("hx-post=\"/admin/ui/keys/{key_id}\"")),
+        body.contains(&format!(
+            "href=\"/admin/ui/channels/{channel_id}\">primary</a>"
+        )),
+        "{body}"
+    );
+
+    // The edit form posts back to this page, with the bound channel selected
+    // in the select.
+    assert!(
+        body.contains(&format!("action=\"/admin/ui/keys/{key_id}\"")),
+        "{body}"
+    );
+    assert!(body.contains("id=\"key-channel\""), "{body}");
+    assert!(
+        body.contains(&format!(
+            "<option value=\"{channel_id}\" selected>primary</option>"
+        )),
         "{body}"
     );
     assert!(body.contains("value=\"ci-bot\""), "{body}");
     assert!(body.contains("value=\"50.00\""), "{body}");
     assert!(body.contains("Save key"), "{body}");
-    // The channel binding is not editable: the select is replaced by a
-    // read-only field carrying the channel name.
-    assert!(!body.contains("id=\"key-channel\""), "{body}");
-    assert!(body.contains("id=\"key-channel-name\""), "{body}");
-    assert!(body.contains("value=\"primary\""), "{body}");
+
+    // Enable/disable and delete live here, with the confirm on the delete.
+    assert!(
+        body.contains(&format!("action=\"/admin/ui/keys/{key_id}/toggle\"")),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!("action=\"/admin/ui/keys/{key_id}/delete\"")),
+        "{body}"
+    );
+    assert!(
+        body.contains(
+            "data-confirm=\"Delete this key? Request logs referencing it are preserved.\""
+        ),
+        "{body}"
+    );
+    assert!(body.contains("href=\"/admin/ui/keys\""), "{body}");
+
+    // No htmx on the page, and the plaintext key exists nowhere: the reveal
+    // modal stays on the creation response only.
+    assert!(!body.contains("hx-"), "{body}");
+    assert!(!body.contains("reveal-key"), "{body}");
 }
 
 #[tokio::test]
-async fn key_edit_form_post_renames_and_replaces_the_limit() {
+async fn key_detail_page_states_why_an_inactive_limit_is_not_enforced() {
+    let db = test_pool().await;
+    let channel_id = create_channel(&db).await;
+    let (status, _) = issue_key(&db, channel_id, "ci-bot", "50.00").await;
+    assert_eq!(status, StatusCode::OK);
+    let key_id = key_id_for_channel(&db, channel_id).await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/keys/{key_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("limit inactive"), "{body}");
+    assert!(
+        body.contains("The limit is stored but not enforced"),
+        "the explanation the row tooltip used to carry is visible text here: {body}"
+    );
+
+    // The same page clears it back to unlimited: nothing left to explain.
+    let (status, body) = post_form(
+        &db,
+        &format!("/admin/ui/keys/{key_id}"),
+        &form(&[("name", "ci-bot"), ("monthly_limit_usd", "")]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("unlimited"), "{body}");
+    assert!(!body.contains("limit inactive"), "{body}");
+}
+
+#[tokio::test]
+async fn key_detail_page_for_an_unknown_id_shows_the_not_found_banner() {
+    let db = test_pool().await;
+    let (status, body) = get_page(&db, "/admin/ui/keys/999").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a missing key is a banner page, not a rejection"
+    );
+    assert!(body.contains("key not found"), "{body}");
+    assert!(!body.contains("Save key"), "{body}");
+    assert!(!body.contains("key-channel"), "{body}");
+    assert!(!body.contains("/999/toggle"), "{body}");
+}
+
+#[tokio::test]
+async fn key_detail_page_for_a_deleted_key_is_read_only() {
+    let db = test_pool().await;
+    let channel_id = create_channel(&db).await;
+    common::seed_key(&db, channel_id).await;
+    let key_id = only_key_id(&db).await;
+    let (status, _) = post_form(&db, &format!("/admin/ui/keys/{key_id}/delete"), "").await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/keys/{key_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("badge deleted"), "{body}");
+    assert!(
+        body.contains("key is deleted and cannot be edited"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("Save key") && !body.contains("/toggle") && !body.contains("/delete"),
+        "a deleted key offers no edit, toggle or delete form: {body}"
+    );
+
+    // The edit route is gone: the detail page replaced it.
+    let (status, _) = get_page(&db, &format!("/admin/ui/keys/{key_id}/edit")).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the old edit route was removed"
+    );
+}
+
+#[tokio::test]
+async fn key_detail_edit_post_renames_and_replaces_the_limit() {
     let db = test_pool().await;
     let channel_id = create_channel(&db).await;
     let (status, _) = issue_key(&db, channel_id, "ci-bot", "50.00").await;
@@ -625,14 +1021,16 @@ async fn key_edit_form_post_renames_and_replaces_the_limit() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(key_name(&db, key_id).await.as_deref(), Some("renamed"));
     assert_eq!(key_limit(&db, key_id).await, Some(7_500_000));
-    assert!(body.contains("renamed"), "{body}");
+    assert!(body.contains("key updated"), "{body}");
+    assert!(body.contains("value=\"renamed\""), "{body}");
     assert!(body.contains("$7.50"), "{body}");
-    // The form closed on success.
-    assert!(!body.contains("Save key"), "{body}");
+    // The detail page re-renders with its form, so the next edit needs no
+    // navigation back.
+    assert!(body.contains("Save key"), "{body}");
 }
 
 #[tokio::test]
-async fn key_edit_form_post_clears_the_limit_and_the_label_with_empty_fields() {
+async fn key_detail_edit_post_clears_the_limit_and_the_label_with_empty_fields() {
     let db = test_pool().await;
     let channel_id = create_channel(&db).await;
     let (status, _) = issue_key(&db, channel_id, "ci-bot", "50.00").await;
@@ -648,11 +1046,12 @@ async fn key_edit_form_post_clears_the_limit_and_the_label_with_empty_fields() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(key_name(&db, key_id).await, None);
     assert_eq!(key_limit(&db, key_id).await, None);
+    assert!(body.contains("key updated"), "{body}");
     assert!(!body.contains("$50.00"), "{body}");
 }
 
 #[tokio::test]
-async fn key_edit_form_post_rejects_a_bad_limit_and_keeps_the_stored_one() {
+async fn key_detail_edit_post_rejects_a_bad_limit_and_keeps_the_stored_one() {
     let db = test_pool().await;
     let channel_id = create_channel(&db).await;
     let (status, _) = issue_key(&db, channel_id, "ci-bot", "50.00").await;
@@ -676,41 +1075,152 @@ async fn key_edit_form_post_rejects_a_bad_limit_and_keeps_the_stored_one() {
 }
 
 #[tokio::test]
-async fn key_edit_form_is_refused_for_a_deleted_key() {
+async fn key_detail_channel_select_moves_the_key_to_another_channel() {
     let db = test_pool().await;
-    let channel_id = create_channel(&db).await;
-    common::seed_key(&db, channel_id).await;
-    let key_id = key_id_for_channel(&db, channel_id).await;
-    let (status, _) = post_form(&db, &format!("/admin/ui/keys/{key_id}/delete"), "").await;
-    assert_eq!(status, StatusCode::OK);
+    let first = create_channel_named(&db, "primary").await;
+    let second = create_channel_named(&db, "secondary").await;
+    common::seed_key(&db, first).await;
+    let key_id = only_key_id(&db).await;
+    assert_eq!(key_channel(&db, key_id).await, first);
 
-    let (status, body) = get_page(&db, &format!("/admin/ui/keys/{key_id}/edit")).await;
+    // Both enabled channels are offered, the bound one selected.
+    let (status, body) = get_page(&db, &format!("/admin/ui/keys/{key_id}")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body.contains("key is deleted and cannot be edited"),
+        body.contains(&format!(
+            "<option value=\"{first}\" selected>primary</option>"
+        )),
         "{body}"
     );
-    assert!(!body.contains("Save key"), "{body}");
+    assert!(
+        body.contains(&format!("<option value=\"{second}\">secondary</option>")),
+        "{body}"
+    );
 
     let (status, body) = post_form(
         &db,
         &format!("/admin/ui/keys/{key_id}"),
-        &form(&[("name", "x"), ("monthly_limit_usd", "1")]),
+        &form(&[
+            ("name", "moved"),
+            ("monthly_limit_usd", ""),
+            ("channel_id", &second.to_string()),
+        ]),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("key updated"), "{body}");
+    assert_eq!(key_channel(&db, key_id).await, second, "the binding moved");
+    assert_eq!(key_name(&db, key_id).await.as_deref(), Some("moved"));
+    // The page shows the new channel as its link text, and the select marks
+    // it.
     assert!(
-        body.contains("key is deleted and cannot be edited"),
+        body.contains(&format!(
+            "href=\"/admin/ui/channels/{second}\">secondary</a>"
+        )),
+        "{body}"
+    );
+    assert!(
+        body.contains(&format!(
+            "<option value=\"{second}\" selected>secondary</option>"
+        )),
         "{body}"
     );
 }
 
 #[tokio::test]
-async fn key_edit_form_for_an_unknown_key_reports_it_and_still_renders_the_panel() {
+async fn key_detail_channel_select_refuses_an_unknown_or_disabled_channel() {
     let db = test_pool().await;
-    let (status, body) = get_page(&db, "/admin/ui/keys/999/edit").await;
+    let first = create_channel_named(&db, "primary").await;
+    let second = create_channel_named(&db, "secondary").await;
+    common::seed_key(&db, first).await;
+    let key_id = only_key_id(&db).await;
+
+    // An unknown id is a form error: no panic, nothing written.
+    let (status, body) = post_form(
+        &db,
+        &format!("/admin/ui/keys/{key_id}"),
+        &form(&[
+            ("name", "renamed"),
+            ("monthly_limit_usd", "5"),
+            ("channel_id", "999"),
+        ]),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("key not found"), "{body}");
+    assert!(body.contains("channel not found"), "{body}");
+    assert!(body.contains("field-error"), "{body}");
+    assert!(
+        body.contains("value=\"renamed\""),
+        "the rejected submission stays in the form: {body}"
+    );
+    assert_eq!(
+        key_channel(&db, key_id).await,
+        first,
+        "the key is unchanged"
+    );
+    assert_eq!(key_name(&db, key_id).await, None);
+    assert_eq!(key_limit(&db, key_id).await, None);
+
+    // A disabled channel is refused the same way, and the rejected choice
+    // stays visible in the select.
+    common::set_channel_enabled(&db, second, false).await;
+    let (status, body) = post_form(
+        &db,
+        &format!("/admin/ui/keys/{key_id}"),
+        &form(&[
+            ("name", ""),
+            ("monthly_limit_usd", ""),
+            ("channel_id", &second.to_string()),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("channel is disabled"), "{body}");
+    assert!(
+        body.contains(&format!(
+            "<option value=\"{second}\" selected>secondary (disabled)</option>"
+        )),
+        "{body}"
+    );
+    assert_eq!(key_channel(&db, key_id).await, first);
+}
+
+#[tokio::test]
+async fn a_key_bound_to_a_disabled_channel_keeps_its_binding_and_stays_editable() {
+    let db = test_pool().await;
+    let channel_id = create_channel(&db).await;
+    common::seed_key(&db, channel_id).await;
+    let key_id = only_key_id(&db).await;
+    common::set_channel_enabled(&db, channel_id, false).await;
+
+    // The stored binding is offered, marked, and selected: the admin can read
+    // it and cannot lose it by accident.
+    let (status, body) = get_page(&db, &format!("/admin/ui/keys/{key_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(&format!(
+            "<option value=\"{channel_id}\" selected>primary (disabled)</option>"
+        )),
+        "{body}"
+    );
+
+    // A save that changes only the label and the limit leaves the binding
+    // alone, so a key bound to a channel that was disabled afterwards is
+    // still editable.
+    let (status, body) = post_form(
+        &db,
+        &format!("/admin/ui/keys/{key_id}"),
+        &form(&[
+            ("name", "ci-bot"),
+            ("monthly_limit_usd", "5"),
+            ("channel_id", &channel_id.to_string()),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("key updated"), "{body}");
+    assert_eq!(key_channel(&db, key_id).await, channel_id);
+    assert_eq!(key_name(&db, key_id).await.as_deref(), Some("ci-bot"));
 }
 
 // --- CSRF and auth gates --------------------------------------------------
@@ -827,8 +1337,8 @@ async fn ui_posts_without_credentials_redirect_to_the_login_page() {
 /// unauthenticated and with credentials. Pages without a session go to the
 /// login page; the login page itself and the static assets the login page
 /// needs are public; `/admin/ui` redirects once authenticated. Built with a
-/// real channel id and a real key id so the edit-form routes resolve
-/// existing rows.
+/// real channel id and a real key id so the detail routes resolve existing
+/// rows.
 fn ui_get_routes(channel_id: i64, key_id: i64) -> Vec<(String, StatusCode, StatusCode)> {
     vec![
         (
@@ -852,7 +1362,14 @@ fn ui_get_routes(channel_id: i64, key_id: i64) -> Vec<(String, StatusCode, Statu
             StatusCode::OK,
         ),
         (
-            format!("/admin/ui/channels/{channel_id}/edit"),
+            format!("/admin/ui/channels/{channel_id}"),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        // A missing channel answers the not-found banner with 200, the
+        // convention the removed channel edit route set.
+        (
+            "/admin/ui/channels/999".to_string(),
             StatusCode::SEE_OTHER,
             StatusCode::OK,
         ),
@@ -867,7 +1384,14 @@ fn ui_get_routes(channel_id: i64, key_id: i64) -> Vec<(String, StatusCode, Statu
             StatusCode::OK,
         ),
         (
-            format!("/admin/ui/keys/{key_id}/edit"),
+            format!("/admin/ui/keys/{key_id}"),
+            StatusCode::SEE_OTHER,
+            StatusCode::OK,
+        ),
+        // A missing key answers the not-found banner with 200, the convention
+        // the removed key edit route set.
+        (
+            "/admin/ui/keys/999".to_string(),
             StatusCode::SEE_OTHER,
             StatusCode::OK,
         ),

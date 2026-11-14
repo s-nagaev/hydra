@@ -48,6 +48,11 @@ pub struct KeyPatch {
     /// `Some(None)` clears the limit back to unlimited, `Some(Some(micro))`
     /// sets it and `None` leaves the stored limit alone.
     pub monthly_limit_micro_usd: Option<Option<i64>>,
+    /// `Some(channel_id)` moves the key to another channel and `None` leaves
+    /// the binding alone. The admin UI detail form is the only caller: the
+    /// JSON API's PATCH does not expose the binding, which stays fixed at
+    /// creation there.
+    pub channel_id: Option<i64>,
 }
 
 /// Result of a PATCH attempt against the soft-delete state machine.
@@ -186,6 +191,13 @@ pub async fn patch(db: &Db, id: i64, key_patch: &KeyPatch) -> sqlx::Result<Patch
         }
         sql.push("monthly_limit_micro_usd = ")
             .bind(Arg::OptInt(limit));
+        assignments += 1;
+    }
+    if let Some(channel_id) = key_patch.channel_id {
+        if assignments > 0 {
+            sql.push(", ");
+        }
+        sql.push("channel_id = ").bind(Arg::Int(channel_id));
         assignments += 1;
     }
     if assignments == 0 {
@@ -331,7 +343,86 @@ mod tests {
             name: None,
             enabled: None,
             monthly_limit_micro_usd: limit,
+            channel_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn patching_moves_the_key_to_another_channel_and_leaves_it_by_default() {
+        let db = test_db().await;
+        let first = channel_id(&db).await;
+        let second = channels::create(
+            &db,
+            &NewChannel {
+                name: "second".to_string(),
+                base_url: "https://api2.example.com".to_string(),
+                api_key: "sk-upstream-secret".to_string(),
+                allowed_models: None,
+            },
+        )
+        .await
+        .unwrap()
+        .id;
+        let created = create(
+            &db,
+            &NewKey {
+                channel_id: first,
+                ..new_key("bound", None)
+            },
+        )
+        .await
+        .unwrap();
+
+        let PatchOutcome::Updated(rebound) = patch(
+            &db,
+            created.id,
+            &KeyPatch {
+                channel_id: Some(second),
+                ..patch_only(None)
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("an alive key must report Updated");
+        };
+        assert_eq!(rebound.channel_id, second);
+        assert_eq!(
+            find(&db, created.id).await.unwrap().unwrap().channel_id,
+            second
+        );
+
+        // An absent channel leaves the binding alone, like a name-only patch.
+        let PatchOutcome::Updated(untouched) = patch(
+            &db,
+            created.id,
+            &KeyPatch {
+                name: Some(Some("renamed".to_string())),
+                ..patch_only(None)
+            },
+        )
+        .await
+        .unwrap() else {
+            panic!("an alive key must report Updated");
+        };
+        assert_eq!(untouched.channel_id, second);
+
+        // A soft-deleted key is still immutable.
+        delete(&db, created.id).await.unwrap();
+        let refused = patch(
+            &db,
+            created.id,
+            &KeyPatch {
+                channel_id: Some(first),
+                ..patch_only(None)
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(refused, PatchOutcome::Deleted));
+        assert_eq!(
+            find(&db, created.id).await.unwrap().unwrap().channel_id,
+            second
+        );
     }
 
     #[tokio::test]

@@ -242,6 +242,7 @@ mod tests {
                 name: None,
                 enabled: None,
                 monthly_limit_micro_usd: Some(Some(50_000_000)),
+                channel_id: None,
             },
         )
         .await
@@ -276,6 +277,7 @@ mod tests {
                 name: None,
                 enabled: None,
                 monthly_limit_micro_usd: Some(Some(4_001)),
+                channel_id: None,
             },
         )
         .await
@@ -339,6 +341,7 @@ mod tests {
                 name: None,
                 enabled: None,
                 monthly_limit_micro_usd: Some(Some(4_969)),
+                channel_id: None,
             },
         )
         .await
@@ -380,6 +383,7 @@ mod tests {
                 name: None,
                 enabled: None,
                 monthly_limit_micro_usd: Some(Some(4_813)),
+                channel_id: None,
             },
         )
         .await

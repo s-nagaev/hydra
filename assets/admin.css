@@ -147,45 +147,12 @@ body {
   background: #fafbfc;
 }
 
-.actions-col {
-  text-align: right;
-  white-space: nowrap;
-  /* Shrink to the width the controls need; the other columns absorb the rest. */
-  width: 1%;
-}
-
-/* `.data-table th` is one class plus one element and outbids the bare
-   .actions-col class, so the header would otherwise sit left of the button
-   group it labels. Same selector weight, later in the sheet, so it wins. */
-th.actions-col {
-  text-align: right;
-}
-
-.actions-col > * {
-  vertical-align: middle;
-}
-
-/* Collapse the inline whitespace between the controls. Body cells only: the restore
-   rule below matches elements, and the header cell holds a bare text node. */
-td.actions-col {
-  font-size: 0;
-}
-
-td.actions-col > * {
-  font-size: 14px;
-}
-
-.actions-col form.inline {
-  margin-left: 8px;
-}
-
 /* The channels and keys tables take the card's width and never more: a fixed
    layout puts every column on a share of that width, so the tables follow the
    viewport instead of outgrowing it, and no scroll container is needed. The
    shares are the width each column needs for its own content at the narrowest
-   supported viewport (1000px): the masked key, the badges and the action
-   buttons stay on one line, and the wrapping cells (base URL, price runs,
-   names) take the rest. */
+   supported viewport (1000px): the masked key and the badges stay on one line,
+   and the wrapping cells (base URL, price runs, names) take the rest. */
 
 .channels-table,
 .keys-table {
@@ -193,63 +160,55 @@ td.actions-col > * {
 }
 
 .channels-table th:nth-child(1) {
-  width: 8.5%;
-}
-
-.channels-table th:nth-child(2) {
-  width: 8%;
-}
-
-.channels-table th:nth-child(3) {
-  width: 11.5%;
-}
-
-.channels-table th:nth-child(4) {
-  width: 11%;
-}
-
-.channels-table th:nth-child(5) {
   width: 14%;
 }
 
+.channels-table th:nth-child(2) {
+  width: 13%;
+}
+
+.channels-table th:nth-child(3) {
+  width: 15%;
+}
+
+.channels-table th:nth-child(4) {
+  width: 15%;
+}
+
+.channels-table th:nth-child(5) {
+  width: 18%;
+}
+
 .channels-table th:nth-child(6) {
-  width: 11.5%;
+  width: 14%;
 }
 
 .channels-table th:nth-child(7) {
-  width: 9.5%;
-}
-
-.channels-table th:nth-child(8) {
-  width: 26%;
+  width: 11%;
 }
 
 .keys-table th:nth-child(1) {
-  width: 12%;
+  width: 16%;
 }
 
 .keys-table th:nth-child(2) {
-  width: 13.5%;
+  width: 18%;
 }
 
 .keys-table th:nth-child(3) {
-  width: 12%;
+  width: 17%;
 }
 
 .keys-table th:nth-child(4) {
-  width: 14.5%;
+  width: 17%;
 }
 
 .keys-table th:nth-child(5) {
-  width: 9.5%;
+  width: 11%;
 }
 
 .keys-table th:nth-child(6) {
-  width: 12%;
-}
-
-.keys-table th:nth-child(7) {
-  width: 26.5%;
+  width: 21%;
 }
 
 /* Cells whose content has no wrap opportunity of its own (a channel name, a
@@ -266,24 +225,16 @@ td.actions-col > * {
   overflow-wrap: anywhere;
 }
 
-/* Narrower viewports keep the same shares with tighter cell padding and
-   tighter action controls, so the buttons stay on one line. Only these two
-   tables are affected: the shares above are sized for this padding, and the
-   logs and stats tables keep the roomier cells. */
+/* Narrower viewports keep the same shares with tighter cell padding, so the
+   masked key and the badges stay on one line. Only these two tables are
+   affected: the shares above are sized for this padding, and the logs and
+   stats tables keep the roomier cells. */
 @media (max-width: 1100px) {
   .channels-table th,
   .channels-table td,
   .keys-table th,
   .keys-table td {
     padding: 8px 6px;
-  }
-
-  td.actions-col button {
-    padding: 7px 12px;
-  }
-
-  .actions-col form.inline {
-    margin-left: 6px;
   }
 }
 
@@ -399,12 +350,22 @@ button.danger:hover {
   background: var(--danger-bg);
 }
 
-/* Error banner (fragment partial) */
+/* Error banner (fragment partial) and success banner (a detail page
+   re-rendered after a mutation). */
 
 .error-banner {
   background: var(--danger-bg);
   color: var(--danger);
   border: 1px solid #e5b4b4;
+  border-radius: 6px;
+  padding: 10px 14px;
+  margin-bottom: 14px;
+}
+
+.notice-banner {
+  background: var(--ok-bg);
+  color: var(--ok);
+  border: 1px solid #b7e0c6;
   border-radius: 6px;
   padding: 10px 14px;
   margin-bottom: 14px;
@@ -508,7 +469,7 @@ textarea {
   resize: vertical;
 }
 
-/* Row action forms and shared bits */
+/* Inline action forms and shared bits */
 
 form.inline {
   display: inline;
@@ -839,12 +800,13 @@ td.key-cell {
   white-space: normal;
 }
 
-/* Log detail drill-down */
+/* Row drill-down, shared by every table whose rows open a detail page: the
+   table carries `.row-link-table` and the first cell's anchor `.row-link`. */
 
-/* The time cell anchor stretches over the whole row, so the row itself is the
-   link to the detail page. The overlay is absolutely positioned, so its box is
-   the row's only when the row is its containing block. Relative positioning on
-   a table row is not a defined containing block (CSS 2.1 leaves positioning of
+/* That anchor stretches over the whole row, so the row itself is the link to
+   the detail page. The overlay is absolutely positioned, so its box is the
+   row's only when the row is its containing block. Relative positioning on a
+   table row is not a defined containing block (CSS 2.1 leaves positioning of
    internal table boxes undefined, and an engine that ignores it lets the
    overlay escape to the viewport, where it swallows every click on the page).
    A transform does establish one on a row: CSS Transforms excludes table
@@ -853,20 +815,28 @@ td.key-cell {
    descendants. Measured in Chromium: with the row's relative positioning
    neutralized the overlay still covers exactly its own row, and without the
    transform it covered the whole viewport. */
-.logs-table tbody tr {
+.row-link-table tbody tr {
   position: relative;
   transform: translate(0, 0);
 }
 
-.logs-table .row-link {
+.row-link-table .row-link {
   color: inherit;
   text-decoration: none;
 }
 
-.logs-table .row-link::after {
+.row-link-table .row-link::after {
   content: "";
   position: absolute;
   inset: 0;
+}
+
+/* Detail pages (a log, a channel): the metadata table at the top, then the
+   edit form and the destructive actions under small muted headings. */
+
+.detail-heading {
+  font-size: 15px;
+  margin: 22px 0 10px;
 }
 
 .detail-meta {

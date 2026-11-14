@@ -312,6 +312,7 @@ async fn pg_key_soft_delete_state_machine() {
             name: Some(Some("renamed".to_string())),
             enabled: Some(false),
             monthly_limit_micro_usd: Some(Some(60_000_000)),
+            channel_id: None,
         },
     )
     .await
@@ -332,6 +333,7 @@ async fn pg_key_soft_delete_state_machine() {
             name: Some(Some("renamed-again".to_string())),
             enabled: None,
             monthly_limit_micro_usd: None,
+            channel_id: None,
         },
     )
     .await
@@ -347,6 +349,7 @@ async fn pg_key_soft_delete_state_machine() {
             name: None,
             enabled: None,
             monthly_limit_micro_usd: Some(None),
+            channel_id: None,
         },
     )
     .await
@@ -377,6 +380,7 @@ async fn pg_key_soft_delete_state_machine() {
             name: Some(Some("x".to_string())),
             enabled: None,
             monthly_limit_micro_usd: None,
+            channel_id: None,
         },
     )
     .await
@@ -434,6 +438,7 @@ async fn pg_key_monthly_limit_round_trip() {
             name: None,
             enabled: None,
             monthly_limit_micro_usd: Some(Some(7_500_000)),
+            channel_id: None,
         },
     )
     .await
@@ -449,6 +454,7 @@ async fn pg_key_monthly_limit_round_trip() {
             name: None,
             enabled: None,
             monthly_limit_micro_usd: Some(None),
+            channel_id: None,
         },
     )
     .await
