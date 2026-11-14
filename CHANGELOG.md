@@ -1,9 +1,10 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 (2026-11-13)
 
 ### Added
 
+- The site root (`GET /`) redirects to the admin UI, so a browser that opens the bare host reaches the login page instead of a 404. Proxied routes, the admin JSON API and the UI's own assets keep their paths.
 - OpenAI Responses passthrough at `POST /v1/responses`, on the same channel, key and limit machinery as chat, with the Responses usage counts read for the log, the cost and the monthly gate.
 - Anthropic Messages passthrough at `POST /v1/messages`: the key may arrive in `x-api-key` or in a bearer header, the required `anthropic-version` and the optional `anthropic-beta` are forwarded as sent, and the request body and upstream response pass through untouched.
 - A fifth per-model price dimension, `cache_write_input`, for the tokens an upstream writes into its cache. It is set independently of the input price, so the provider's own figure is entered rather than derived, and a table that names no such rate keeps working and bills those tokens at zero.
