@@ -61,8 +61,15 @@
   </table>
 
   {% if let Some(content) = request_content %}
-  <details class="body-block" open>
+<details class="body-block" open>
     <summary class="snippet-label">Request content</summary>
+    <pre class="code-snippet">{{ content }}</pre>
+  </details>
+  {% endif %}
+
+  {% if let Some(content) = response_content %}
+  <details class="body-block" open>
+    <summary class="snippet-label">Response content</summary>
     <pre class="code-snippet">{{ content }}</pre>
   </details>
   {% endif %}
@@ -75,13 +82,6 @@
   {% else %}
   <h2 class="snippet-label">Request body</h2>
   <p class="text-muted">Bodies were not captured for this request. Body capture is opt-in via HYDRA_LOG_BODIES=1.</p>
-  {% endif %}
-
-  {% if let Some(content) = response_content %}
-  <details class="body-block" open>
-    <summary class="snippet-label">Response content</summary>
-    <pre class="code-snippet">{{ content }}</pre>
-  </details>
   {% endif %}
 
   {% if let Some(body) = response_body %}
