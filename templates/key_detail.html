@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+
+{% block title %}Key #{{ id }}{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>Key #{{ id }}</h1>
+    <a class="button" href="/admin/ui/keys">Back to keys</a>
+  </div>
+
+  {% if let Some(message) = notice %}
+  <div class="notice-banner" role="status">{{ message }}</div>
+  {% endif %}
+
+  {% if let Some(message) = error %}
+  <div class="error-banner" role="alert">{{ message }}</div>
+  {% endif %}
+
+  {% if let Some(key) = key %}
+  <table class="data-table detail-meta">
+    <tbody>
+      <tr>
+        <th scope="row">Prefix</th>
+        <td class="mono">{{ key.display_prefix }}</td>
+      </tr>
+      <tr>
+        <th scope="row">Name</th>
+        <td>{% match key.name %}{% when Some with (name) %}{{ name }}{% when None %}<span class="text-muted">-</span>{% endmatch %}</td>
+      </tr>
+      <tr>
+        <th scope="row">Channel</th>
+        <td><a href="/admin/ui/channels/{{ key.channel_id }}">{{ key.channel_name }}</a></td>
+      </tr>
+      <tr>
+        <th scope="row">Monthly limit</th>
+        <td>
+          {% match key.monthly_limit %}
+          {% when Some with (limit) %}
+          <span class="mono">{{ limit }}</span>
+          {% if key.limit_inactive %}<span class="badge off">limit inactive</span>
+          <div class="field-hint">The limit is stored but not enforced: the bound channel is disabled, allows every upstream model, or a model it allows carries no price. It becomes effective once the channel's prices are complete.</div>
+          {% endif %}
+          {% when None %}<span class="text-muted">unlimited</span>
+          {% endmatch %}
+        </td>
+      </tr>
+      <tr>
+        <th scope="row">State</th>
+        <td>
+          {% if key.deleted %}<span class="badge deleted">deleted</span>
+          {% else %}{% if key.enabled %}<span class="badge ok">enabled</span>
+          {% else %}<span class="badge off">disabled</span>{% endif %}{% endif %}
+        </td>
+      </tr>
+      <tr>
+        <th scope="row">Created</th>
+        <td>{{ key.created_at }}</td>
+      </tr>
+    </tbody>
+  </table>
+  {% endif %}
+
+  {% if let Some(form) = form %}
+  <h2 class="detail-heading">Edit key</h2>
+  <form class="stack key-form" method="post" action="{{ form.action }}">
+    <div>
+      <label for="key-channel">Channel</label>
+      <select id="key-channel" name="channel_id" required>
+        {% for option in form.channel_options %}
+        <option value="{{ option.id }}"{% if option.selected %} selected{% endif %}>{{ option.name }}{% if option.disabled %} (disabled){% endif %}</option>
+        {% endfor %}
+      </select>
+      <div class="field-hint">Requests through this key are forwarded to this channel. Only an enabled channel can take a new binding; the current one stays selectable if it was disabled after the key was issued.</div>
+      {% if let Some(error) = form.errors.channel_id %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div>
+      <label for="key-name">Name (optional)</label>
+      <input type="text" id="key-name" name="name" value="{{ form.name }}">
+    </div>
+    <div>
+      <label for="key-monthly-limit">Monthly limit, USD</label>
+      <input type="text" id="key-monthly-limit" name="monthly_limit_usd" value="{{ form.monthly_limit_usd }}">
+      <div class="field-hint">Empty means unlimited. Decimal USD with at most six decimal places.</div>
+      {% if let Some(error) = form.errors.monthly_limit_usd %}<div class="field-error">{{ error }}</div>{% endif %}
+    </div>
+    <div class="form-actions">
+      <button type="submit" class="primary">Save key</button>
+    </div>
+  </form>
+  {% endif %}
+
+  {% if let Some(key) = key %}
+  {% if !key.deleted %}
+  <h2 class="detail-heading">Manage</h2>
+  <div class="form-actions">
+    <form method="post" action="/admin/ui/keys/{{ id }}/toggle">
+      <input type="hidden" name="enabled" value="{% if key.enabled %}false{% else %}true{% endif %}">
+      <button type="submit">{% if key.enabled %}Disable{% else %}Enable{% endif %}</button>
+    </form>
+    <form method="post" action="/admin/ui/keys/{{ id }}/delete" data-confirm="Delete this key? Request logs referencing it are preserved.">
+      <button type="submit" class="danger">Delete</button>
+    </form>
+  </div>
+  {% endif %}
+  {% endif %}
+</section>
+{% endblock %}

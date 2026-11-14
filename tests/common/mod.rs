@@ -279,6 +279,7 @@ pub async fn disable_key(db: &SqlitePool, key_id: i64) {
             name: None,
             enabled: Some(false),
             monthly_limit_micro_usd: None,
+            channel_id: None,
         },
     ))
     .await

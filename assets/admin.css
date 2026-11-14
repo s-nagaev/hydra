@@ -188,31 +188,27 @@ body {
 }
 
 .keys-table th:nth-child(1) {
-  width: 12%;
+  width: 16%;
 }
 
 .keys-table th:nth-child(2) {
-  width: 13.5%;
+  width: 18%;
 }
 
 .keys-table th:nth-child(3) {
-  width: 12%;
+  width: 17%;
 }
 
 .keys-table th:nth-child(4) {
-  width: 14.5%;
+  width: 17%;
 }
 
 .keys-table th:nth-child(5) {
-  width: 9.5%;
+  width: 11%;
 }
 
 .keys-table th:nth-child(6) {
-  width: 12%;
-}
-
-.keys-table th:nth-child(7) {
-  width: 26.5%;
+  width: 21%;
 }
 
 /* Cells whose content has no wrap opportunity of its own (a channel name, a

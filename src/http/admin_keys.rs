@@ -486,6 +486,7 @@ pub async fn patch(
             name: request.name,
             enabled: request.enabled,
             monthly_limit_micro_usd: limit_patch,
+            channel_id: None,
         },
     )
     .await?
