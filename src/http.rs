@@ -17,6 +17,7 @@ mod admin_ui_channels;
 mod admin_ui_keys;
 mod admin_ui_logs;
 mod admin_ui_stats;
+mod body_content;
 mod client_ip;
 mod csrf;
 mod docs;

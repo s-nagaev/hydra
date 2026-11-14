@@ -28,6 +28,7 @@ use crate::db::channels::{self, Channel};
 use crate::db::keys::{self, ApiKey};
 use crate::db::request_logs::{self, LogFilters, RequestLog};
 use crate::http::admin_logs::{build_filters, LogsError, RawLogQuery, DEFAULT_PAGE_SIZE};
+use crate::http::body_content;
 use crate::http::ui_auth::UiAuth;
 use crate::http::AppState;
 
@@ -119,7 +120,9 @@ pub struct LogsPage {
 /// The drill-down page for one request log. Bodies arrive already
 /// formatted ([`body_view`]: pretty JSON, a re-rendered SSE capture, or the
 /// stored text with its escapes decoded) and are wrapped in collapsible
-/// sections; the JSON highlighter in `assets/admin.js` styles them on the
+/// sections; above each of them sits the text pulled out of it at render
+/// time ([`body_content`]), which is the readable part of a chat exchange.
+/// The JSON highlighter in `assets/admin.js` styles the bodies on the
 /// client. Askama escapes whatever is rendered, so no markup can become
 /// live HTML.
 #[derive(Template, WebTemplate)]
@@ -141,7 +144,15 @@ pub struct LogDetailPage {
     pub duration_ms: i64,
     pub client_ip: Option<String>,
     pub log_error: Option<String>,
+    /// The text extracted from the stored request body
+    /// ([`body_content::request_content`]), absent when the body carries no
+    /// recognizable content.
+    pub request_content: Option<String>,
     pub request_body: Option<String>,
+    /// The text extracted from the stored response body
+    /// ([`body_content::response_content`]), absent when the body carries no
+    /// recognizable content.
+    pub response_content: Option<String>,
     pub response_body: Option<String>,
     pub back_url: String,
     pub error: Option<String>,
@@ -913,7 +924,15 @@ async fn build_detail(state: &AppState, log: RequestLog, back_url: String) -> Lo
         duration_ms: log.duration_ms,
         client_ip: log.client_ip,
         log_error: log.error,
+        request_content: log
+            .request_body
+            .as_deref()
+            .and_then(body_content::request_content),
         request_body: log.request_body.as_deref().map(body_view),
+        response_content: log
+            .response_body
+            .as_deref()
+            .and_then(body_content::response_content),
         response_body: log.response_body.as_deref().map(body_view),
         back_url,
         error: None,
@@ -938,7 +957,9 @@ fn empty_detail(id: i64, back_url: String, message: String) -> LogDetailPage {
         duration_ms: 0,
         client_ip: None,
         log_error: None,
+        request_content: None,
         request_body: None,
+        response_content: None,
         response_body: None,
         back_url,
         error: Some(message),
