@@ -34,6 +34,14 @@
       </select>
     </div>
     <div class="filter-field">
+      <label for="stats-status">Status</label>
+      <select id="stats-status" name="status_class">
+        {% for option in status_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
       <button type="submit" class="primary">Apply</button>
     </div>
     <div class="filter-field">
@@ -128,12 +136,21 @@
       <h3 class="chart-title">Cost per day</h3>
       {{ plot.cost_svg|safe }}
     </div>
+    {% if let Some(status_svg) = plot.status_svg %}
+    <div class="chart-block">
+      <h3 class="chart-title">Requests per day</h3>
+      {{ status_svg|safe }}
+    </div>
+    {% endif %}
   </div>
   <p class="table-meta">
     Bars cover the selected month under the current filters, one bar per day that
     has usage. Token bars stack input tokens at the bottom and output tokens on
     top; heights are relative to the busiest day of the series. Cost is priced the
     same way the table prices it, so the daily bars add up to the same money.
+    Request bars stack the response status classes of the month, in the classes the
+    legend names, and follow the status filter, while the token and cost bars and
+    the table keep counting every request of the month.
   </p>
 </section>
 {% endif %}

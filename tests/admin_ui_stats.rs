@@ -225,6 +225,43 @@ async fn log_priced_request(db: &SqlitePool, key_id: i64, channel_id: i64, at: &
     .await;
 }
 
+/// One request log row with an explicit upstream status; `None` is a request
+/// that never reached an upstream.
+#[allow(clippy::too_many_arguments)]
+async fn log_with_status(
+    db: &SqlitePool,
+    key_id: i64,
+    channel_id: i64,
+    model: Option<&str>,
+    status: Option<i64>,
+    prompt: Option<i64>,
+    completion: Option<i64>,
+    at: &str,
+) {
+    within(request_logs::insert_at(
+        &Db::from(db.clone()),
+        &NewRequestLog {
+            api_key_id: Some(key_id),
+            channel_id: Some(channel_id),
+            model: model.map(str::to_string),
+            status,
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_input_tokens: None,
+            cached_output_tokens: None,
+            cache_write_input_tokens: None,
+            duration_ms: 1,
+            request_body: None,
+            response_body: None,
+            error: None,
+            client_ip: None,
+        },
+        at,
+    ))
+    .await
+    .unwrap();
+}
+
 // --- Auth gate and navigation --------------------------------------------
 
 #[tokio::test]
@@ -816,5 +853,207 @@ async fn an_unparsable_key_id_shows_a_banner_and_filters_nothing() {
     assert!(
         table_rows(&html).contains(&prefix),
         "the view stays unfiltered: {html}"
+    );
+}
+
+// --- Status classes -------------------------------------------------------
+
+#[tokio::test]
+async fn the_requests_chart_stacks_the_month_by_status_class() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "classes", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(500),
+        Some(100),
+        Some(10),
+        "2026-06-01 11:00:00",
+    )
+    .await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Requests per day"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Requests per day\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains("Day 1: 2 requests (1 2xx, 0 4xx, 1 5xx, 0 other)"),
+        "the bar splits the day by class: {charts}"
+    );
+    for class in ["2xx", "4xx", "5xx", "other"] {
+        assert!(
+            charts.contains(&format!(">{class}</text>")),
+            "the legend names {class}: {charts}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_status_filter_narrows_the_requests_chart_alone() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "narrowed", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(500),
+        Some(100),
+        Some(10),
+        "2026-06-01 11:00:00",
+    )
+    .await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=5xx").await;
+    assert_eq!(status, StatusCode::OK);
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("Day 1: 1 requests (0 2xx, 0 4xx, 1 5xx, 0 other)"),
+        "the requests chart follows the filter: {charts}"
+    );
+    // Both requests of the day stay in the token and cost bars, and in the
+    // table: 1100 prompt and 210 completion tokens priced at 4350
+    // micro-USD.
+    assert!(
+        charts.contains("Day 1: 1,310 tokens (1,100 in, 210 out) in 2 requests"),
+        "the token bars ignore the status filter: {charts}"
+    );
+    assert!(
+        charts.contains("Day 1: $0.00435"),
+        "the cost bars ignore the status filter: {charts}"
+    );
+    let table = table_rows(&html);
+    assert!(
+        table.contains(">1,100<"),
+        "the table counts both requests: {table}"
+    );
+    assert!(table.contains(">$0.00435<"), "{table}");
+    assert!(
+        option_is_selected(&html, "5xx"),
+        "the filter in force is visible: {html}"
+    );
+
+    // Without the filter the requests chart holds the whole day.
+    let (_, unfiltered) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    assert!(chart_panel(&unfiltered).contains("Day 1: 2 requests (1 2xx, 0 4xx, 1 5xx, 0 other)"));
+    assert!(table_rows(&unfiltered).contains(">$0.00435<"));
+}
+
+#[tokio::test]
+async fn the_status_filter_rides_along_the_month_links() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "linked", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=4xx").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(option_is_selected(&html, "4xx"), "{html}");
+    let targets = links(&html);
+    assert!(
+        targets.contains(&"/admin/ui/stats?month=2026-05&status_class=4xx".to_string()),
+        "the previous link keeps the filter: {html}"
+    );
+    assert!(
+        targets.contains(&"/admin/ui/stats?month=2026-07&status_class=4xx".to_string()),
+        "the next link keeps the filter: {html}"
+    );
+    let control = select_markup(&html, "stats-status");
+    assert!(
+        control.contains("<option value=\"other\">"),
+        "every class stays offered, so the filter can be widened: {html}"
+    );
+    assert!(
+        !control.contains("<option value=\"\" selected>"),
+        "the filter in force is not hidden behind All statuses: {html}"
+    );
+
+    // A month without a 4xx response drops the requests chart alone: the
+    // token and cost bars and the table keep the request.
+    assert!(
+        !html.contains("aria-label=\"Requests per day\""),
+        "the requests chart is left out when the filter selects nothing: {html}"
+    );
+    assert!(html.contains("aria-label=\"Tokens per day\""), "{html}");
+    assert!(html.contains("aria-label=\"Cost per day\""), "{html}");
+    assert!(table_rows(&html).contains(">$0.004<"), "{html}");
+}
+
+#[tokio::test]
+async fn a_request_that_never_reached_an_upstream_counts_as_other() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "failed", None).await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        None,
+        None,
+        None,
+        "2026-06-02 10:00:00",
+    )
+    .await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        chart_panel(&html).contains("Day 2: 1 requests (0 2xx, 0 4xx, 0 5xx, 1 other)"),
+        "{html}"
+    );
+
+    let (_, other) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=other").await;
+    assert!(
+        chart_panel(&other).contains("Day 2: 1 requests (0 2xx, 0 4xx, 0 5xx, 1 other)"),
+        "the other class is selectable: {other}"
+    );
+
+    let (_, success) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=2xx").await;
+    assert!(
+        !success.contains("aria-label=\"Requests per day\""),
+        "{success}"
+    );
+    assert!(
+        table_rows(&success).contains(">$0.00<"),
+        "the table still counts the failed request: {success}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_status_class_shows_a_banner_and_filters_nothing() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "bogus", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+
+    // `errors` is a bucket of the log listing, not a class of the chart.
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=errors").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("is not one of 2xx, 4xx, 5xx, other"),
+        "the banner lists the accepted values: {html}"
+    );
+    assert!(
+        html.contains("errors"),
+        "the banner names the value: {html}"
+    );
+    assert!(
+        html.contains("aria-label=\"Requests per day\""),
+        "the view stays unfiltered: {html}"
+    );
+    assert!(
+        select_markup(&html, "stats-status").contains("<option value=\"\" selected>"),
+        "no filter is in force: {html}"
     );
 }

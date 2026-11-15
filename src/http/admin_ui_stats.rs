@@ -31,21 +31,25 @@
 //! shareable and reloadable without JavaScript, and a malformed value falls
 //! back to the current month behind a banner instead of failing the page.
 //!
-//! Two optional filters narrow the view, a key and a model, read from the
-//! same query string and combined with the month. They apply to the table
-//! and to the charts alike, which is why the table is narrowed by filtering
-//! the per-key aggregates the page already loaded rather than by a second
-//! query, while the day rows arrive pre-filtered from their own aggregate.
-//! The month links carry whatever filters are set, so stepping through
-//! months keeps the slice of usage the admin is looking at.
+//! Three filters narrow the view, a key, a model and a status class, read
+//! from the same query string and combined with the month. The key and the
+//! model apply to the table and to every chart, which is why the table is
+//! narrowed by filtering the per-key aggregates the page already loaded
+//! rather than by a second query, while the day rows arrive pre-filtered from
+//! their own aggregate. The status class applies to the status chart alone:
+//! the table, the token bars and the cost bars are token-based and keep their
+//! meaning under it. The month links carry whatever filters are set, so
+//! stepping through months keeps the slice of usage the admin is looking at.
 //!
-//! Under the table sit two charts of the same filtered month, tokens per day
-//! and cost per day, drawn server-side by [`crate::http::stats_chart`] as
-//! plain SVG and injected with askama's `|safe` filter. The cost of a day is
-//! the sum of [`crate::usage::group_cost`] over that day's groups, priced
-//! from the key's channel exactly like the table, so the bars and the table
-//! add up to the same money. A view with no day rows renders no chart at all
-//! and keeps the table's empty state instead.
+//! Under the table sit three charts of the same filtered month, tokens per
+//! day, cost per day and requests per day, drawn server-side by
+//! [`crate::http::stats_chart`] as plain SVG and injected with askama's
+//! `|safe` filter. The cost of a day is the sum of [`crate::usage::group_cost`]
+//! over that day's groups, priced from the key's channel exactly like the
+//! table, so the bars and the table add up to the same money. The requests
+//! chart stacks the response status classes and is left out when the status
+//! filter selects no row at all; a view with no day rows renders no chart at
+//! all and keeps the table's empty state instead.
 //!
 //! There is no mutating route here, so the CSRF guard has nothing to reject;
 //! the module is merged into the `/admin/ui` nest like the other read-only
@@ -63,7 +67,7 @@ use serde::Deserialize;
 
 use crate::db::channels::{self, PricedChannel};
 use crate::db::keys::{self, ApiKey};
-use crate::db::request_logs::{self, DayUsage, ModelUsage};
+use crate::db::request_logs::{self, DayStatusUsage, DayUsage, ModelUsage, StatusBucket};
 use crate::db::Db;
 use crate::http::admin_ui_logs::{thousands, SelectOption};
 use crate::http::stats_chart;
@@ -74,23 +78,29 @@ use crate::month::Month;
 use crate::prices::ModelPrices;
 use crate::usage;
 
-/// The view state of the page: the month and the two optional filters. Kept
-/// as strings so a malformed or empty value becomes a banner over an
+/// The view state of the page: the month and the three optional filters.
+/// Kept as strings so a malformed or empty value becomes a banner over an
 /// unfiltered view instead of a rejected request.
 #[derive(Debug, Default, Deserialize)]
 pub struct StatsQuery {
     month: Option<String>,
     key_id: Option<String>,
     model: Option<String>,
+    status_class: Option<String>,
 }
 
-/// The key and model filters of one view, after parsing. Both are absent
-/// when the parameter is missing, blank or, for the key, not a row id.
+/// The key, model and status class filters of one view, after parsing. Every
+/// one is absent when its parameter is missing or blank; the key is also
+/// absent when the value is not a row id and the class when it names no
+/// bucket.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Filters {
     key_id: Option<i64>,
     /// The trimmed model name; `None` when the parameter is absent or blank.
     model: Option<String>,
+    /// The status class the requests chart is narrowed to; `None` when the
+    /// parameter is absent or blank.
+    status_class: Option<StatusBucket>,
 }
 
 impl Filters {
@@ -98,7 +108,7 @@ impl Filters {
     /// "no requests logged" and the "no usage matches the filters" empty
     /// text.
     fn is_set(&self) -> bool {
-        self.key_id.is_some() || self.model.is_some()
+        self.key_id.is_some() || self.model.is_some() || self.status_class.is_some()
     }
 }
 
@@ -126,13 +136,16 @@ pub struct DisplaySums {
     pub cost: String,
 }
 
-/// The two charts of the view, already rendered as SVG. Present only when
-/// the filtered month has rows to plot.
+/// The charts of the view, already rendered as SVG. Present only when the
+/// filtered month has rows to plot.
 pub struct Charts {
     /// Tokens per day, input and output stacked.
     pub tokens_svg: String,
     /// Cost per day, priced from each key's channel.
     pub cost_svg: String,
+    /// Requests per day, stacked by status class. Absent when the status
+    /// filter selects no row, because an empty plot says less than none.
+    pub status_svg: Option<String>,
 }
 
 #[derive(Template, WebTemplate)]
@@ -151,6 +164,9 @@ pub struct StatsPage {
     pub key_options: Vec<SelectOption>,
     /// The Model select: `All models` plus every model logged in the month.
     pub model_options: Vec<SelectOption>,
+    /// The Status select: `All statuses` plus the four classes the requests
+    /// chart stacks.
+    pub status_options: Vec<SelectOption>,
     /// Absent when the filtered month has nothing to plot.
     pub charts: Option<Charts>,
     pub prev_url: String,
@@ -253,8 +269,11 @@ struct StatsData {
     month: Month,
     keys: Vec<KeyUsage>,
     channels: HashMap<i64, ChannelInfo>,
-    /// Day-level rows of the filtered month, for the charts.
+    /// Day-level rows of the filtered month, for the token and cost charts.
     days: Vec<DayUsage>,
+    /// Day-level request counts per status class of the filtered month, for
+    /// the requests chart.
+    status_days: Vec<DayStatusUsage>,
     /// The distinct models logged in the month, for the Model select.
     models: Vec<String>,
 }
@@ -281,6 +300,9 @@ fn view_url(month: &Month, filters: &Filters) -> String {
     if let Some(model) = &filters.model {
         serializer.append_pair("model", model);
     }
+    if let Some(status_class) = filters.status_class {
+        serializer.append_pair("status_class", status_class.label());
+    }
     format!("/admin/ui/stats?{}", serializer.finish())
 }
 
@@ -305,11 +327,11 @@ fn resolve_month(query: &StatsQuery) -> (Month, Option<String>) {
     }
 }
 
-/// Resolves the `key_id` and `model` query parameters into the view's
-/// filters. A blank value means "no filter", an unparsable key id yields the
-/// banner text and no filter (the same lenient reading the month parameter
-/// gets), and the model name is trimmed so a stray space cannot hide every
-/// row.
+/// Resolves the `key_id`, `model` and `status_class` query parameters into
+/// the view's filters. A blank value means "no filter", an unparsable key id
+/// or status class yields the banner text and no filter (the same lenient
+/// reading the month parameter gets), and the model name is trimmed so a
+/// stray space cannot hide every row.
 fn resolve_filters(query: &StatsQuery) -> (Filters, Option<String>) {
     let model = query
         .model
@@ -322,7 +344,7 @@ fn resolve_filters(query: &StatsQuery) -> (Filters, Option<String>) {
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let (key_id, error) = match raw_key {
+    let (key_id, key_error) = match raw_key {
         None => (None, None),
         Some(value) => match value.parse::<i64>() {
             Ok(id) => (Some(id), None),
@@ -334,7 +356,40 @@ fn resolve_filters(query: &StatsQuery) -> (Filters, Option<String>) {
             ),
         },
     };
-    (Filters { key_id, model }, error)
+    let raw_class = query
+        .status_class
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (status_class, class_error) = match raw_class {
+        None => (None, None),
+        Some(value) => match StatusBucket::parse(value) {
+            Some(class) => (Some(class), None),
+            None => (
+                None,
+                Some(format!(
+                    "status_class \"{value}\" is not one of {}; showing every status",
+                    class_values()
+                )),
+            ),
+        },
+    };
+    let filters = Filters {
+        key_id,
+        model,
+        status_class,
+    };
+    (filters, key_error.or(class_error))
+}
+
+/// The accepted `status_class` values, in the order the select offers them,
+/// so the banner and the control cannot list different vocabularies.
+fn class_values() -> String {
+    StatusBucket::ALL
+        .iter()
+        .map(|class| class.label())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `$0.004`, or `$0.000001` for an amount below one cent. A cost is never
@@ -382,11 +437,13 @@ async fn channel_info(db: &Db) -> sqlx::Result<HashMap<i64, ChannelInfo>> {
 }
 
 /// Loads the key list, the channel price tables, one month-to-date aggregate
-/// per key, the day rows the charts plot and the model names of the month.
+/// per key, the day rows the token and cost charts plot, the day rows per
+/// status class and the model names of the month.
 ///
 /// The month aggregate is per key and is narrowed in memory by [`build_page`];
-/// the day rows are narrowed by their own query, which already carries the
-/// same two predicates. The model list of the select stays month-scoped and
+/// the day rows are narrowed by their own queries, which already carry the
+/// key and model predicates, and the status rows carry the status class
+/// filter on top. The model list of the select stays month-scoped and
 /// unfiltered on purpose, so the control always offers every model of the
 /// month rather than only the surviving one.
 async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<StatsData, String> {
@@ -405,6 +462,16 @@ async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<Stat
     )
     .await
     .map_err(|error| internal_error(&error))?;
+    let status_days = request_logs::day_status_usage(
+        &state.db,
+        &month.start(),
+        &month.end(),
+        filters.key_id,
+        filters.model.clone(),
+        filters.status_class,
+    )
+    .await
+    .map_err(|error| internal_error(&error))?;
     let models = request_logs::distinct_models(&state.db, &month.start(), &month.end())
         .await
         .map_err(|error| internal_error(&error))?;
@@ -420,6 +487,7 @@ async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<Stat
         keys,
         channels,
         days,
+        status_days,
         models,
     })
 }
@@ -469,6 +537,34 @@ fn model_options(models: &[String], selected: Option<&str>) -> Vec<SelectOption>
     options
 }
 
+/// The Status select: `All statuses` plus the four classes the requests
+/// chart stacks, in the order they stack. The wording repeats the log
+/// listing's, so one class reads the same way on both pages.
+fn status_options(selected: Option<StatusBucket>) -> Vec<SelectOption> {
+    let mut options = vec![SelectOption {
+        value: String::new(),
+        label: "All statuses".to_string(),
+        selected: selected.is_none(),
+    }];
+    options.extend(StatusBucket::ALL.iter().map(|class| SelectOption {
+        value: class.label().to_string(),
+        label: class_label(*class).to_string(),
+        selected: selected == Some(*class),
+    }));
+    options
+}
+
+/// The wording of one status class in the select, which explains what the
+/// class covers rather than repeating its label.
+fn class_label(class: StatusBucket) -> &'static str {
+    match class {
+        StatusBucket::Ok2xx => "2xx success",
+        StatusBucket::Client4xx => "4xx client error",
+        StatusBucket::Server5xx => "5xx server error",
+        StatusBucket::Other => "Other (1xx, 3xx, failures)",
+    }
+}
+
 /// The page with its navigation, filter widgets and empty table in place;
 /// the rows, the grand totals and the charts are filled in by [`build_page`].
 fn page_shell(month: &Month, filters: &Filters, error: Option<String>) -> StatsPage {
@@ -493,6 +589,7 @@ fn page_shell(month: &Month, filters: &Filters, error: Option<String>) -> StatsP
         grand: Sums::default().display(),
         key_options: key_options(&[], filters.key_id),
         model_options: model_options(&[], filters.model.as_deref()),
+        status_options: status_options(filters.status_class),
         charts: None,
         prev_url: view_url(&month.previous(), filters),
         next_url: view_url(&month.next(), filters),
@@ -517,12 +614,13 @@ fn day_group(day: &DayUsage) -> ModelUsage {
     }
 }
 
-/// The charts of one view: the daily token bars, and the daily cost bars
-/// built by pricing every day group from the price table of the key that
-/// spent it. A key whose channel is missing or prices nothing contributes
-/// zero, exactly as it does in the table. `None` when the filtered month has
-/// no day rows at all, which is when the page shows its empty state instead
-/// of an empty plot.
+/// The charts of one view: the daily token bars, the daily cost bars built by
+/// pricing every day group from the price table of the key that spent it, and
+/// the daily requests bars stacked by status class. A key whose channel is
+/// missing or prices nothing contributes zero, exactly as it does in the
+/// table. `None` when the filtered month has no day rows at all, which is
+/// when the page shows its empty state instead of an empty plot; the status
+/// chart is dropped on its own when the status filter leaves it no row.
 fn charts(data: &StatsData) -> Option<Charts> {
     if data.days.is_empty() {
         return None;
@@ -548,9 +646,12 @@ fn charts(data: &StatsData) -> Option<Charts> {
             (day.day.clone(), usage::group_cost(&day_group(day), prices))
         })
         .collect();
+    let status_svg =
+        (!data.status_days.is_empty()).then(|| stats_chart::daily_status_bars(&data.status_days));
     Some(Charts {
         tokens_svg: stats_chart::daily_token_bars(&data.days),
         cost_svg: stats_chart::daily_cost_bars(&costs),
+        status_svg,
     })
 }
 
@@ -634,6 +735,7 @@ fn build_page(data: StatsData, filters: &Filters, error: Option<String>) -> Stat
 
     page.key_options = key_options(&data.keys, filters.key_id);
     page.model_options = model_options(&data.models, filters.model.as_deref());
+    page.status_options = status_options(filters.status_class);
     page.charts = charts(&data);
     page.grand = grand.display();
     page.rows = rows;
@@ -761,6 +863,7 @@ mod tests {
             keys,
             channels,
             days: Vec::new(),
+            status_days: Vec::new(),
             models: Vec::new(),
         }
     }
@@ -821,6 +924,7 @@ mod tests {
         let both = Filters {
             key_id: Some(3),
             model: Some("gpt-4o".to_string()),
+            ..Filters::default()
         };
         assert_eq!(
             view_url(&january, &both),
@@ -829,12 +933,22 @@ mod tests {
         // Whitespace inside a model name survives as a URL-encoded value
         // rather than splitting the query string.
         let spaced = Filters {
-            key_id: None,
             model: Some("claude 3.5".to_string()),
+            ..Filters::default()
         };
         assert_eq!(
             view_url(&january, &spaced),
             "/admin/ui/stats?month=2026-01&model=claude+3.5"
+        );
+        // The status class travels by its label, the same string the SQL
+        // bucket expression emits.
+        let classed = Filters {
+            status_class: Some(StatusBucket::Client4xx),
+            ..Filters::default()
+        };
+        assert_eq!(
+            view_url(&january, &classed),
+            "/admin/ui/stats?month=2026-01&status_class=4xx"
         );
     }
 
@@ -874,6 +988,68 @@ mod tests {
         let error = error.expect("the offending value is reported");
         assert!(error.contains("abc"), "{error}");
         assert!(error.contains("row id"), "{error}");
+    }
+
+    #[test]
+    fn the_status_class_filter_parses_its_label_and_reports_an_unknown_one() {
+        let query = StatsQuery {
+            status_class: Some("  5xx  ".to_string()),
+            ..StatsQuery::default()
+        };
+        let (filters, error) = resolve_filters(&query);
+        assert_eq!(filters.status_class, Some(StatusBucket::Server5xx));
+        assert!(filters.is_set());
+        assert!(error.is_none());
+
+        let query = StatsQuery {
+            status_class: Some("errors".to_string()),
+            ..StatsQuery::default()
+        };
+        let (filters, error) = resolve_filters(&query);
+        assert_eq!(
+            filters.status_class, None,
+            "the log listing's errors bucket is not a class of the chart"
+        );
+        assert!(!filters.is_set());
+        let error = error.expect("the offending value is reported");
+        assert!(error.contains("errors"), "{error}");
+        assert!(error.contains("2xx, 4xx, 5xx, other"), "{error}");
+
+        let query = StatsQuery {
+            status_class: Some("   ".to_string()),
+            ..StatsQuery::default()
+        };
+        let (filters, error) = resolve_filters(&query);
+        assert_eq!(filters, Filters::default());
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn the_status_select_offers_every_class_in_stacking_order() {
+        let options = status_options(None);
+        let labels: Vec<&str> = options.iter().map(|option| option.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "All statuses",
+                "2xx success",
+                "4xx client error",
+                "5xx server error",
+                "Other (1xx, 3xx, failures)",
+            ]
+        );
+        let values: Vec<&str> = options.iter().map(|option| option.value.as_str()).collect();
+        assert_eq!(values, vec!["", "2xx", "4xx", "5xx", "other"]);
+        assert!(options[0].selected);
+
+        let options = status_options(Some(StatusBucket::Other));
+        assert_eq!(
+            options.iter().filter(|option| option.selected).count(),
+            1,
+            "exactly one option is selected"
+        );
+        assert!(options[4].selected);
+        assert!(!options[0].selected);
     }
 
     #[test]
@@ -1098,7 +1274,7 @@ mod tests {
             data,
             &Filters {
                 key_id: Some(2),
-                model: None,
+                ..Filters::default()
             },
             None,
         );
@@ -1125,7 +1301,7 @@ mod tests {
             data,
             &Filters {
                 key_id: Some(9),
-                model: None,
+                ..Filters::default()
             },
             None,
         );
@@ -1155,8 +1331,8 @@ mod tests {
         let page = build_page(
             data,
             &Filters {
-                key_id: None,
                 model: Some("gpt-5-mini".to_string()),
+                ..Filters::default()
             },
             None,
         );
@@ -1188,8 +1364,8 @@ mod tests {
         let page = build_page(
             data,
             &Filters {
-                key_id: None,
                 model: Some("nope".to_string()),
+                ..Filters::default()
             },
             None,
         );
@@ -1320,6 +1496,63 @@ mod tests {
     }
 
     #[test]
+    fn the_requests_chart_renders_with_status_rows_and_is_dropped_without_them() {
+        let day = day_row("2026-11-02", "gpt-4o", 1000, 200);
+        let mut data = stats_data(
+            november(),
+            vec![KeyUsage {
+                key: stored_key(None),
+                groups: vec![usage("gpt-4o", 1000, 200, 1)],
+            }],
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        data.days = vec![day];
+        data.status_days = vec![DayStatusUsage {
+            day: "2026-11-02".to_string(),
+            status_class: StatusBucket::Server5xx,
+            requests: 2,
+        }];
+        let plot = build_page(data, &Filters::default(), None)
+            .charts
+            .expect("day rows draw the charts");
+        let status = plot
+            .status_svg
+            .expect("status rows draw the requests chart");
+        assert!(
+            status.contains("aria-label=\"Requests per day\""),
+            "{status}"
+        );
+        assert!(status.contains("Day 2: 2 requests (0 2xx, 0 4xx, 2 5xx, 0 other)"));
+
+        // A status filter that selects nothing drops that chart alone and
+        // leaves the token and cost bars of the same view in place.
+        let day = day_row("2026-11-02", "gpt-4o", 1000, 200);
+        let mut data = stats_data(
+            november(),
+            vec![KeyUsage {
+                key: stored_key(None),
+                groups: vec![usage("gpt-4o", 1000, 200, 1)],
+            }],
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        data.days = vec![day];
+        data.status_days = Vec::new();
+        let plot = build_page(
+            data,
+            &Filters {
+                status_class: Some(StatusBucket::Client4xx),
+                ..Filters::default()
+            },
+            None,
+        )
+        .charts
+        .expect("the token and cost rows still draw their charts");
+        assert!(plot.status_svg.is_none());
+        assert!(plot.tokens_svg.contains("aria-label=\"Tokens per day\""));
+        assert!(plot.cost_svg.contains("aria-label=\"Cost per day\""));
+    }
+
+    #[test]
     fn the_failure_shell_keeps_the_navigation_and_drops_the_empty_message() {
         let month = november();
         let page = page_shell(
@@ -1339,6 +1572,8 @@ mod tests {
             "the key select keeps its default"
         );
         assert!(page.key_options[0].selected);
+        assert!(page.status_options[0].selected);
+        assert_eq!(page.status_options.len(), 5);
     }
 
     #[test]
@@ -1358,15 +1593,16 @@ mod tests {
         let filters = Filters {
             key_id: Some(4),
             model: Some("gpt-4o".to_string()),
+            status_class: Some(StatusBucket::Server5xx),
         };
         let page = page_shell(&month, &filters, None);
         assert_eq!(
             page.prev_url,
-            "/admin/ui/stats?month=2026-10&key_id=4&model=gpt-4o"
+            "/admin/ui/stats?month=2026-10&key_id=4&model=gpt-4o&status_class=5xx"
         );
         assert_eq!(
             page.next_url,
-            "/admin/ui/stats?month=2026-12&key_id=4&model=gpt-4o"
+            "/admin/ui/stats?month=2026-12&key_id=4&model=gpt-4o&status_class=5xx"
         );
         assert!(page
             .empty_message

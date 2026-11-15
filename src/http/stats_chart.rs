@@ -1,19 +1,22 @@
 //! Server-side SVG bar charts for the admin stats page.
 //!
-//! The stats page renders two charts, tokens per day and cost per day, as
-//! plain `<svg>` markup generated here: no JavaScript, no charting crate and
-//! no template logic beyond the `|safe` filter that injects the returned
-//! string. Heights are normalized to the largest daily total in the series,
-//! and every bar carries a `<title>` so the browser shows a native tooltip
-//! without any script.
+//! The stats page renders three charts, tokens per day, cost per day and
+//! requests per day, as plain `<svg>` markup generated here: no JavaScript,
+//! no charting crate and no template logic beyond the `|safe` filter that
+//! injects the returned string. Heights are normalized to the largest daily
+//! total in the series, every bar carries a `<title>` so the browser shows a
+//! native tooltip without any script, and all three share the same viewport,
+//! gutters, day slots and day labels.
 //!
 //! The token chart consumes [`DayUsage`] rows exactly as the SQL aggregate
 //! hands them over and buckets them with [`aggregate_daily`]. The cost chart
 //! takes a pre-summed `(day, micro-USD)` series instead of the same rows,
-//! because a price is a function of the cached-token dimensions
-//! ([`crate::usage::group_cost`]) that `DayUsage` deliberately does not
-//! carry: the caller prices its own query groups and sums them per day, so
-//! no cost is ever derived from a truncated row.
+//! because a price is a function of the price table of the key's channel
+//! ([`crate::usage::group_cost`]), which no usage row carries: the caller
+//! prices its own query groups and sums them per day, so no cost is ever
+//! derived from a row priced with another channel's rates. The status chart
+//! consumes [`DayStatusUsage`] rows and stacks one segment per class, with a
+//! legend that maps the palette colors to the class labels.
 //!
 //! Rows whose day label does not parse to a day of the month are skipped,
 //! and a series that maps to no bar at all renders a placeholder note inside
@@ -24,7 +27,7 @@ use std::fmt::Write as _;
 
 /// The aggregate row the SQL layer defines, reused here so both branches of
 /// the stats page read one shape instead of two identical copies.
-pub(crate) use crate::db::request_logs::DayUsage;
+pub(crate) use crate::db::request_logs::{DayStatusUsage, DayUsage, StatusBucket};
 
 /// Viewport width in user units; the root element scales it to the card.
 const VIEW_W: f64 = 720.0;
@@ -59,6 +62,12 @@ const ACCENT_FILL: &str = "#2563eb";
 const MUTED_FILL: &str = "#6a7280";
 /// `--accent-dark` from `assets/admin.css`, the cost bars.
 const COST_FILL: &str = "#1e50c8";
+/// `--ok` from `assets/admin.css`, the 2xx segment of the status chart.
+const OK_FILL: &str = "#15803d";
+/// `--warn` from `assets/admin.css`, the 4xx segment of the status chart.
+const WARN_FILL: &str = "#92400e";
+/// `--danger` from `assets/admin.css`, the 5xx segment of the status chart.
+const DANGER_FILL: &str = "#b91c1c";
 /// `--border` from `assets/admin.css`, the axis rules.
 const BORDER_STROKE: &str = "#d9dde3";
 
@@ -66,8 +75,13 @@ const BORDER_STROKE: &str = "#d9dde3";
 const TOKENS_LABEL: &str = "Tokens per day";
 /// Accessible name of the cost chart.
 const COST_LABEL: &str = "Cost per day";
+/// Accessible name of the requests chart.
+const STATUS_LABEL: &str = "Requests per day";
 /// Note rendered when a series maps to no bar.
 const EMPTY_NOTE: &str = "No usage in this period";
+/// Class of the legend group of a chart, which is also what tells the legend
+/// rects apart from the bar rects.
+const LEGEND_OPEN: &str = "<g class=\"chart-legend\">";
 
 /// Which pair of values a chart plots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +90,16 @@ enum ChartKind {
     Stacked,
     /// One bar per day from a caller-priced cost series.
     Single,
+}
+
+impl ChartKind {
+    /// The text above the plot naming the largest value of the series.
+    fn max_label(self, max: i64) -> String {
+        match self {
+            ChartKind::Stacked => format!("max {} tokens", compact_count(max)),
+            ChartKind::Single => format!("max {}", compact_usd(max)),
+        }
+    }
 }
 
 /// One day of a chart series, already summed across keys and models.
@@ -95,6 +119,45 @@ impl DayBar {
     /// Height driver of the bar, saturating so no input can overflow.
     fn total(&self) -> i64 {
         self.input.saturating_add(self.output)
+    }
+}
+
+/// One day of the status chart: the request count of every class, in the
+/// fixed stacking order of [`StatusBucket::ALL`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StatusBar {
+    /// Day of the month, 1 through 31.
+    day: u32,
+    /// Request counts per class, indexed by [`class_index`].
+    counts: [i64; 4],
+}
+
+impl StatusBar {
+    /// Height driver of the bar, saturating so no input can overflow.
+    fn total(&self) -> i64 {
+        self.counts
+            .iter()
+            .fold(0, |total, count| total.saturating_add(*count))
+    }
+}
+
+/// Position of a class in the stacking order. Every class is listed in
+/// [`StatusBucket::ALL`], so the lookup always succeeds; the fallback names
+/// the last segment instead of panicking on a value the list does not carry.
+fn class_index(class: StatusBucket) -> usize {
+    StatusBucket::ALL
+        .iter()
+        .position(|known| *known == class)
+        .unwrap_or(StatusBucket::ALL.len() - 1)
+}
+
+/// The palette color of one class.
+fn class_fill(class: StatusBucket) -> &'static str {
+    match class {
+        StatusBucket::Ok2xx => OK_FILL,
+        StatusBucket::Client4xx => WARN_FILL,
+        StatusBucket::Server5xx => DANGER_FILL,
+        StatusBucket::Other => MUTED_FILL,
     }
 }
 
@@ -184,6 +247,39 @@ fn cost_series(costs: &[(String, i64)]) -> Vec<DayBar> {
     slots.into_values().collect()
 }
 
+/// Renders the requests-per-day chart: one bar per day that has data, a
+/// segment per response status class stacked in the order of
+/// [`StatusBucket::ALL`], and a legend mapping the colors to the classes.
+///
+/// The classes are the same ones the SQL aggregate groups by, so the bar
+/// segments and the tooltip figures always agree. An empty series renders a
+/// placeholder note, exactly like the other two charts.
+pub(crate) fn daily_status_bars(rows: &[DayStatusUsage]) -> String {
+    let bars = status_series(rows);
+    if bars.is_empty() {
+        return placeholder_chart(STATUS_LABEL);
+    }
+    render_status_chart(&bars)
+}
+
+/// Buckets the status rows into the fixed day slots, folding the classes of
+/// one day into one bar.
+fn status_series(rows: &[DayStatusUsage]) -> Vec<StatusBar> {
+    let mut slots: BTreeMap<u32, StatusBar> = BTreeMap::new();
+    for row in rows {
+        let Some(number) = day_number(&row.day) else {
+            continue;
+        };
+        let bar = slots.entry(number).or_insert(StatusBar {
+            day: number,
+            counts: [0; 4],
+        });
+        let index = class_index(row.status_class);
+        bar.counts[index] = bar.counts[index].saturating_add(row.requests);
+    }
+    slots.into_values().collect()
+}
+
 /// Day of the month a `YYYY-MM-DD` (or bare day) label names, `None` when
 /// the label does not parse or falls outside 1 through 31.
 fn day_number(day: &str) -> Option<u32> {
@@ -197,10 +293,27 @@ fn render_chart(label: &str, bars: &[DayBar], kind: ChartKind) -> String {
     let scale = if max > 0 { PLOT_H / max as f64 } else { 0.0 };
     let mut svg = String::new();
     push_open(&mut svg, label);
-    push_axes(&mut svg, max, kind);
+    push_axes(&mut svg, &kind.max_label(max));
     for bar in bars {
         push_bar(&mut svg, bar, kind, scale);
     }
+    push_close(&mut svg);
+    svg
+}
+
+/// One complete status chart: frame, axes, stacked bars, legend, closing
+/// tag. The legend goes into the free top gutter, so it takes no room from
+/// the plot and the chart keeps the height of the other two.
+fn render_status_chart(bars: &[StatusBar]) -> String {
+    let max = bars.iter().map(StatusBar::total).max().unwrap_or(0);
+    let scale = if max > 0 { PLOT_H / max as f64 } else { 0.0 };
+    let mut svg = String::new();
+    push_open(&mut svg, STATUS_LABEL);
+    push_axes(&mut svg, &format!("max {} requests", compact_count(max)));
+    for bar in bars {
+        push_status_bar(&mut svg, bar, scale);
+    }
+    push_status_legend(&mut svg);
     push_close(&mut svg);
     svg
 }
@@ -239,7 +352,7 @@ fn push_close(svg: &mut String) {
 
 /// Draws the top gridline, the baseline, the largest value and the sparse
 /// day labels.
-fn push_axes(svg: &mut String, max: i64, kind: ChartKind) {
+fn push_axes(svg: &mut String, max_label: &str) {
     let right = PAD_LEFT + PLOT_W;
     let _ = write!(
         svg,
@@ -247,14 +360,10 @@ fn push_axes(svg: &mut String, max: i64, kind: ChartKind) {
          stroke=\"{BORDER_STROKE}\" stroke-width=\"1\"/>",
     );
     push_baseline(svg);
-    let label = match kind {
-        ChartKind::Stacked => format!("max {} tokens", compact_count(max)),
-        ChartKind::Single => format!("max {}", compact_usd(max)),
-    };
     let _ = write!(
         svg,
         "<text x=\"{PAD_LEFT:.2}\" y=\"{:.2}\" text-anchor=\"start\" font-size=\"11\" \
-         fill=\"{MUTED_FILL}\">{label}</text>",
+         fill=\"{MUTED_FILL}\">{max_label}</text>",
         PAD_TOP - 6.0,
     );
     for day in 1..=DAY_SLOTS {
@@ -318,6 +427,63 @@ fn push_rect(svg: &mut String, day: u32, y: f64, height: f64, fill: &str) {
     );
 }
 
+/// One status bar plus its hover tooltip: the class segments stacked from
+/// the baseline upwards in the order of [`StatusBucket::ALL`], each
+/// normalized by `scale`.
+///
+/// A segment that carries no request draws no rectangle, so a day whose
+/// classes are all zero keeps its title and stays an empty slot.
+fn push_status_bar(svg: &mut String, bar: &StatusBar, scale: f64) {
+    let _ = write!(svg, "<g><title>{}</title>", status_bar_title(bar));
+    let mut top = BASE_Y;
+    for class in StatusBucket::ALL {
+        let height = (bar.counts[class_index(class)] as f64 * scale).min(top - PAD_TOP);
+        if height <= 0.0 {
+            continue;
+        }
+        top -= height;
+        push_rect(svg, bar.day, top, height, class_fill(class));
+    }
+    svg.push_str("</g>");
+}
+
+/// The class legend of the status chart, drawn right-aligned in the free top
+/// gutter as one swatch and one label per class.
+///
+/// It is part of the returned string because the page injects the chart as
+/// markup, so the colors are explained where they appear. The entries are
+/// laid out from the right edge with an estimated character width, which is
+/// enough for four labels and costs no text metrics engine.
+fn push_status_legend(svg: &mut String) {
+    /// Side of a legend swatch.
+    const SWATCH: f64 = 9.0;
+    /// Gap between a swatch and its label.
+    const SWATCH_GAP: f64 = 6.0;
+    /// Gap between two legend entries.
+    const ENTRY_GAP: f64 = 14.0;
+    /// Approximate advance width of one character at the legend font size.
+    const CHAR_W: f64 = 6.0;
+    let baseline = PAD_TOP - 6.0;
+    let mut right = PAD_LEFT + PLOT_W;
+    let mut legend = String::from(LEGEND_OPEN);
+    for class in StatusBucket::ALL.iter().rev() {
+        let label = class.label();
+        let text_x = right - label.len() as f64 * CHAR_W;
+        let swatch_x = text_x - SWATCH_GAP - SWATCH;
+        let _ = write!(
+            legend,
+            "<rect x=\"{swatch_x:.2}\" y=\"{:.2}\" width=\"{SWATCH:.2}\" height=\"{SWATCH:.2}\" \
+             fill=\"{}\"/><text x=\"{text_x:.2}\" y=\"{baseline:.2}\" text-anchor=\"start\" \
+             font-size=\"11\" fill=\"{MUTED_FILL}\">{label}</text>",
+            baseline - 4.0 - SWATCH / 2.0,
+            class_fill(*class),
+        );
+        right = swatch_x - ENTRY_GAP;
+    }
+    legend.push_str("</g>");
+    svg.push_str(&legend);
+}
+
 /// Tooltip text of one bar.
 fn bar_title(bar: &DayBar, kind: ChartKind) -> String {
     match kind {
@@ -331,6 +497,28 @@ fn bar_title(bar: &DayBar, kind: ChartKind) -> String {
         ),
         ChartKind::Single => format!("Day {}: {}", bar.day, format_usd(bar.input)),
     }
+}
+
+/// Tooltip text of one status bar: the day's request count and how it splits
+/// across the classes, so a hover answers which failures the bar holds.
+fn status_bar_title(bar: &StatusBar) -> String {
+    let mut split = String::new();
+    for (index, class) in StatusBucket::ALL.iter().enumerate() {
+        if index > 0 {
+            split.push_str(", ");
+        }
+        let _ = write!(
+            split,
+            "{} {}",
+            group_digits(bar.counts[class_index(*class)]),
+            class.label()
+        );
+    }
+    format!(
+        "Day {}: {} requests ({split})",
+        bar.day,
+        group_digits(bar.total())
+    )
 }
 
 /// Left edge of a day's bar.
@@ -453,6 +641,180 @@ mod tests {
     /// `</text>` tag instead, so the pattern isolates the bars.
     fn rects(svg: &str, fill: &str) -> usize {
         count(svg, &format!("fill=\"{fill}\"/>"))
+    }
+
+    /// One status row as the SQL aggregate would hand it over.
+    fn status_row(day: &str, class: StatusBucket, requests: i64) -> DayStatusUsage {
+        DayStatusUsage {
+            day: day.to_owned(),
+            status_class: class,
+            requests,
+        }
+    }
+
+    /// The chart without its legend, which is emitted last and is the only
+    /// other place the palette colors appear.
+    fn bars_only(svg: &str) -> (&str, &str) {
+        svg.split_once(LEGEND_OPEN)
+            .unwrap_or_else(|| panic!("the status chart carries a legend: {svg}"))
+    }
+
+    #[test]
+    fn empty_status_rows_render_a_placeholder_chart() {
+        let svg = daily_status_bars(&[]);
+        assert!(svg.starts_with("<svg "));
+        assert!(svg.ends_with("</svg>"));
+        assert!(svg.contains(EMPTY_NOTE));
+        assert_eq!(count(&svg, "<rect"), 0);
+        assert_eq!(count(&svg, "<title>"), 0);
+        assert_eq!(count(&svg, LEGEND_OPEN), 0);
+    }
+
+    #[test]
+    fn unparsable_status_days_are_skipped() {
+        let rows = [
+            status_row("bogus", StatusBucket::Ok2xx, 1),
+            status_row("2026-11-00", StatusBucket::Ok2xx, 1),
+            status_row("2026-11-32", StatusBucket::Ok2xx, 1),
+        ];
+        let svg = daily_status_bars(&rows);
+        assert!(svg.contains(EMPTY_NOTE));
+        assert_eq!(count(&svg, "<rect"), 0);
+    }
+
+    #[test]
+    fn status_segments_stack_in_class_order() {
+        let rows = [
+            status_row("2026-11-04", StatusBucket::Other, 1),
+            status_row("2026-11-04", StatusBucket::Server5xx, 2),
+            status_row("2026-11-04", StatusBucket::Ok2xx, 4),
+            status_row("2026-11-04", StatusBucket::Client4xx, 3),
+        ];
+        let svg = daily_status_bars(&rows);
+        let (bars, legend) = bars_only(&svg);
+        assert_eq!(count(bars, "<rect"), 4, "one segment per class: {bars}");
+        // The bottom segment is drawn first, so the class order in the
+        // markup is the stacking order: 2xx, 4xx, 5xx, other. The axis and
+        // day labels carry the muted fill as text, so a bar is found by its
+        // self-closing rect.
+        let order: Vec<usize> = StatusBucket::ALL
+            .iter()
+            .map(|class| {
+                bars.find(&format!("fill=\"{}\"/>", class_fill(*class)))
+                    .unwrap_or_else(|| panic!("{} has a segment: {bars}", class.label()))
+            })
+            .collect();
+        assert!(
+            order.windows(2).all(|pair| pair[0] < pair[1]),
+            "the segments stack in class order: {bars}"
+        );
+        assert!(svg.contains("Day 4: 10 requests (4 2xx, 3 4xx, 2 5xx, 1 other)"));
+        assert!(svg.contains(">max 10 requests</text>"));
+        // The legend lists the same four classes once more, as swatches.
+        assert_eq!(count(legend, "<rect"), 4, "one swatch per class: {legend}");
+    }
+
+    #[test]
+    fn the_legend_names_every_class() {
+        let svg = daily_status_bars(&[status_row("2026-11-01", StatusBucket::Ok2xx, 1)]);
+        let (_, legend) = bars_only(&svg);
+        for class in StatusBucket::ALL {
+            assert!(
+                legend.contains(&format!(">{}</text>", class.label())),
+                "{} is missing from the legend: {legend}",
+                class.label()
+            );
+            assert_eq!(
+                rects(legend, class_fill(class)),
+                1,
+                "{} carries one swatch: {legend}",
+                class.label()
+            );
+        }
+        // The legend is laid out from the right edge of the plot with an
+        // estimated label width, so every coordinate it computes has to stay
+        // inside the viewport it shares with the axis label.
+        for x in legend
+            .split("x=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+        {
+            let value: f64 = x.parse().expect("an x coordinate is a number");
+            assert!(
+                (PAD_LEFT..=PAD_LEFT + PLOT_W).contains(&value),
+                "{value} leaves the plot: {legend}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_day_with_one_class_draws_one_segment_and_keeps_its_title() {
+        let svg = daily_status_bars(&[status_row("2026-11-07", StatusBucket::Server5xx, 2)]);
+        let (bars, _) = bars_only(&svg);
+        assert_eq!(count(bars, "<rect"), 1);
+        assert_eq!(rects(bars, DANGER_FILL), 1);
+        assert_eq!(rects(bars, OK_FILL), 0);
+        assert!(svg.contains("Day 7: 2 requests (0 2xx, 0 4xx, 2 5xx, 0 other)"));
+        assert!(!svg.contains(EMPTY_NOTE));
+    }
+
+    #[test]
+    fn a_status_day_with_no_requests_keeps_a_title_without_a_segment() {
+        let svg = daily_status_bars(&[status_row("2026-11-07", StatusBucket::Ok2xx, 0)]);
+        let (bars, _) = bars_only(&svg);
+        assert_eq!(count(bars, "<rect"), 0);
+        assert_eq!(count(bars, "<title>"), 1);
+        assert!(svg.contains("Day 7: 0 requests (0 2xx, 0 4xx, 0 5xx, 0 other)"));
+        assert!(svg.contains(">max 0 requests</text>"));
+        assert!(!svg.contains(EMPTY_NOTE));
+    }
+
+    #[test]
+    fn every_day_of_the_month_gets_a_status_bar() {
+        let rows: Vec<DayStatusUsage> = (1..=DAY_SLOTS)
+            .map(|day| status_row(&format!("2026-11-{day:02}"), StatusBucket::Ok2xx, 1))
+            .collect();
+        let svg = daily_status_bars(&rows);
+        let (bars, _) = bars_only(&svg);
+        assert_eq!(count(bars, "<g><title>"), DAY_SLOTS as usize);
+        assert_eq!(count(bars, "<rect"), DAY_SLOTS as usize);
+        // The day labels keep the sparse layout of the other charts.
+        assert_eq!(count(&svg, "text-anchor=\"middle\""), 7);
+        assert_eq!(count(&svg, "text-anchor=\"start\""), 5);
+    }
+
+    #[test]
+    fn status_output_is_deterministic_and_order_independent() {
+        /// The same rows in a fixed order, rebuilt on every call.
+        fn sample() -> Vec<DayStatusUsage> {
+            vec![
+                status_row("2026-11-02", StatusBucket::Other, 1),
+                status_row("2026-11-01", StatusBucket::Ok2xx, 3),
+                status_row("2026-11-01", StatusBucket::Server5xx, 2),
+            ]
+        }
+        let mut reversed = sample();
+        reversed.reverse();
+        assert_eq!(daily_status_bars(&sample()), daily_status_bars(&sample()));
+        assert_eq!(daily_status_bars(&sample()), daily_status_bars(&reversed));
+    }
+
+    #[test]
+    fn status_values_saturate_and_stay_inside_the_plot() {
+        let rows = [
+            status_row("2026-11-01", StatusBucket::Ok2xx, i64::MAX),
+            status_row("2026-11-01", StatusBucket::Other, i64::MAX),
+        ];
+        let svg = daily_status_bars(&rows);
+        let (bars, _) = bars_only(&svg);
+        // Saturation drops the segment that no longer fits, but no
+        // coordinate ever leaves the plot.
+        assert_eq!(count(bars, "<rect"), 1);
+        assert!(!svg.contains("NaN"));
+        assert!(!svg.contains("y=\"-"));
+        assert!(svg.contains("y=\"20.00\""));
+        assert!(svg.contains("9,223,372,036,854,775,807"));
+        assert!(svg.contains(">max 9.2E requests</text>"));
     }
 
     #[test]

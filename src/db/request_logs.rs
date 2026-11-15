@@ -147,6 +147,63 @@ impl StatusClass {
     }
 }
 
+/// One response status class of the daily status chart, and the value the
+/// `status_class` query parameter of the stats page carries.
+///
+/// The buckets differ from [`StatusClass`], which serves the log listing: the
+/// listing folds 4xx and 5xx together into `errors`, while the chart shows
+/// each class on its own and keeps everything outside the three named ranges
+/// (1xx, 3xx, and a NULL status, which is a request that never reached an
+/// upstream) in [`StatusBucket::Other`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusBucket {
+    Ok2xx,
+    Client4xx,
+    Server5xx,
+    Other,
+}
+
+impl StatusBucket {
+    /// Every class, in the order the status chart stacks them bottom first.
+    pub const ALL: [StatusBucket; 4] = [
+        StatusBucket::Ok2xx,
+        StatusBucket::Client4xx,
+        StatusBucket::Server5xx,
+        StatusBucket::Other,
+    ];
+
+    /// The label of the class: the value the bucket expression below emits
+    /// for its rows and the URL value of the filter, so one string names a
+    /// class in the query, in the filter and in the legend.
+    pub fn label(self) -> &'static str {
+        match self {
+            StatusBucket::Ok2xx => "2xx",
+            StatusBucket::Client4xx => "4xx",
+            StatusBucket::Server5xx => "5xx",
+            StatusBucket::Other => "other",
+        }
+    }
+
+    /// Parses a class label; `None` means the value names no class.
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.label() == raw)
+    }
+}
+
+/// The SQL expression that buckets the nullable INTEGER `status` column into
+/// the four [`StatusBucket`] labels.
+///
+/// One expression serves both the label of the grouping and the `GROUP BY`
+/// itself, so a row is counted under exactly the class it is grouped by. The
+/// three named ranges are the classes of the chart, and everything else, a
+/// NULL status included, falls into `other`: `BETWEEN` is false for a NULL
+/// operand, so a request that never reached an upstream lands there instead
+/// of vanishing from the chart.
+const STATUS_BUCKET_SQL: &str = "CASE WHEN status BETWEEN 200 AND 299 THEN '2xx' \
+     WHEN status BETWEEN 400 AND 499 THEN '4xx' \
+     WHEN status BETWEEN 500 AND 599 THEN '5xx' \
+     ELSE 'other' END";
+
 /// Filters for the admin listing; every field is optional. `from` and `to`
 /// are inclusive bounds already normalized to the `YYYY-MM-DD HH:MM:SS` UTC
 /// text format the `created_at` column stores, so string comparison against
@@ -435,6 +492,78 @@ fn map_day_usage(row: &Row) -> sqlx::Result<DayUsage> {
     })
 }
 
+/// Request count of one (day, status class) group, as the status chart of
+/// the stats page reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DayStatusUsage {
+    /// The `YYYY-MM-DD` label of the row's day, the label of the grouping.
+    pub day: String,
+    /// The status class of the group, always one of the four buckets.
+    pub status_class: StatusBucket,
+    /// Number of logged requests in the group, whatever their token columns
+    /// hold.
+    pub requests: i64,
+}
+
+/// Request counts per day and status class inside a month window.
+///
+/// The month window is a range predicate on `created_at` in the WHERE
+/// clause, which is what the `(api_key_id, created_at)` index serves;
+/// `substr(created_at, 1, 10)` appears only as the label of the grouping,
+/// never as a filter that would defeat that index. Rows without an
+/// `api_key_id` (rejections whose key never resolved) are excluded, exactly
+/// as in [`day_usage`], so the status chart counts the same requests the
+/// token chart plots. The class comes from one bucket expression in the
+/// SELECT list and in the GROUP BY; a `status_class` filter
+/// compares the same expression, so filtering and grouping can never
+/// disagree. Sums are counted with `COUNT(*)`, which counts a row whatever
+/// its token columns hold and returns an integer on both backends.
+pub async fn day_status_usage(
+    db: &Db,
+    month_start: &str,
+    month_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) -> sqlx::Result<Vec<DayStatusUsage>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT substr(created_at, 1, 10) AS day, ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ")
+        .push("WHERE api_key_id IS NOT NULL AND created_at >= ")
+        .bind(Arg::Text(Some(month_start.to_string())))
+        .push(" AND created_at < ")
+        .bind(Arg::Text(Some(month_end.to_string())));
+    if let Some(key_id) = key_id {
+        sql.push(" AND api_key_id = ").bind(Arg::Int(key_id));
+    }
+    if let Some(model) = model {
+        sql.push(" AND model = ").bind(Arg::Text(Some(model)));
+    }
+    if let Some(status_class) = status_class {
+        sql.push(" AND ")
+            .push(STATUS_BUCKET_SQL)
+            .push(" = ")
+            .bind(Arg::Text(Some(status_class.label().to_string())));
+    }
+    sql.push(" GROUP BY substr(created_at, 1, 10), ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" ORDER BY day, status_class");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(map_day_status_usage).collect()
+}
+
+/// Maps one grouped row; a label the bucket expression does not know counts
+/// as `other` rather than dropping the requests behind it.
+fn map_day_status_usage(row: &Row) -> sqlx::Result<DayStatusUsage> {
+    let label = row.text("status_class")?;
+    Ok(DayStatusUsage {
+        day: row.text("day")?,
+        status_class: StatusBucket::parse(&label).unwrap_or(StatusBucket::Other),
+        requests: row.int("request_count")?,
+    })
+}
+
 /// The distinct model names logged in a month window, sorted, for the model
 /// filter of the charts page.
 ///
@@ -539,6 +668,15 @@ mod tests {
         NewRequestLog {
             cache_write_input_tokens: cache_write_input,
             ..row(model, prompt, completion, cached_input, None)
+        }
+    }
+
+    /// A row with an explicit upstream status; `None` is a request that
+    /// never reached an upstream.
+    fn row_with_status(status: Option<i64>, model: Option<&str>) -> NewRequestLog {
+        NewRequestLog {
+            status,
+            ..row(model, Some(10), Some(1), None, None)
         }
     }
 
@@ -1145,5 +1283,375 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// The bucket expression is the only place the class labels are written
+    /// in SQL, while the filter, the chart and the legend read them from
+    /// [`StatusBucket::label`]. The two must name the same strings.
+    #[test]
+    fn the_bucket_expression_names_every_class_label() {
+        for class in StatusBucket::ALL {
+            assert!(
+                STATUS_BUCKET_SQL.contains(&format!("'{}'", class.label())),
+                "{} is unnamed in {STATUS_BUCKET_SQL}",
+                class.label()
+            );
+        }
+        assert!(
+            STATUS_BUCKET_SQL.ends_with("ELSE 'other' END"),
+            "every class outside the named ranges falls into other: {STATUS_BUCKET_SQL}"
+        );
+    }
+
+    #[tokio::test]
+    async fn day_status_usage_groups_each_day_by_status_class() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "status-groups").await;
+
+        for (status, at) in [
+            (Some(200), "2026-11-08 10:00:00"),
+            (Some(204), "2026-11-08 11:00:00"),
+            (Some(404), "2026-11-08 12:00:00"),
+            (Some(500), "2026-11-09 10:00:00"),
+            (Some(503), "2026-11-09 11:00:00"),
+            (Some(503), "2026-11-09 12:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, Some("alpha")),
+                at,
+            )
+            .await;
+        }
+
+        let usage = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 3, "{usage:?}");
+        // Ordered by day, then by the class label.
+        assert_eq!(usage[0].day, "2026-11-08");
+        assert_eq!(usage[0].status_class, StatusBucket::Ok2xx);
+        assert_eq!(usage[0].requests, 2);
+        assert_eq!(usage[1].day, "2026-11-08");
+        assert_eq!(usage[1].status_class, StatusBucket::Client4xx);
+        assert_eq!(usage[1].requests, 1);
+        assert_eq!(usage[2].day, "2026-11-09");
+        assert_eq!(usage[2].status_class, StatusBucket::Server5xx);
+        assert_eq!(usage[2].requests, 3);
+    }
+
+    #[tokio::test]
+    async fn day_status_usage_buckets_every_status_into_one_of_four_classes() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "status-buckets").await;
+
+        // A NULL status is a request that never reached an upstream, so it
+        // belongs with the statuses outside the three named ranges.
+        for (index, status) in [
+            None,
+            Some(100),
+            Some(199),
+            Some(200),
+            Some(299),
+            Some(302),
+            Some(400),
+            Some(499),
+            Some(500),
+            Some(599),
+            Some(600),
+            Some(0),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let at = format!("2026-11-08 {:02}:00:00", index + 1);
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, Some("alpha")),
+                &at,
+            )
+            .await;
+        }
+
+        let usage = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let counts: Vec<(StatusBucket, i64)> = usage
+            .iter()
+            .map(|group| (group.status_class, group.requests))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![
+                (StatusBucket::Ok2xx, 2),
+                (StatusBucket::Client4xx, 2),
+                (StatusBucket::Server5xx, 2),
+                (StatusBucket::Other, 6),
+            ],
+            "{usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn day_status_usage_takes_only_rows_inside_the_month() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "status-range").await;
+
+        // Last October instant, both November edges, first December instant.
+        for at in [
+            "2026-10-31 23:59:59",
+            "2026-11-01 00:00:00",
+            "2026-11-30 23:59:59",
+            "2026-12-01 00:00:00",
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(Some(200), Some("alpha")),
+                at,
+            )
+            .await;
+        }
+
+        let usage = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 2, "{usage:?}");
+        assert_eq!(usage[0].day, "2026-11-01");
+        assert_eq!(usage[0].requests, 1);
+        assert_eq!(usage[1].day, "2026-11-30");
+        assert_eq!(usage[1].requests, 1);
+    }
+
+    #[tokio::test]
+    async fn day_status_usage_excludes_rows_without_a_key() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "status-no-key").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(Some(200), Some("alpha")),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        // A rejection row whose key never resolved belongs to nobody, even
+        // though it carries a status.
+        insert_at(
+            &db,
+            &row_with_status(Some(401), Some("alpha")),
+            "2026-11-08 11:00:00",
+        )
+        .await
+        .unwrap();
+
+        let usage = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].status_class, StatusBucket::Ok2xx);
+        assert_eq!(usage[0].requests, 1);
+    }
+
+    #[tokio::test]
+    async fn day_status_usage_key_filter_keeps_only_that_key() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "status-key-first").await;
+        let (second_key, second_channel) = seed(&db, "status-key-second").await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row_with_status(Some(200), Some("alpha")),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            second_key,
+            second_channel,
+            row_with_status(Some(200), Some("alpha")),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+        put(
+            &db,
+            second_key,
+            second_channel,
+            row_with_status(Some(500), Some("alpha")),
+            "2026-11-08 12:00:00",
+        )
+        .await;
+
+        let usage = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            Some(second_key),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 2, "{usage:?}");
+        assert_eq!(usage[0].status_class, StatusBucket::Ok2xx);
+        assert_eq!(usage[0].requests, 1);
+        assert_eq!(usage[1].status_class, StatusBucket::Server5xx);
+        assert_eq!(usage[1].requests, 1);
+    }
+
+    #[tokio::test]
+    async fn day_status_usage_model_filter_drops_rows_without_a_model() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "status-model-filter").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(Some(200), Some("alpha")),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(Some(500), None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+
+        let usage = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            Some("alpha".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].status_class, StatusBucket::Ok2xx);
+        assert_eq!(usage[0].requests, 1);
+    }
+
+    #[tokio::test]
+    async fn day_status_usage_class_filter_keeps_only_that_class() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "status-class-filter").await;
+        for status in [Some(200), Some(200), Some(404), Some(500), None] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, Some("alpha")),
+                "2026-11-08 10:00:00",
+            )
+            .await;
+        }
+
+        let group = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Ok2xx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(group.len(), 1, "{group:?}");
+        assert_eq!(group[0].status_class, StatusBucket::Ok2xx);
+        assert_eq!(group[0].requests, 2);
+
+        let others = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Other),
+        )
+        .await
+        .unwrap();
+        assert_eq!(others.len(), 1, "{others:?}");
+        assert_eq!(others[0].status_class, StatusBucket::Other);
+        assert_eq!(
+            others[0].requests, 1,
+            "the request that never reached an upstream counts as other"
+        );
+
+        let none = day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Client4xx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(none.len(), 1, "{none:?}");
+        assert_eq!(none[0].requests, 1);
+    }
+
+    #[tokio::test]
+    async fn day_status_usage_is_empty_without_rows_in_the_month() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "status-empty").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(Some(200), Some("alpha")),
+            "2026-10-05 10:00:00",
+        )
+        .await;
+
+        assert!(day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .is_empty());
     }
 }

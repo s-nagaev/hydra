@@ -6,6 +6,8 @@
 
 - Charts on the admin UI Stat tab: one bar per day of the selected month for usage, one for cost. The token bars stack input tokens under output tokens, the cost bars are priced from the channels exactly as the table is, and both hover titles carry the day's figures.
 - Key and model filters on the admin UI Stat tab, combinable with the month picker and applied to the table and the charts alike. The month navigation links keep whatever filters are in force.
+- Requests-per-day chart on the admin UI Stat tab, stacking the response status classes (2xx, 4xx, 5xx and the rest, which includes requests that never reached an upstream) with a legend that names each color.
+- Status filter on the admin UI Stat tab: it narrows the requests chart to one status class, and the token and cost figures on the page keep counting every request of the month.
 
 ## 1.1.1 (2026-11-15)
 
