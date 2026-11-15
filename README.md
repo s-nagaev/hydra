@@ -47,8 +47,9 @@ plus `/v1/models`, one admin user, no failover.
 - Optional prices per model on a channel (USD per 1M tokens, stored as exact
   integer micro-USD), in five rate dimensions, and an optional monthly
   spending limit per client key, enforced with a 429 `Monthly limit reached`
-- A **Stat** admin tab with month-to-date token usage and computed cost per
-  key, broken down by model and selectable by month
+- Two **Stat** admin tabs with month-to-date token usage and computed cost per
+  key, broken down by model and selectable by date range, and requests per day
+  and per response status code
 
 ## Quickstart
 

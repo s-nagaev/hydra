@@ -75,13 +75,6 @@
 //! There is no mutating route here, so the CSRF guard has nothing to reject;
 //! the module is merged into the `/admin/ui` nest like the other read-only
 //! pages.
-//! per exact code of the range with its class, its request count and its
-//! share of the requests the filters select, the busiest code first. Like the
-//! requests chart it is left out entirely when the filters select no request.
-//!
-//! There is no mutating route here, so the CSRF guard has nothing to reject;
-//! the module is merged into the `/admin/ui` nest like the other read-only
-//! pages.
 
 use std::collections::HashMap;
 
@@ -918,7 +911,6 @@ fn class_label(class: StatusBucket) -> &'static str {
     }
 }
 
-/// The page with its filter widgets and empty table in place; the rows, the
 /// The Tokens page with its filter widgets and empty table in place; the
 /// rows, the grand totals and the charts are filled in by
 /// [`build_tokens_page`].
@@ -1035,7 +1027,6 @@ fn tokens_charts(data: &TokensData) -> Option<TokenCharts> {
     })
 }
 
-/// Renders the table: the model lines of every key that saw usage in the
 /// Renders the Tokens page: the model lines of every key that saw usage in
 /// the range, each followed by the key's total line, plus the grand total and
 /// the two charts.
@@ -1169,7 +1160,6 @@ fn add_day(group: &mut ModelUsage, day: &DayUsage) {
     group.requests = group.requests.saturating_add(day.requests);
 }
 
-/// GET /admin/ui/stats: the usage table, the charts and the status code
 /// Reads the view state of one request out of its query string: the date
 /// range, the filters and the banner text of a value the page cannot use.
 ///

@@ -13,9 +13,9 @@ preserved), logs to the configured database in the background, and returns the
 response.
 **Current status: POC**: the three proxied surfaces plus `/v1/models`, single
 admin user, no failover. Beyond the proxy there is an admin UI under `/admin/ui`
-(channels, keys, logs, a Stat tab for usage), optional prices per model on a
-channel and an optional monthly spending limit per client key. This file is
-the authority on conventions; read it before extending anything.
+(channels, keys, logs, Stat tabs for usage and requests), optional prices per
+model on a channel and an optional monthly spending limit per client key. This
+file is the authority on conventions; read it before extending anything.
 
 ## Repo layout
 
