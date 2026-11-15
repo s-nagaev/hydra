@@ -24,6 +24,7 @@ mod docs;
 mod openai_error;
 mod proxy;
 mod proxy_auth;
+pub(crate) mod stats_chart;
 mod ui_auth;
 
 use std::time::Duration;

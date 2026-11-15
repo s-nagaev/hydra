@@ -117,7 +117,8 @@ body {
   margin-bottom: 16px;
 }
 
-.panel-head h1 {
+.panel-head h1,
+.panel-head h2 {
   font-size: 18px;
   margin: 0;
 }
@@ -650,6 +651,59 @@ td.key-cell {
   align-self: flex-start;
 }
 
+/* The stats date-range bar is laid out in two fixed rows: From, To and the
+   shortcuts on the first one, Key, Model, Status and Apply on the second.
+   The break element forces the wrap regardless of the viewport width, and
+   every field stretches with an equal share of its row, so the controls fill
+   the line edge to edge. The bar still leads its markup with the Apply
+   field, because a browser submitting a form on Enter sends the first submit
+   button of the form: with Apply first, Enter inside a day picker applies
+   the typed range, and the three shortcuts stay ordinary buttons that need a
+   click. `order` then puts the button back at the end of the second row, so
+   the control sequence on screen is untouched. */
+.filter-bar--stats .filter-field {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+/* The date pickers need a fixed comfortable width rather than an equal
+   share: a day value always renders the same, while the selects and the
+   preset group absorb the rest of the row. */
+.filter-bar--stats .filter-field--date {
+  flex: 0 0 15em;
+}
+
+.filter-bar--stats .filter-field input,
+.filter-bar--stats .filter-field select {
+  width: 100%;
+  min-width: 0;
+}
+
+.filter-bar--stats .filter-field--apply {
+  order: 10;
+}
+
+.filter-bar--stats .filter-field--apply button,
+.filter-bar--stats .filter-field--presets button {
+  white-space: nowrap;
+}
+
+/* The shortcuts stay one horizontal group and share their cell equally. */
+.filter-bar--stats .filter-field--presets {
+  flex-direction: row;
+  gap: 8px;
+}
+
+.filter-bar--stats .filter-field--presets button {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.filter-bar--stats .filter-break {
+  flex-basis: 100%;
+  height: 0;
+}
+
 .table-meta {
   color: var(--text-muted);
   font-size: 13px;
@@ -871,6 +925,27 @@ td.key-cell {
   border-top: 2px solid var(--border);
   border-bottom: none;
   color: var(--text-muted);
+}
+
+/* Stats page: the daily charts under the table. The generated SVG fills
+   its block width through the viewBox; blocks stack in one full-width
+   column, one chart per row. */
+.chart-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px 20px;
+}
+
+.chart-title {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.chart-block svg {
+  display: block;
+  width: 100%;
 }
 
 /* Session login: the page shown before a session exists, and the logout

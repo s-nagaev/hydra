@@ -47,8 +47,9 @@ plus `/v1/models`, one admin user, no failover.
 - Optional prices per model on a channel (USD per 1M tokens, stored as exact
   integer micro-USD), in five rate dimensions, and an optional monthly
   spending limit per client key, enforced with a 429 `Monthly limit reached`
-- A **Stat** admin tab with month-to-date token usage and computed cost per
-  key, broken down by model and selectable by month
+- Two **Stat** admin tabs with month-to-date token usage and computed cost per
+  key, broken down by model and selectable by date range, and requests per day
+  and per response status code
 
 ## Quickstart
 
@@ -328,10 +329,14 @@ set, and every model in that
 whitelist carries a price entry; those prices feed the per-key cost and
 monthly limit described below.
 
-The Stat tab (`/admin/ui/stats`) shows month-to-date token usage per key,
-grouped by model, with input, output, cached input, cached output, cache-write
-input, request count and computed cost, for a month chosen with a picker or the
-previous/next links.
+The Tokens tab (`/admin/ui/stats`) shows token usage per key, grouped by model,
+with input, output, cached input, cached output, cache-write input, request
+count and computed cost, for a date range chosen with a From and a To day
+picker or with the Today, Current week and Current month shortcuts. The
+Requests tab (`/admin/ui/stats/requests`) reads the same range and the same key
+and model filters and shows the requests per day, stacked by exact response
+status code, with a table of every code of the range, its class and its share
+of the requests, and a status class filter of its own.
 
 ![Keys page](docs/screenshots/keys.png)
 
@@ -580,14 +585,17 @@ precondition, so a channel priced before that dimension existed stays
 limitable; leaving it unset prices cache writes at zero. A limit on a channel
 that does not qualify is stored
 and not enforced, which the admin UI marks with `limit inactive: channel prices
-incomplete` on the keys page and the Stat tab. This is deliberate: prices are
+incomplete` on the keys page and the Tokens tab. This is deliberate: prices are
 often filled in after the key is issued.
 
-The Stat tab (`/admin/ui/stats`) is where the numbers are visible: month-to-date
-usage per key, grouped by model, with input, output, cached input, cached output
-and cache-write tokens, request count and computed cost in USD, plus a total row
-for all keys.
-The month is selectable with a picker and previous/next links.
+The Tokens tab (`/admin/ui/stats`) is where the numbers are visible: usage per
+key over a selectable date range, grouped by model, with input, output, cached
+input, cached output and cache-write tokens, request count and computed cost in
+USD, plus a total row for all keys. The Requests tab
+(`/admin/ui/stats/requests`) counts the same range per day and per response
+status code.
+The range is chosen with two day pickers or the Today, Current week and Current
+month shortcuts, and it travels in the URL.
 
 ### Known limitations
 

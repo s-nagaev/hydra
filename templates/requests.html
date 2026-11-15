@@ -1,0 +1,117 @@
+{% extends "base.html" %}
+
+{% block title %}Requests{% endblock %}
+
+{% block content %}
+<section class="panel">
+  <div class="panel-head">
+    <h1>Requests <span class="text-muted">{{ range_label }}</span></h1>
+  </div>
+
+  {% if let Some(error) = error %}
+  <div class="error-banner" role="alert">{{ error }}</div>
+  {% endif %}
+
+  <form class="filter-bar filter-bar--stats" method="get" action="/admin/ui/stats/requests">
+    <div class="filter-field filter-field--apply">
+      <button type="submit" class="primary">Apply</button>
+    </div>
+    <div class="filter-field filter-field--date">
+      <label for="stats-from">From (UTC)</label>
+      <input type="date" id="stats-from" name="from" value="{{ from_value }}">
+    </div>
+    <div class="filter-field filter-field--date">
+      <label for="stats-to">To (UTC)</label>
+      <input type="date" id="stats-to" name="to" value="{{ to_value }}">
+    </div>
+    <div class="filter-field filter-field--presets">
+      {% for preset in preset_buttons %}
+      <button type="submit" name="preset" value="{{ preset.value }}">{{ preset.label }}</button>
+      {% endfor %}
+    </div>
+    <div class="filter-break" aria-hidden="true"></div>
+    <div class="filter-field">
+      <label for="stats-key">Key</label>
+      <select id="stats-key" name="key_id">
+        {% for option in key_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="stats-model">Model</label>
+      <select id="stats-model" name="model">
+        {% for option in model_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="filter-field">
+      <label for="stats-status">Status</label>
+      <select id="stats-status" name="status_class">
+        {% for option in status_options %}
+        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+  </form>
+
+  {% if !empty_message.is_empty() %}
+  <p class="empty-state">{{ empty_message }}</p>
+  {% endif %}
+</section>
+
+{% if let Some(status_svg) = status_svg %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>Requests per day <span class="text-muted">{{ range_label }}</span></h2>
+  </div>
+  <div class="chart-grid">
+    <div class="chart-block">
+      <h3 class="chart-title">Requests per day</h3>
+      {{ status_svg|safe }}
+    </div>
+  </div>
+  <p class="table-meta">
+    Bars cover the selected range under the current filters, one bar per day that
+    has requests, stacked by the exact response status codes in the colors the
+    legend names. Heights are relative to the busiest day of the series, and the
+    status filter of the page narrows the bars like it narrows the table below.
+  </p>
+</section>
+{% endif %}
+
+{% if !status_codes.is_empty() %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>Status codes <span class="text-muted">{{ range_label }}</span></h2>
+  </div>
+  <table class="data-table stats-table">
+    <thead>
+      <tr>
+        <th>Status code</th>
+        <th>Class</th>
+        <th>Requests</th>
+        <th>Share</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in status_codes %}
+      <tr>
+        <td class="mono">{{ row.code }}</td>
+        <td>{{ row.class }}</td>
+        <td class="mono">{{ row.requests }}</td>
+        <td class="mono">{{ row.share }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="table-meta">
+    Every exact status code the current filters select, the busiest code first,
+    with the class it belongs to and its share of the requests those filters
+    count. A request that never reached an upstream carries no code and is listed
+    as n/a.
+  </p>
+</section>
+{% endif %}
+{% endblock %}

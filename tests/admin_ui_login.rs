@@ -199,6 +199,7 @@ async fn the_session_cookie_opens_every_ui_page() {
         "/admin/ui/keys",
         "/admin/ui/logs",
         "/admin/ui/stats",
+        "/admin/ui/stats/requests",
     ] {
         let answer = get(
             state_with_password(&db, "secret"),

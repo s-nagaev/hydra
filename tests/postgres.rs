@@ -865,12 +865,12 @@ async fn pg_monthly_limit_gate_rejects_an_over_budget_key() {
     }
 }
 
-/// The admin stats page over PostgreSQL: the per-key month-to-date aggregate
-/// and the priced cost have to render through the real router on the PG
+/// The admin stats page over PostgreSQL: the per-day aggregate of a date
+/// range and the priced cost have to render through the real router on the PG
 /// schema, where the `substr` bucket and the `BIGINT` casts behave as the
 /// sqlite unit tests pin them.
 #[tokio::test]
-async fn pg_stats_page_renders_priced_month_rows() {
+async fn pg_stats_page_renders_priced_range_rows() {
     let Some(db) = pg_db().await else {
         skip_note();
         return;
@@ -915,14 +915,22 @@ async fn pg_stats_page_renders_priced_month_rows() {
     .unwrap();
 
     // One January request and one in February: only January belongs to the
-    // rendered window.
+    // rendered range.
     log_usage_at(&db, key.id, priced.channel.id, "2026-01-05 10:00:00").await;
     log_usage_at(&db, key.id, priced.channel.id, "2026-02-05 10:00:00").await;
 
+    // Every other test of this binary shares this database, and the January
+    // 2026 window is not this test's own: the month-to-date test logs rows on
+    // 2026-01-05, 06, 20 and 31 under its own keys. Without a key in the URL
+    // the pages count those rows too, so both URLs below name this test's
+    // key, which leaves the assertions reading its rows alone.
     let response = within(
         router(app_state(&db)).oneshot(
             Request::builder()
-                .uri("/admin/ui/stats?month=2026-01")
+                .uri(format!(
+                    "/admin/ui/stats?from=2026-01-01&to=2026-01-31&key_id={}",
+                    key.id
+                ))
                 .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
@@ -942,8 +950,50 @@ async fn pg_stats_page_renders_priced_month_rows() {
     assert!(html.contains(">$0.004<"), "the priced January row: {html}");
     assert!(html.contains(">All keys<"), "the grand total line: {html}");
     assert!(
-        html.contains("/admin/ui/stats?month=2025-12")
-            && html.contains("/admin/ui/stats?month=2026-02"),
-        "the month navigation renders: {html}"
+        html.contains("2026-01-01 to 2026-01-31")
+            && html.contains("name=\"from\" value=\"2026-01-01\"")
+            && html.contains("name=\"to\" value=\"2026-01-31\""),
+        "the range the page rendered is the one the URL named: {html}"
     );
+
+    // The Requests page reads the same range out of the status aggregates on
+    // the PG schema, which count the January request alone once the key is
+    // named.
+    let response = within(
+        router(app_state(&db)).oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/admin/ui/stats/requests?from=2026-01-01&to=2026-01-31&key_id={}",
+                    key.id
+                ))
+                .header("authorization", auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+
+    assert!(html.contains("Requests per day"), "{html}");
+    assert!(
+        html.contains("Day 5: 1 requests (1 200)"),
+        "one January request only: {html}"
+    );
+    // The whole table of the view, whitespace flattened: one line for code
+    // 200 carrying the one request of the range. The February request of the
+    // same key would make it two, so this line pins the range boundary too.
+    let cells = html.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        cells.contains(
+            "<td class=\"mono\">200</td> <td>2xx</td> <td class=\"mono\">1</td> \
+             <td class=\"mono\">100.0%</td>"
+        ),
+        "the status code table counts the logged code alone: {html}"
+    );
+    assert!(html.contains("2026-01-01 to 2026-01-31"), "{html}");
 }

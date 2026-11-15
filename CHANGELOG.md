@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Two pages in the admin UI in place of the single Stat tab: Tokens (`/admin/ui/stats`), which keeps the usage table and the token and cost charts, and Requests (`/admin/ui/stats/requests`), which holds the request figures. Each one carries its own entry in the top navigation.
+- Charts on the admin UI Tokens tab: one bar per day of the selected date range for usage, one for cost. The token bars stack input tokens under output tokens, the cost bars are priced from the channels exactly as the table is, and both hover titles carry the day's figures.
+- Date-range filter on both stats pages: a From and a To day picker, plus Today, Current week and Current month shortcut buttons that fill the two pickers. The key and model filters combine with the range on either page, the Requests tab adds a status class filter of its own, an empty range shows the current month to date, and every view is shareable through the URL.
+- Requests tab of the admin UI: one bar per day of the selected date range, stacked by the exact response status codes with a legend that names each color, and a status code table under it listing every code of the range with its class, its request count and its share of the requests the current filters select. A request that never reached an upstream is listed as n/a.
+- Status class filter on the Requests tab, narrowing the page as a whole, its chart and its table alike. A class reads the same way here and in the log listing.
+
+### Changed
+
+- Each stats page now runs only the queries its own content needs: the Tokens page reads the usage and price aggregates, the Requests page the status aggregates.
+
 ## 1.1.1 (2026-11-15)
 
 ### Added

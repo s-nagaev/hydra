@@ -373,6 +373,7 @@ mod tests {
             "/admin/ui/keys",
             "/admin/ui/logs",
             "/admin/ui/stats",
+            "/admin/ui/stats/requests",
         ] {
             let answer = send(
                 state.clone(),
@@ -442,6 +443,7 @@ mod tests {
             "/admin/ui/channels",
             "/admin/ui/logs",
             "/admin/ui/stats",
+            "/admin/ui/stats/requests",
         ] {
             let answer = send(state.clone(), "GET", uri, &[]).await;
             assert_eq!(
@@ -524,6 +526,7 @@ mod tests {
         assert!(body.contains("/admin/ui/keys"));
         assert!(body.contains("/admin/ui/logs"));
         assert!(body.contains("/admin/ui/stats"));
+        assert!(body.contains("/admin/ui/stats/requests"));
         assert!(body.contains("class=\"active\""));
         assert!(body.contains(concat!("hydra ", env!("CARGO_PKG_VERSION"))));
     }
@@ -534,13 +537,20 @@ mod tests {
         let (status, body) = get_page(state, "/admin/ui/stats", Some(&auth_header())).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("Token usage"));
-        for section in ["channels", "keys", "logs", "stats"] {
+        for section in [
+            "/admin/ui/channels",
+            "/admin/ui/keys",
+            "/admin/ui/logs",
+            "/admin/ui/stats",
+            "/admin/ui/stats/requests",
+        ] {
             assert!(
-                body.contains(&format!("/admin/ui/{section}")),
+                body.contains(&format!("href=\"{section}\"")),
                 "the nav must link {section}"
             );
         }
-        assert!(body.contains("href=\"/admin/ui/stats\""));
+        assert!(body.contains(">Tokens</a>"), "{body}");
+        assert!(body.contains(">Requests</a>"), "{body}");
     }
 
     #[tokio::test]
