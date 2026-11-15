@@ -874,12 +874,12 @@ td.key-cell {
   color: var(--text-muted);
 }
 
-/* Stats page: the two daily charts under the table. The generated SVG fills
-   its block width through the viewBox, so the blocks only have to settle
-   into one column on a narrow page and two on a wide one. */
+/* Stats page: the daily charts under the table. The generated SVG fills
+   its block width through the viewBox; blocks stack in one full-width
+   column, one chart per row. */
 .chart-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  grid-template-columns: 1fr;
   gap: 16px 20px;
 }
 
