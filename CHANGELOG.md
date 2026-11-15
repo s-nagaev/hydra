@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.1 (2026-11-15)
 
 - Added: Detail pages for channels and keys
 - Added: Switching a key's channel from its detail page
