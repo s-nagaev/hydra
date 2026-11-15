@@ -342,6 +342,96 @@ fn map_usage(row: &Row) -> sqlx::Result<ModelUsage> {
     })
 }
 
+/// Day-level usage of one (day, key, model) group, as the charts page reads
+/// it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DayUsage {
+    /// The `YYYY-MM-DD` label of the row's day, the label of the grouping.
+    pub day: String,
+    /// The key the requests were made with; never NULL in a returned row.
+    pub key_id: i64,
+    /// The logged model name; NULL for rows that carry no model.
+    pub model: Option<String>,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    /// Number of logged requests in the group, whatever their status.
+    pub requests: i64,
+}
+
+/// Day-level token and request totals inside a month window, one group per
+/// day, key and model.
+///
+/// The month window is a range predicate on `created_at` in the WHERE clause,
+/// which is what the `(api_key_id, created_at)` index serves;
+/// `substr(created_at, 1, 10)` appears only as the label of the grouping,
+/// never as a filter that would defeat that index. Rows without an
+/// `api_key_id` (rejections whose key never resolved) are excluded. A `model`
+/// filter naturally drops the NULL-model rows, while without it those rows
+/// form their own group. A NULL token count contributes nothing, so a group
+/// whose rows all lack tokens still counts its requests and sums to zero. The
+/// sums are cast to `BIGINT` because PostgreSQL's `SUM` over `BIGINT` returns
+/// `NUMERIC` while SQLite's stays an integer, and both must read back as
+/// `i64`.
+pub async fn day_usage(
+    db: &Db,
+    month_start: &str,
+    month_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+) -> sqlx::Result<Vec<DayUsage>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT substr(created_at, 1, 10) AS day, api_key_id, model, ")
+        .push("CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS prompt_tokens, ")
+        .push("CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS completion_tokens, ")
+        .push("COUNT(*) AS request_count FROM request_logs ")
+        .push("WHERE api_key_id IS NOT NULL AND created_at >= ")
+        .bind(Arg::Text(Some(month_start.to_string())))
+        .push(" AND created_at < ")
+        .bind(Arg::Text(Some(month_end.to_string())));
+    if let Some(key_id) = key_id {
+        sql.push(" AND api_key_id = ").bind(Arg::Int(key_id));
+    }
+    if let Some(model) = model {
+        sql.push(" AND model = ").bind(Arg::Text(Some(model)));
+    }
+    sql.push(" GROUP BY substr(created_at, 1, 10), api_key_id, model")
+        .push(" ORDER BY day, api_key_id, model");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(map_day_usage).collect()
+}
+
+fn map_day_usage(row: &Row) -> sqlx::Result<DayUsage> {
+    Ok(DayUsage {
+        day: row.text("day")?,
+        key_id: row.int("api_key_id")?,
+        model: row.opt_text("model")?,
+        prompt_tokens: row.int("prompt_tokens")?,
+        completion_tokens: row.int("completion_tokens")?,
+        requests: row.int("request_count")?,
+    })
+}
+
+/// The distinct model names logged in a month window, sorted, for the model
+/// filter of the charts page.
+///
+/// The window is a range predicate on `created_at`, so the same index serves
+/// it, and rows without a model contribute nothing to a list of names.
+pub async fn distinct_models(
+    db: &Db,
+    month_start: &str,
+    month_end: &str,
+) -> sqlx::Result<Vec<String>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT DISTINCT model FROM request_logs ")
+        .push("WHERE model IS NOT NULL AND created_at >= ")
+        .bind(Arg::Text(Some(month_start.to_string())))
+        .push(" AND created_at < ")
+        .bind(Arg::Text(Some(month_end.to_string())))
+        .push(" ORDER BY model");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(|row| row.text("model")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use sqlx::sqlite::SqlitePoolOptions;
@@ -673,6 +763,315 @@ mod tests {
         )
         .await;
         assert!(month_to_date_usage(&db, key_id, &november())
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn day_usage_groups_by_day_key_and_model() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "days-first").await;
+        let (second_key, second_channel) = seed(&db, "days-second").await;
+
+        // One day, two models for the first key.
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("alpha"), Some(7), Some(1), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("alpha"), Some(3), Some(2), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("beta"), Some(9), Some(4), None, None),
+            "2026-11-08 12:00:00",
+        )
+        .await;
+        // A second day for the first key.
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("alpha"), Some(100), Some(10), None, None),
+            "2026-11-09 00:00:01",
+        )
+        .await;
+        // Another key on the same day is a separate group.
+        put(
+            &db,
+            second_key,
+            second_channel,
+            row(Some("alpha"), Some(1000), Some(0), None, None),
+            "2026-11-08 13:00:00",
+        )
+        .await;
+
+        let usage = day_usage(&db, &november().start(), &november().end(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 4, "{usage:?}");
+        // Ordered by day, then key, then model.
+        assert_eq!(usage[0].day, "2026-11-08");
+        assert_eq!(usage[0].key_id, first_key);
+        assert_eq!(usage[0].model.as_deref(), Some("alpha"));
+        assert_eq!(usage[0].prompt_tokens, 10);
+        assert_eq!(usage[0].completion_tokens, 3);
+        assert_eq!(usage[0].requests, 2);
+        assert_eq!(usage[1].model.as_deref(), Some("beta"));
+        assert_eq!(usage[1].prompt_tokens, 9);
+        assert_eq!(usage[1].requests, 1);
+        assert_eq!(usage[2].day, "2026-11-08");
+        assert_eq!(usage[2].key_id, second_key);
+        assert_eq!(usage[2].prompt_tokens, 1000);
+        assert_eq!(usage[3].day, "2026-11-09");
+        assert_eq!(usage[3].key_id, first_key);
+        assert_eq!(usage[3].prompt_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn day_usage_takes_only_rows_inside_the_month() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "day-range").await;
+
+        // Last October instant, both November edges, first December instant.
+        for (at, tokens) in [
+            ("2026-10-31 23:59:59", 1000),
+            ("2026-11-01 00:00:00", 10),
+            ("2026-11-30 23:59:59", 20),
+            ("2026-12-01 00:00:00", 1000),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row(Some("alpha"), Some(tokens), Some(0), None, None),
+                at,
+            )
+            .await;
+        }
+
+        let usage = day_usage(&db, &november().start(), &november().end(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 2, "{usage:?}");
+        assert_eq!(usage[0].day, "2026-11-01");
+        assert_eq!(usage[0].prompt_tokens, 10);
+        assert_eq!(usage[1].day, "2026-11-30");
+        assert_eq!(usage[1].prompt_tokens, 20);
+    }
+
+    #[tokio::test]
+    async fn day_usage_excludes_rows_without_a_key() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "day-no-key").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row(Some("alpha"), Some(5), Some(1), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        // A rejection row whose key never resolved belongs to nobody.
+        insert_at(
+            &db,
+            &row(Some("alpha"), Some(1000), Some(1000), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await
+        .unwrap();
+
+        let usage = day_usage(&db, &november().start(), &november().end(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].key_id, key_id);
+        assert_eq!(usage[0].prompt_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn day_usage_sums_missing_token_counts_to_zero() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "day-zero-sums").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row(Some("alpha"), None, None, None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row(Some("alpha"), None, None, None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+
+        let usage = day_usage(&db, &november().start(), &november().end(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].prompt_tokens, 0);
+        assert_eq!(usage[0].completion_tokens, 0);
+        assert_eq!(usage[0].requests, 2);
+    }
+
+    #[tokio::test]
+    async fn day_usage_model_filter_drops_rows_without_a_model() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "day-model-filter").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row(Some("alpha"), Some(5), Some(1), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row(None, Some(50), Some(50), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+
+        // Without a filter the NULL-model row forms its own group.
+        let all = day_usage(&db, &november().start(), &november().end(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2, "{all:?}");
+        let named = all
+            .iter()
+            .find(|group| group.model.as_deref() == Some("alpha"))
+            .expect("named group");
+        assert_eq!(named.prompt_tokens, 5);
+        let unnamed = all
+            .iter()
+            .find(|group| group.model.is_none())
+            .expect("NULL-model group");
+        assert_eq!(unnamed.prompt_tokens, 50);
+
+        // A model filter naturally drops the NULL-model group.
+        let filtered = day_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            Some("alpha".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(filtered.len(), 1, "{filtered:?}");
+        assert_eq!(filtered[0].prompt_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn day_usage_key_filter_keeps_only_that_key() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "day-key-first").await;
+        let (second_key, second_channel) = seed(&db, "day-key-second").await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("alpha"), Some(5), Some(1), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            second_key,
+            second_channel,
+            row(Some("alpha"), Some(50), Some(10), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+
+        let usage = day_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            Some(first_key),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].key_id, first_key);
+        assert_eq!(usage[0].prompt_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn day_usage_is_empty_without_rows_in_the_month() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "day-empty").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row(Some("alpha"), Some(1), Some(1), None, None),
+            "2026-10-05 10:00:00",
+        )
+        .await;
+
+        assert!(
+            day_usage(&db, &november().start(), &november().end(), None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_models_lists_each_month_model_once() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "distinct-models").await;
+        for (model, at) in [
+            (Some("beta"), "2026-11-02 10:00:00"),
+            (None, "2026-11-03 10:00:00"),
+            (Some("alpha"), "2026-11-04 10:00:00"),
+            (Some("beta"), "2026-11-05 10:00:00"),
+            (Some("gamma"), "2026-10-31 23:59:59"),
+            (Some("delta"), "2026-12-01 00:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row(model, Some(1), Some(1), None, None),
+                at,
+            )
+            .await;
+        }
+
+        let models = distinct_models(&db, &november().start(), &november().end())
+            .await
+            .unwrap();
+        assert_eq!(models, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn distinct_models_is_empty_without_rows_in_the_month() {
+        let db = test_db().await;
+
+        assert!(distinct_models(&db, &november().start(), &november().end())
             .await
             .unwrap()
             .is_empty());
