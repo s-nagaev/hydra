@@ -80,22 +80,35 @@
   // The theme toggle of the header. The inline script in <head> has already
   // applied the stored theme and written the cookie the stats pages read, so
   // this only has to keep the button in step and to handle the flip. A page
-  // carrying server-rendered charts reloads once: the SVG colors are chosen
-  // on the server, and the reload is what gives the new theme's palette to
-  // the bars, the axes and the legend of the page already on screen.
+  // carrying server-rendered charts reloads once on a flip: the SVG colors
+  // are chosen on the server, and the reload is what gives the new theme's
+  // palette to the bars, the axes and the legend of the page already on
+  // screen.
+  //
+  // Putting a theme in force and storing one are separate steps on purpose.
+  // The theme a page load resolves is the operating system's answer whenever
+  // the visitor has made no choice, so the load path may paint it and may
+  // hand it to the server in the cookie, but it must not write it to the
+  // store: that would turn the system's answer into a choice of the visitor's
+  // and freeze it for every later visit.
   function applyTheme(theme) {
     document.documentElement.setAttribute("data-theme", theme);
-    try {
-      window.localStorage.setItem("hydra-theme", theme);
-    } catch (error) {
-      // A browser that refuses storage keeps the theme of this page anyway.
-    }
     document.cookie = "theme=" + theme + "; path=/; max-age=31536000; samesite=lax";
     var button = document.getElementById("theme-toggle");
     if (button) {
       var dark = theme === "dark";
       button.setAttribute("aria-pressed", dark ? "true" : "false");
       button.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+    }
+  }
+
+  // The store holds the visitor's own choice and nothing else, which is why
+  // the click handler is the only caller.
+  function persistTheme(theme) {
+    try {
+      window.localStorage.setItem("hydra-theme", theme);
+    } catch (error) {
+      // A browser that refuses storage keeps the theme of this page anyway.
     }
   }
 
@@ -108,9 +121,14 @@
     if (!button) {
       return;
     }
+    // Paint what this page already is, in step with the inline script, and
+    // leave the store alone: a visitor with no stored choice keeps following
+    // the operating system on every later visit.
     applyTheme(activeTheme());
     button.addEventListener("click", function () {
-      applyTheme(activeTheme() === "dark" ? "light" : "dark");
+      var next = activeTheme() === "dark" ? "light" : "dark";
+      persistTheme(next);
+      applyTheme(next);
       if (document.querySelector(".chart-block")) {
         window.location.reload();
       }

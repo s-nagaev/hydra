@@ -726,4 +726,40 @@ mod tests {
         );
         assert!(source.contains("textContent"));
     }
+
+    #[test]
+    fn the_theme_choice_is_stored_only_when_the_toggle_is_clicked() {
+        let source = std::str::from_utf8(ADMIN_JS).unwrap();
+        // The theme a page load resolves is the operating system's answer
+        // whenever the visitor has made no choice. Writing it to the store on
+        // that path would turn the answer of the first visit into a choice of
+        // the visitor's and stop `prefers-color-scheme` from being followed,
+        // so the store gets exactly one writer and one caller, both reached
+        // from the click handler.
+        let writes: Vec<usize> = source
+            .match_indices("window.localStorage.setItem")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(writes.len(), 1, "the store has a single writer: {writes:?}");
+        let calls: Vec<usize> = source
+            .match_indices("persistTheme(")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(calls.len(), 2, "one definition and one call: {calls:?}");
+        assert!(
+            source[..calls[0]].ends_with("function "),
+            "the first mention defines the helper"
+        );
+        assert!(
+            calls[0] < writes[0] && writes[0] < calls[1],
+            "the write belongs to that helper: {calls:?} {writes:?}"
+        );
+        let click = source
+            .find("button.addEventListener(\"click\"")
+            .expect("the toggle listens for clicks");
+        assert!(
+            calls[0] < click && click < calls[1],
+            "the only call sits in the click handler: {calls:?} around {click}"
+        );
+    }
 }
