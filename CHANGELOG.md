@@ -1,12 +1,20 @@
 # Changelog
 
-## Unreleased
+## 1.1.1 (2026-11-15)
 
-- Added: Detail pages for channels and keys
-- Added: Switching a key's channel from its detail page
-- Added: Request and response text on the log detail page, each in its own collapsible block above the captured body
-- Changed: Rows in the channels and keys tables link to the detail page
-- Removed: Actions columns in the channels and keys tables and the /admin/ui/{channels,keys}/{id}/edit routes
+### Added
+
+- Detail pages for channels and keys: clicking a row in either table opens a card with the full entity details and the actions on it.
+- Switching a key's channel from its detail page with a selector, so the key can be moved to another channel without deleting it.
+- Request and response text on the log detail page, each in its own collapsible block above the captured body. The text is extracted from the stored body at render time, supports Chat Completions, Responses and Anthropic shapes including streamed ones, and falls back silently when no text is detectable.
+
+### Changed
+
+- Rows in the channels and keys tables link to the detail page instead of exposing row actions.
+
+### Removed
+
+- The Actions columns in the channels and keys tables and the `/admin/ui/{channels,keys}/{id}/edit` routes they served.
 
 ## 1.1.0 (2026-11-13)
 
