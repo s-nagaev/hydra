@@ -865,12 +865,12 @@ async fn pg_monthly_limit_gate_rejects_an_over_budget_key() {
     }
 }
 
-/// The admin stats page over PostgreSQL: the per-key month-to-date aggregate
-/// and the priced cost have to render through the real router on the PG
+/// The admin stats page over PostgreSQL: the per-day aggregate of a date
+/// range and the priced cost have to render through the real router on the PG
 /// schema, where the `substr` bucket and the `BIGINT` casts behave as the
 /// sqlite unit tests pin them.
 #[tokio::test]
-async fn pg_stats_page_renders_priced_month_rows() {
+async fn pg_stats_page_renders_priced_range_rows() {
     let Some(db) = pg_db().await else {
         skip_note();
         return;
@@ -915,14 +915,14 @@ async fn pg_stats_page_renders_priced_month_rows() {
     .unwrap();
 
     // One January request and one in February: only January belongs to the
-    // rendered window.
+    // rendered range.
     log_usage_at(&db, key.id, priced.channel.id, "2026-01-05 10:00:00").await;
     log_usage_at(&db, key.id, priced.channel.id, "2026-02-05 10:00:00").await;
 
     let response = within(
         router(app_state(&db)).oneshot(
             Request::builder()
-                .uri("/admin/ui/stats?month=2026-01")
+                .uri("/admin/ui/stats?from=2026-01-01&to=2026-01-31")
                 .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
@@ -942,8 +942,9 @@ async fn pg_stats_page_renders_priced_month_rows() {
     assert!(html.contains(">$0.004<"), "the priced January row: {html}");
     assert!(html.contains(">All keys<"), "the grand total line: {html}");
     assert!(
-        html.contains("/admin/ui/stats?month=2025-12")
-            && html.contains("/admin/ui/stats?month=2026-02"),
-        "the month navigation renders: {html}"
+        html.contains("2026-01-01 to 2026-01-31")
+            && html.contains("name=\"from\" value=\"2026-01-01\"")
+            && html.contains("name=\"to\" value=\"2026-01-31\""),
+        "the range the page rendered is the one the URL named: {html}"
     );
 }

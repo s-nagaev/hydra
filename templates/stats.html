@@ -5,18 +5,27 @@
 {% block content %}
 <section class="panel">
   <div class="panel-head">
-    <h1>Token usage <span class="text-muted">{{ month_label }}</span></h1>
+    <h1>Token usage <span class="text-muted">{{ range_label }}</span></h1>
   </div>
 
   {% if let Some(error) = error %}
   <div class="error-banner" role="alert">{{ error }}</div>
   {% endif %}
 
-  <form class="filter-bar" method="get" action="/admin/ui/stats">
+  <form class="filter-bar filter-grid" method="get" action="/admin/ui/stats">
     <div class="filter-field">
-      <label for="stats-month">Month (UTC)</label>
-      <input type="month" id="stats-month" name="month" value="{{ month_value }}">
+      <label for="stats-from">From (UTC)</label>
+      <input type="date" id="stats-from" name="from" value="{{ from_value }}">
     </div>
+    <div class="filter-field">
+      <label for="stats-to">To (UTC)</label>
+      <input type="date" id="stats-to" name="to" value="{{ to_value }}">
+    </div>
+    {% for preset in preset_buttons %}
+    <div class="filter-field">
+      <button type="submit" name="preset" value="{{ preset.value }}">{{ preset.label }}</button>
+    </div>
+    {% endfor %}
     <div class="filter-field">
       <label for="stats-key">Key</label>
       <select id="stats-key" name="key_id">
@@ -44,17 +53,6 @@
     <div class="filter-field">
       <button type="submit" class="primary">Apply</button>
     </div>
-    <div class="filter-field">
-      <a class="button" href="{{ prev_url }}">Previous month</a>
-    </div>
-    <div class="filter-field">
-      <a class="button" href="{{ next_url }}">Next month</a>
-    </div>
-    {% if !is_current_month %}
-    <div class="filter-field">
-      <a href="{{ current_url }}">This month</a>
-    </div>
-    {% endif %}
   </form>
 
   <table class="data-table stats-table">
@@ -125,7 +123,7 @@
 {% if let Some(plot) = charts %}
 <section class="panel">
   <div class="panel-head">
-    <h2>Usage over time <span class="text-muted">{{ month_label }}</span></h2>
+    <h2>Usage over time <span class="text-muted">{{ range_label }}</span></h2>
   </div>
   <div class="chart-grid">
     <div class="chart-block">
@@ -144,13 +142,13 @@
     {% endif %}
   </div>
   <p class="table-meta">
-    Bars cover the selected month under the current filters, one bar per day that
+    Bars cover the selected range under the current filters, one bar per day that
     has usage. Token bars stack input tokens at the bottom and output tokens on
     top; heights are relative to the busiest day of the series. Cost is priced the
     same way the table prices it, so the daily bars add up to the same money.
-    Request bars stack the exact response status codes of the month, in the colors
+    Request bars stack the exact response status codes of the range, in the colors
     the legend names, and follow the status filter, while the token and cost bars
-    and the table keep counting every request of the month.
+    and the table keep counting every request of the range.
   </p>
 </section>
 {% endif %}
@@ -158,7 +156,7 @@
 {% if !status_codes.is_empty() %}
 <section class="panel">
   <div class="panel-head">
-    <h2>Status codes <span class="text-muted">{{ month_label }}</span></h2>
+    <h2>Status codes <span class="text-muted">{{ range_label }}</span></h2>
   </div>
   <table class="data-table stats-table">
     <thead>

@@ -1,9 +1,9 @@
-//! Integration tests for the admin UI stats page: the auth gate, month
-//! selection and navigation, per key and per model grouping with summed
+//! Integration tests for the admin UI stats page: the auth gate, date-range
+//! selection with its shortcuts, per key and per model grouping with summed
 //! tokens and priced cost, the inactive-limit warning, the omission of keys
 //! without usage, soft-deleted keys, rows whose upstream reported no usage,
 //! the filters and charts, the per-status-code chart and table and the empty
-//! and malformed month states.
+//! and malformed range states.
 //!
 //! Rows are seeded through the database layer with explicit timestamps, and
 //! the page itself is driven through the real router, so the tests pin the
@@ -52,18 +52,43 @@ async fn get_page(db: &SqlitePool, uri: &str) -> Send {
     send(db, uri, Some(&auth_header())).await
 }
 
+/// The `YYYY-MM` label of the current month, the prefix of the day range the
+/// page defaults to.
 fn current_month_label() -> String {
     String::from_utf8_lossy(&Month::current().bucket()).to_string()
 }
 
+/// The `YYYY-MM-DD` label of the current UTC day, the default `to` bound.
+fn today_label() -> String {
+    let now = time::OffsetDateTime::now_utc();
+    format!(
+        "{:04}-{:02}-{:02}",
+        now.year(),
+        u8::from(now.month()),
+        now.day()
+    )
+}
+
 /// The rows of the rendered table, between its opening and closing tags. The
-/// key and model filters list every key and every model of the month in the
+/// key and model filters list every key and every model of the range in the
 /// select boxes above it, so an assertion that a key or a model has no row
 /// has to look at the table rather than at the whole page.
 fn table_rows(html: &str) -> &str {
     let (_, rest) = html.split_once("<table").expect("the stats table renders");
     let (table, _) = rest.split_once("</table>").expect("the table is closed");
     table
+}
+
+/// The filter bar markup, from its opening form to its closing tag, so an
+/// assertion about the controls cannot be satisfied by the table below it.
+fn filter_bar(html: &str) -> &str {
+    let (_, rest) = html
+        .split_once("<form class=\"filter-bar")
+        .expect("the filter bar renders");
+    let (bar, _) = rest
+        .split_once("</form>")
+        .expect("the filter bar is closed");
+    bar
 }
 
 /// The chart panel, which is the part of the page after the table panel. A
@@ -138,17 +163,6 @@ fn select_markup<'a>(html: &'a str, id: &str) -> &'a str {
         .split_once("</select>")
         .expect("the select must be closed");
     markup
-}
-
-/// Every link target of the page with its HTML escaping undone, so a link
-/// can be compared against the URL the handler built rather than against the
-/// escaped attribute the template emits.
-fn links(html: &str) -> Vec<String> {
-    html.split("href=\"")
-        .skip(1)
-        .filter_map(|rest| rest.split_once('"').map(|(url, _)| url.to_string()))
-        .map(|url| url.replace("&#38;", "&").replace("&amp;", "&"))
-        .collect()
 }
 
 /// A channel whitelisted to `gpt-4o` and priced for it, so it is limitable:
@@ -336,76 +350,234 @@ async fn stats_page_renders_the_active_nav_entry_and_the_footnote() {
         html.contains("Requests without reported usage are not counted"),
         "the NULL-usage footnote must be on the page"
     );
-    assert!(html.contains("Month (UTC)"));
+    assert!(html.contains("From (UTC)") && html.contains("To (UTC)"));
 }
 
-// --- Month selection ------------------------------------------------------
+// --- Date range selection -------------------------------------------------
 
 #[tokio::test]
-async fn stats_page_defaults_to_the_current_month() {
+async fn the_filter_bar_offers_two_day_pickers_and_three_shortcuts() {
     let db = test_pool().await;
     let (status, html) = get_page(&db, "/admin/ui/stats").await;
     assert_eq!(status, StatusCode::OK);
-    let label = current_month_label();
+    let bar = filter_bar(&html);
     assert!(
-        html.contains(&format!(
-            "id=\"stats-month\" name=\"month\" value=\"{label}\""
-        )),
-        "the month input must default to {label}: {html}"
+        bar.contains("id=\"stats-from\" name=\"from\" value=\""),
+        "the From day picker must be in the bar: {bar}"
     );
-    assert!(html.contains(&format!("Token usage <span class=\"text-muted\">{label}")));
+    assert!(
+        bar.contains("type=\"date\""),
+        "the day pickers are date inputs: {bar}"
+    );
+    assert!(
+        bar.contains("id=\"stats-to\" name=\"to\" value=\""),
+        "the To day picker must be in the bar: {bar}"
+    );
+    assert!(
+        !bar.contains("type=\"month\"") && !bar.contains("name=\"month\""),
+        "the month field is gone: {bar}"
+    );
+    assert!(
+        !html.contains("Previous month") && !html.contains("Next month"),
+        "the month navigation links are gone: {html}"
+    );
+    for (value, label) in [
+        ("today", "Today"),
+        ("week", "Current week"),
+        ("month", "Current month"),
+    ] {
+        assert!(
+            bar.contains(&format!(
+                "<button type=\"submit\" name=\"preset\" value=\"{value}\">{label}</button>"
+            )),
+            "the {label} shortcut must submit preset={value}: {bar}"
+        );
+    }
+
+    // Reading order: the two day fields, the shortcuts, the three filters,
+    // then the submit button.
+    let order = [
+        "stats-from",
+        "stats-to",
+        "preset\" value=\"today\"",
+        "preset\" value=\"week\"",
+        "preset\" value=\"month\"",
+        "stats-key",
+        "stats-model",
+        "stats-status",
+        "Apply",
+    ];
+    let mut previous = 0;
+    for needle in order {
+        let at = bar
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} must be in the bar: {bar}"));
+        assert!(at >= previous, "{needle} is out of the bar's order: {bar}");
+        previous = at;
+    }
 }
 
 #[tokio::test]
-async fn the_selected_month_drives_the_rows_and_the_navigation_links() {
+async fn stats_page_defaults_to_the_current_month_to_date() {
+    let db = test_pool().await;
+    let (status, html) = get_page(&db, "/admin/ui/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    let month = current_month_label();
+    let today = today_label();
+    let bar = filter_bar(&html);
+    assert!(
+        bar.contains(&format!("name=\"from\" value=\"{month}-01\"")),
+        "an empty from is the first day of the current month: {bar}"
+    );
+    assert!(
+        bar.contains(&format!("name=\"to\" value=\"{today}\"")),
+        "an empty to is today: {bar}"
+    );
+    assert!(
+        html.contains(&format!(
+            "Token usage <span class=\"text-muted\">{month}-01 to {today}"
+        )),
+        "the heading names the days the view covers: {html}"
+    );
+}
+
+#[tokio::test]
+async fn the_selected_range_drives_the_rows_and_leaves_other_days_out() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (key_id, prefix) = seed_key(&db, channel_id, "jan", None).await;
     log_priced_request(&db, key_id, channel_id, "2026-01-05 10:00:00").await;
     log_priced_request(&db, key_id, channel_id, "2026-02-05 10:00:00").await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-01").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-01-01&to=2026-01-31").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains(&prefix), "{html}");
     assert!(
-        html.contains("/admin/ui/stats?month=2025-12"),
-        "the previous month link must step back a month"
+        filter_bar(&html).contains("name=\"from\" value=\"2026-01-01\""),
+        "the from field echoes the URL: {html}"
     );
-    assert!(
-        html.contains("/admin/ui/stats?month=2026-02"),
-        "the next month link must step forward a month"
-    );
-    // One request that month: 1000 prompt, 200 completion, 400 cached input.
+    // One request in the range: 1000 prompt, 200 completion, 400 cached
+    // input.
     assert!(html.contains(">1,000<"), "{html}");
     assert!(html.contains(">400<"), "{html}");
     assert!(html.contains(">$0.004<"), "one priced request: {html}");
 
     // The February view carries its own numbers and does not leak January
-    // into them.
-    let (_, february) = get_page(&db, "/admin/ui/stats?month=2026-02").await;
+    // into them, and the heading names its own days.
+    let (_, february) = get_page(&db, "/admin/ui/stats?from=2026-02-01&to=2026-02-28").await;
     assert!(february.contains(">$0.004<"));
-    assert!(
-        february.contains("/admin/ui/stats?month=2026-01"),
-        "February links back to January"
-    );
-    assert!(
-        february.contains("/admin/ui/stats?month=2026-03"),
-        "February links forward to March"
-    );
+    assert!(february.contains("2026-02-01 to 2026-02-28"), "{february}");
+    assert!(!february.contains("2026-01-01 to 2026-01-31"));
 
-    // A month after the logged rows renders the empty state, with the key
+    // A range before the logged rows renders the empty state, with the key
     // still offered by the filter select but carrying no row.
-    let (_, empty) = get_page(&db, "/admin/ui/stats?month=2026-05").await;
-    assert!(empty.contains("No requests logged in 2026-05"), "{empty}");
+    let (_, empty) = get_page(&db, "/admin/ui/stats?from=2026-05-01&to=2026-05-31").await;
+    assert!(
+        empty.contains("No requests logged between 2026-05-01 and 2026-05-31"),
+        "{empty}"
+    );
     assert!(
         !table_rows(&empty).contains(&prefix),
-        "no rows for a month without usage"
+        "no rows for a range without usage"
     );
     assert!(!empty.contains("<svg"), "no data means no chart: {empty}");
 }
 
 #[tokio::test]
-async fn a_malformed_month_falls_back_to_the_current_month_behind_a_banner() {
+async fn a_range_that_cuts_through_a_month_keeps_its_own_days() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "cut", None).await;
+    // Two requests inside the range, the second one late on the inclusive
+    // `to` day, and one in the first second after it.
+    log_priced_request(&db, key_id, channel_id, "2026-06-03 10:00:00").await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-10 23:59:59").await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-11 00:00:00").await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-10").await;
+    assert_eq!(status, StatusCode::OK);
+    let table = table_rows(&html);
+    assert!(
+        table.contains(">2,000<") && table.contains(">$0.008<"),
+        "the two requests inside the range are the whole table: {table}"
+    );
+    assert!(
+        !table.contains(">3,000<") && !table.contains(">$0.012<"),
+        "the request of the day after `to` stays out: {table}"
+    );
+    let charts = chart_panel(&html);
+    assert!(charts.contains("Day 3:"), "{charts}");
+    assert!(
+        charts.contains("Day 10:"),
+        "the to day itself is plotted: {charts}"
+    );
+    assert!(
+        !charts.contains("Day 11:"),
+        "the day after the to day is not: {charts}"
+    );
+
+    // A single-day range covers exactly that day.
+    let (_, one_day) = get_page(&db, "/admin/ui/stats?from=2026-06-03&to=2026-06-03").await;
+    assert!(one_day.contains(">$0.004<"), "{one_day}");
+    assert!(!one_day.contains(">$0.008<"), "{one_day}");
+}
+
+#[tokio::test]
+async fn a_shortcut_fills_the_day_pickers_and_decides_the_rows() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, prefix) = seed_key(&db, channel_id, "short", None).await;
+    // One request today and one on the first day of the current month: the
+    // day shortcut sees the first alone, the month shortcut both.
+    log_priced_request(
+        &db,
+        key_id,
+        channel_id,
+        &format!("{} 10:00:00", today_label()),
+    )
+    .await;
+    log_priced_request(
+        &db,
+        key_id,
+        channel_id,
+        &format!("{}-01 00:00:01", current_month_label()),
+    )
+    .await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?preset=today").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains(&prefix), "{html}");
+    let bar = filter_bar(&html);
+    let today = today_label();
+    assert!(
+        bar.contains(&format!("name=\"from\" value=\"{today}\""))
+            && bar.contains(&format!("name=\"to\" value=\"{today}\"")),
+        "the shortcut fills both day fields: {bar}"
+    );
+    assert!(
+        !table_rows(&html).contains(">$0.008<"),
+        "one request falls on today: {html}"
+    );
+    assert!(html.contains(&format!("{today} to {today}")), "{html}");
+
+    let (_, month) = get_page(&db, "/admin/ui/stats?preset=month").await;
+    let bar = filter_bar(&month);
+    assert!(
+        bar.contains(&format!(
+            "name=\"from\" value=\"{}-01\"",
+            current_month_label()
+        )),
+        "the month shortcut starts on the 1st: {bar}"
+    );
+    let table = table_rows(&month);
+    assert!(
+        table.contains(">$0.008<"),
+        "both requests of the month are in the table: {table}"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_day_falls_back_to_the_current_month_behind_a_banner() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (key_id, prefix) = seed_key(&db, channel_id, "now", None).await;
@@ -414,10 +586,10 @@ async fn a_malformed_month_falls_back_to_the_current_month_behind_a_banner() {
     let now = format!("{}-01 10:00:00", current_month_label());
     log_priced_request(&db, key_id, channel_id, &now).await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=January").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=January").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        html.contains("is not a YYYY-MM month"),
+        html.contains("is not a YYYY-MM-DD date"),
         "the banner must explain the expected shape: {html}"
     );
     assert!(
@@ -425,7 +597,58 @@ async fn a_malformed_month_falls_back_to_the_current_month_behind_a_banner() {
         "the banner must name the offending value: {html}"
     );
     assert!(html.contains(&prefix), "the current month still renders");
-    assert!(html.contains(&format!("value=\"{}\"", current_month_label())));
+    assert!(filter_bar(&html).contains(&format!("value=\"{}-01\"", current_month_label())));
+}
+
+#[tokio::test]
+async fn an_inverted_range_shows_a_banner_and_renders_the_current_month() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "inverted", None).await;
+    log_priced_request(
+        &db,
+        key_id,
+        channel_id,
+        &format!("{} 10:00:00", today_label()),
+    )
+    .await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-09&to=2026-06-01").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("is after"), "{html}");
+    assert!(
+        html.contains("2026-06-09") && html.contains("2026-06-01"),
+        "{html}"
+    );
+    let bar = filter_bar(&html);
+    assert!(
+        bar.contains(&format!(
+            "name=\"from\" value=\"{}-01\"",
+            current_month_label()
+        )) && bar.contains(&format!("name=\"to\" value=\"{}\"", today_label())),
+        "the default range is rendered instead: {bar}"
+    );
+    assert!(
+        table_rows(&html).contains(">$0.004<"),
+        "the current month's usage is still there: {html}"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_shortcut_shows_a_banner_and_no_shortcut_takes_effect() {
+    let db = test_pool().await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?preset=yesterday").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("is not one of today, week, month"),
+        "the banner lists the accepted shortcuts: {html}"
+    );
+    assert!(html.contains("yesterday"), "{html}");
+    let bar = filter_bar(&html);
+    assert!(
+        bar.contains(&format!("name=\"to\" value=\"{}\"", today_label())),
+        "the default range still renders: {bar}"
+    );
 }
 
 // --- Grouping, cost and warnings -----------------------------------------
@@ -453,7 +676,7 @@ async fn rows_group_by_key_and_model_with_totals_and_a_grand_total() {
     .await;
     log_priced_request(&db, second_id, channel_id, "2026-06-04 10:00:00").await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains(&first_prefix) && html.contains(&second_prefix));
     assert!(html.contains("gpt-4o") && html.contains("gpt-5-mini"));
@@ -481,7 +704,7 @@ async fn rows_group_by_key_and_model_with_totals_and_a_grand_total() {
 }
 
 #[tokio::test]
-async fn a_key_without_usage_in_the_month_is_omitted() {
+async fn a_key_without_usage_in_the_range_is_omitted() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (used_id, used_prefix) = seed_key(&db, channel_id, "used", None).await;
@@ -489,13 +712,13 @@ async fn a_key_without_usage_in_the_month_is_omitted() {
     log_priced_request(&db, used_id, channel_id, "2026-07-01 10:00:00").await;
     assert!(idle_id > 0);
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-07").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-07-01&to=2026-07-31").await;
     assert_eq!(status, StatusCode::OK);
     let table = table_rows(&html);
     assert!(table.contains(&used_prefix));
     assert!(
         !table.contains(&idle_prefix),
-        "a key without usage in the month has no row: {table}"
+        "a key without usage in the range has no row: {table}"
     );
     assert!(
         html.contains(&format!("<option value=\"{idle_id}\">")),
@@ -510,7 +733,7 @@ async fn a_limited_key_on_an_unlimitable_channel_carries_the_warning_badge() {
     let (key_id, _) = seed_key(&db, limited_id, "warned", Some(50_000_000)).await;
     log_priced_request(&db, key_id, limited_id, "2026-08-01 10:00:00").await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-08").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-08-01&to=2026-08-31").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("limit inactive: channel prices incomplete"),
@@ -527,7 +750,7 @@ async fn a_priced_channel_never_shows_the_warning() {
     let (key_id, _) = seed_key(&db, channel_id, "enforced", Some(1)).await;
     log_priced_request(&db, key_id, channel_id, "2026-09-01 10:00:00").await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-09").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-09-01&to=2026-09-30").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         !html.contains("limit inactive"),
@@ -545,7 +768,7 @@ async fn a_deleted_key_keeps_its_rows_and_is_marked() {
         .await
         .unwrap();
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-10").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-10-01&to=2026-10-31").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains(&prefix), "the deleted key keeps its usage");
     assert!(html.contains("<span class=\"badge deleted\">deleted</span>"));
@@ -571,7 +794,7 @@ async fn requests_without_reported_usage_count_but_add_no_tokens() {
     )
     .await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-04").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-04-01&to=2026-04-30").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains(">2<"),
@@ -617,7 +840,7 @@ async fn usage_rejected_before_a_key_resolved_is_attributed_to_no_key() {
     .await
     .unwrap();
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-03").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-03-01&to=2026-03-31").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains(&prefix));
     assert!(
@@ -692,7 +915,7 @@ async fn the_cache_write_column_shows_the_written_tokens_and_their_cost() {
     .await
     .unwrap();
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-08").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-08-01&to=2026-08-31").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains(&prefix), "{html}");
     assert!(
@@ -720,7 +943,7 @@ async fn the_cache_write_column_shows_the_written_tokens_and_their_cost() {
 // --- Filters and charts ---------------------------------------------------
 
 #[tokio::test]
-async fn the_key_filter_narrows_the_table_and_rides_along_the_month_links() {
+async fn the_key_filter_narrows_the_table_and_keeps_the_range() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (first_id, first_prefix) = seed_key(&db, channel_id, "kept", None).await;
@@ -730,7 +953,7 @@ async fn the_key_filter_narrows_the_table_and_rides_along_the_month_links() {
 
     let (status, html) = get_page(
         &db,
-        &format!("/admin/ui/stats?month=2026-06&key_id={first_id}"),
+        &format!("/admin/ui/stats?from=2026-06-01&to=2026-06-30&key_id={first_id}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -748,14 +971,9 @@ async fn the_key_filter_narrows_the_table_and_rides_along_the_month_links() {
         option_is_selected(&html, &first_id.to_string()),
         "the filtered key stays selected in the control: {html}"
     );
-    let targets = links(&html);
     assert!(
-        targets.contains(&format!("/admin/ui/stats?month=2026-05&key_id={first_id}")),
-        "the previous link keeps the filter: {html}"
-    );
-    assert!(
-        targets.contains(&format!("/admin/ui/stats?month=2026-07&key_id={first_id}")),
-        "the next link keeps the filter: {html}"
+        filter_bar(&html).contains("name=\"from\" value=\"2026-06-01\""),
+        "the range survives the filter: {html}"
     );
     assert!(
         select_markup(&html, "stats-key").contains(&format!("<option value=\"{second_id}\">")),
@@ -763,7 +981,7 @@ async fn the_key_filter_narrows_the_table_and_rides_along_the_month_links() {
     );
 
     // Without the filter both keys are back.
-    let (_, unfiltered) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    let (_, unfiltered) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
     assert!(table_rows(&unfiltered).contains(&second_prefix));
 }
 
@@ -785,7 +1003,11 @@ async fn the_model_filter_narrows_the_table_and_the_charts() {
     )
     .await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&model=gpt-5-mini").await;
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&model=gpt-5-mini",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let table = table_rows(&html);
     assert!(table.contains("gpt-5-mini"), "{table}");
@@ -809,7 +1031,7 @@ async fn the_model_filter_narrows_the_table_and_the_charts() {
         !charts.contains("Day 1:"),
         "a filtered-out day draws no bar: {charts}"
     );
-    // The control still lists the whole month, so the filter can be widened,
+    // The control still lists the whole range, so the filter can be widened,
     // and it does not fall back to its "All models" default.
     let models = select_markup(&html, "stats-model");
     assert!(models.contains("<option value=\"gpt-4o\">"), "{html}");
@@ -820,13 +1042,13 @@ async fn the_model_filter_narrows_the_table_and_the_charts() {
 }
 
 #[tokio::test]
-async fn the_charts_plot_the_month_and_agree_with_the_table() {
+async fn the_charts_plot_the_range_and_agree_with_the_table() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (key_id, _) = seed_key(&db, channel_id, "plot", None).await;
     log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Usage over time"), "{html}");
     let charts = chart_panel(&html);
@@ -843,10 +1065,15 @@ async fn the_charts_plot_the_month_and_agree_with_the_table() {
 
     // A filter that selects nothing says so, keeps the empty styling and
     // draws no chart at all.
-    let (status, filtered_out) = get_page(&db, "/admin/ui/stats?month=2026-06&model=nope").await;
+    let (status, filtered_out) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&model=nope",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        filtered_out.contains("No usage matches the current filters in 2026-06"),
+        filtered_out
+            .contains("No usage matches the current filters between 2026-06-01 and 2026-06-30"),
         "{filtered_out}"
     );
     assert!(!filtered_out.contains("<svg"), "{filtered_out}");
@@ -868,7 +1095,7 @@ async fn a_soft_deleted_key_stays_selectable_in_the_key_filter() {
 
     let (status, html) = get_page(
         &db,
-        &format!("/admin/ui/stats?month=2026-10&key_id={key_id}"),
+        &format!("/admin/ui/stats?from=2026-10-01&to=2026-10-31&key_id={key_id}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -894,7 +1121,11 @@ async fn an_unparsable_key_id_shows_a_banner_and_filters_nothing() {
     let (key_id, prefix) = seed_key(&db, channel_id, "kept", None).await;
     log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&key_id=abc").await;
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&key_id=abc",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("is not a row id"), "{html}");
     assert!(html.contains("abc"), "the banner names the value: {html}");
@@ -907,7 +1138,7 @@ async fn an_unparsable_key_id_shows_a_banner_and_filters_nothing() {
 // --- Status codes and classes ---------------------------------------------
 
 #[tokio::test]
-async fn the_requests_chart_stacks_the_month_by_exact_status_code() {
+async fn the_requests_chart_stacks_every_exact_status_code_of_the_range() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (key_id, _) = seed_key(&db, channel_id, "codes", None).await;
@@ -924,7 +1155,7 @@ async fn the_requests_chart_stacks_the_month_by_exact_status_code() {
     )
     .await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Requests per day"), "{html}");
     let charts = chart_panel(&html);
@@ -962,7 +1193,11 @@ async fn the_status_filter_narrows_the_requests_chart_alone() {
     )
     .await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=5xx").await;
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=5xx",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let charts = chart_panel(&html);
     assert!(
@@ -1003,29 +1238,28 @@ async fn the_status_filter_narrows_the_requests_chart_alone() {
     );
 
     // Without the filter the requests chart holds the whole day.
-    let (_, unfiltered) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    let (_, unfiltered) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
     assert!(chart_panel(&unfiltered).contains("Day 1: 2 requests (1 200, 1 500)"));
     assert!(table_rows(&unfiltered).contains(">$0.00435<"));
 }
 
 #[tokio::test]
-async fn the_status_filter_rides_along_the_month_links() {
+async fn the_status_filter_leaves_the_token_and_cost_figures_alone() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (key_id, _) = seed_key(&db, channel_id, "linked", None).await;
     log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=4xx").await;
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=4xx",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(option_is_selected(&html, "4xx"), "{html}");
-    let targets = links(&html);
     assert!(
-        targets.contains(&"/admin/ui/stats?month=2026-05&status_class=4xx".to_string()),
-        "the previous link keeps the filter: {html}"
-    );
-    assert!(
-        targets.contains(&"/admin/ui/stats?month=2026-07&status_class=4xx".to_string()),
-        "the next link keeps the filter: {html}"
+        filter_bar(&html).contains("name=\"from\" value=\"2026-06-01\""),
+        "the range survives the filter: {html}"
     );
     let control = select_markup(&html, "stats-status");
     assert!(
@@ -1037,7 +1271,7 @@ async fn the_status_filter_rides_along_the_month_links() {
         "the filter in force is not hidden behind All statuses: {html}"
     );
 
-    // A month without a 4xx response drops the requests chart alone: the
+    // A range without a 4xx response drops the requests chart alone: the
     // token and cost bars and the table keep the request.
     assert!(
         !html.contains("aria-label=\"Requests per day\""),
@@ -1069,7 +1303,7 @@ async fn a_request_that_never_reached_an_upstream_is_listed_without_a_code() {
     )
     .await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
     assert_eq!(status, StatusCode::OK);
     let charts = chart_panel(&html);
     assert!(
@@ -1091,13 +1325,21 @@ async fn a_request_that_never_reached_an_upstream_is_listed_without_a_code() {
         "{html}"
     );
 
-    let (_, other) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=other").await;
+    let (_, other) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=other",
+    )
+    .await;
     assert!(
         chart_panel(&other).contains("Day 2: 1 requests (1 n/a)"),
         "the other class is selectable: {other}"
     );
 
-    let (_, success) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=2xx").await;
+    let (_, success) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=2xx",
+    )
+    .await;
     assert!(
         !success.contains("aria-label=\"Requests per day\""),
         "{success}"
@@ -1136,7 +1378,7 @@ async fn the_status_code_table_lists_every_code_of_the_period_with_its_share() {
         .await;
     }
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Status codes"), "{html}");
     let rows = status_code_rows(&html);
@@ -1182,8 +1424,8 @@ async fn the_status_code_table_lists_every_code_of_the_period_with_its_share() {
     );
     assert!(charts.contains("Day 3: 1 requests (1 n/a)"), "{charts}");
 
-    // A month without requests renders no status code panel at all.
-    let (_, empty) = get_page(&db, "/admin/ui/stats?month=2026-04").await;
+    // A range without requests renders no status code panel at all.
+    let (_, empty) = get_page(&db, "/admin/ui/stats?from=2026-04-01&to=2026-04-30").await;
     assert!(!empty.contains("Status codes"), "{empty}");
 }
 
@@ -1229,7 +1471,7 @@ async fn the_status_code_table_follows_the_key_model_and_status_filters() {
 
     let (status, html) = get_page(
         &db,
-        &format!("/admin/ui/stats?month=2026-06&key_id={first_id}"),
+        &format!("/admin/ui/stats?from=2026-06-01&to=2026-06-30&key_id={first_id}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1244,7 +1486,11 @@ async fn the_status_code_table_follows_the_key_model_and_status_filters() {
     assert_eq!(rows[1][1], "5xx");
 
     // The model filter narrows the codes and the total the shares divide by.
-    let (_, model) = get_page(&db, "/admin/ui/stats?month=2026-06&model=gpt-5-mini").await;
+    let (_, model) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&model=gpt-5-mini",
+    )
+    .await;
     assert_eq!(
         status_code_rows(&model),
         vec![[
@@ -1257,7 +1503,11 @@ async fn the_status_code_table_follows_the_key_model_and_status_filters() {
     );
 
     // The class filter keeps the codes of that class alone.
-    let (_, class) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=4xx").await;
+    let (_, class) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=4xx",
+    )
+    .await;
     assert_eq!(
         status_code_rows(&class),
         vec![[
@@ -1278,7 +1528,11 @@ async fn an_unknown_status_class_shows_a_banner_and_filters_nothing() {
     log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
 
     // `errors` is a bucket of the log listing, not a class of the chart.
-    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=errors").await;
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=errors",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
         html.contains("is not one of 2xx, 4xx, 5xx, other"),

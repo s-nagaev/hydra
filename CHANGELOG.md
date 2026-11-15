@@ -4,11 +4,11 @@
 
 ### Added
 
-- Charts on the admin UI Stat tab: one bar per day of the selected month for usage, one for cost. The token bars stack input tokens under output tokens, the cost bars are priced from the channels exactly as the table is, and both hover titles carry the day's figures.
-- Key and model filters on the admin UI Stat tab, combinable with the month picker and applied to the table and the charts alike. The month navigation links keep whatever filters are in force.
+- Charts on the admin UI Stat tab: one bar per day of the selected date range for usage, one for cost. The token bars stack input tokens under output tokens, the cost bars are priced from the channels exactly as the table is, and both hover titles carry the day's figures.
+- Date-range filter on the admin UI Stat tab: a From and a To day picker, plus Today, Current week and Current month shortcut buttons that fill the two pickers, applied to the usage table, the charts and the status code table alike. Key, model and status class filters combine with the range, an empty range shows the current month to date, and every view is shareable through the URL.
 - Requests-per-day chart on the admin UI Stat tab, stacking the response status classes (2xx, 4xx, 5xx and the rest, which includes requests that never reached an upstream) with a legend that names each color.
-- Status filter on the admin UI Stat tab: it narrows the requests chart to one status class, and the token and cost figures on the page keep counting every request of the month.
-- Per-status-code breakdown on the admin UI Stat tab: the requests-per-day chart stacks each exact response status code, a request that never reached an upstream being shown as n/a, and a status code table lists every code of the period with its class, its request count and its share of the requests the current filters select.
+- Status filter on the admin UI Stat tab: it narrows the requests chart to one status class, and the token and cost figures on the page keep counting every request of the range.
+- Per-status-code breakdown on the admin UI Stat tab: the requests-per-day chart stacks each exact response status code, a request that never reached an upstream being shown as n/a, and a status code table lists every code of the range with its class, its request count and its share of the requests the current filters select.
 
 ## 1.1.1 (2026-11-15)
 

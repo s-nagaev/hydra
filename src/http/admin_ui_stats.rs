@@ -1,18 +1,14 @@
-//! Admin UI stats page: month-to-date token usage and cost per client key,
-//! grouped by model, for a month selected in the URL.
+//! Admin UI stats page: token usage and cost per client key over a selected
+//! date range, grouped by model.
 //!
-//! The page is a reader of the same two building blocks the monthly-limit
-//! enforcement uses: the `request_logs` month-to-date aggregate
-//! ([`crate::db::request_logs::month_to_date_usage`]) and the pinned cost
-//! formula ([`crate::usage::group_cost`], with
-//! [`crate::usage::month_cost`] for a key's total). No second aggregate
-//! query and no second pricing path exists, so the numbers an admin reads
-//! here are the numbers the gate compares against the stored limit.
-//!
-//! The aggregate is per key, so the page runs one aggregate per listed key.
-//! That is deliberate at the current scale (one admin, a handful of keys)
-//! and keeps the SQL in exactly one place; it is the price of not writing a
-//! second, all-keys aggregate query.
+//! Every sum the page shows comes out of the same day-level aggregate
+//! ([`crate::db::request_logs::day_usage`]) and the same pinned cost formula
+//! the monthly-limit enforcement uses ([`crate::usage::group_cost`]), so the
+//! table, the charts and the status code table can never disagree about the
+//! same request: the table folds the day rows per key and model, the charts
+//! plot the rows themselves. No second aggregate query and no second pricing
+//! path exists, so a range that runs over a whole calendar month prices what
+//! the gate prices for that month.
 //!
 //! Cost comes from the price table of the channel the key is bound to,
 //! exactly as enforcement prices it: a model the channel does not price
@@ -21,28 +17,40 @@
 //! channel, open whitelist, incomplete price list) shows the same
 //! informational badge the keys panel shows.
 //!
-//! Rendering rules worth naming. A key with no usage in the selected month
+//! Rendering rules worth naming. A key with no usage in the selected range
 //! is omitted entirely, because the table lists usage rather than keys;
 //! soft-deleted keys keep their rows, marked, since they spent the tokens.
 //! Rows whose upstream reported no usage add no tokens to the sums while
 //! still counting as requests, and rows rejected before a key resolved
-//! (`api_key_id` NULL) belong to no key and are counted nowhere. The
-//! selected month travels in the query string as `YYYY-MM`, so every view is
-//! shareable and reloadable without JavaScript, and a malformed value falls
-//! back to the current month behind a banner instead of failing the page.
+//! (`api_key_id` NULL) belong to no key and are counted nowhere.
+//!
+//! The range travels in the query string as `from` and `to`, both
+//! `YYYY-MM-DD`, so every view is shareable and reloadable without
+//! JavaScript. The admin's `to` day is inclusive, and the SQL predicate
+//! compares with `<`, so the bounds handed to the aggregates are the first
+//! instant of `from` and the first instant after `to` ([`DateRange::end`]
+//! carries that conversion). An empty `from` is the first day of the current
+//! month and an empty `to` is today, so a page without a range shows the
+//! month to date; a malformed day or a `from` after `to` falls back to that
+//! default range behind a banner instead of failing the page.
+//!
+//! Three shortcut buttons sit between the date fields and the filters,
+//! Today, Current week and Current month. Each is a submit button carrying a
+//! `preset` value, resolved to concrete dates at render time (the same
+//! pattern the logs page presets follow), so a shared shortcut stays
+//! relative to the moment it is opened and the fields always show the days a
+//! view really covers.
 //!
 //! Three filters narrow the view, a key, a model and a status class, read
-//! from the same query string and combined with the month. The key and the
-//! model apply to the table and to every chart, which is why the table is
-//! narrowed by filtering the per-key aggregates the page already loaded
-//! rather than by a second query, while the day rows arrive pre-filtered from
-//! their own aggregate. The status class applies to the requests chart and to
-//! the status code table, which are both request-based: the usage table, the
-//! token bars and the cost bars are token-based and keep their meaning under
-//! it. The month links carry whatever filters are set, so stepping through
-//! months keeps the slice of usage the admin is looking at.
+//! from the same query string and applied to the day rows in their own
+//! query, so the table, the charts and the status table all read the same
+//! rows. The status class applies to the requests chart and to the status
+//! code table, which are both request-based: the usage table, the token bars
+//! and the cost bars are token-based and keep their meaning under it. The
+//! model list of the select stays range-scoped and unfiltered, so the
+//! control always offers every model of the range.
 //!
-//! Under the table sit three charts of the same filtered month, tokens per
+//! Under the table sit three charts of the same filtered range, tokens per
 //! day, cost per day and requests per day, drawn server-side by
 //! [`crate::http::stats_chart`] as plain SVG and injected with askama's
 //! `|safe` filter. The cost of a day is the sum of [`crate::usage::group_cost`]
@@ -53,7 +61,7 @@
 //! chart at all and keeps the table's empty state instead.
 //!
 //! Under the charts sits the status code table of the same filters: one line
-//! per exact code of the period with its class, its request count and its
+//! per exact code of the range with its class, its request count and its
 //! share of the requests the filters select, the busiest code first. Like the
 //! requests chart it is left out entirely when the filters select no request.
 //!
@@ -70,6 +78,7 @@ use axum::extract::{Query, State};
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
+use time::{Date, Duration, OffsetDateTime};
 
 use crate::db::channels::{self, PricedChannel};
 use crate::db::keys::{self, ApiKey};
@@ -82,19 +91,196 @@ use crate::http::stats_chart;
 use crate::http::ui_auth::UiAuth;
 use crate::http::AppState;
 use crate::limits;
-use crate::month::Month;
 use crate::prices::ModelPrices;
 use crate::usage;
 
-/// The view state of the page: the month and the three optional filters.
-/// Kept as strings so a malformed or empty value becomes a banner over an
-/// unfiltered view instead of a rejected request.
+/// The shortcut buttons of the filter bar: the value of the `preset`
+/// parameter and the label of the button that carries it. Each one resolves
+/// to concrete days at render time, so a shortcut link stays relative to the
+/// moment it is opened.
+const PRESETS: &[(&str, &str)] = &[
+    (PRESET_TODAY, "Today"),
+    (PRESET_WEEK, "Current week"),
+    (PRESET_MONTH, "Current month"),
+];
+
+/// The current day, as both bounds of the range.
+const PRESET_TODAY: &str = "today";
+/// The Monday through Sunday of the current ISO week.
+const PRESET_WEEK: &str = "week";
+/// The first through the last day of the current month.
+const PRESET_MONTH: &str = "month";
+
+/// The view state of the page: the date range, the shortcut that may stand
+/// in for it and the three optional filters. Kept as strings so a malformed
+/// or empty value becomes a banner over a usable view instead of a rejected
+/// request.
 #[derive(Debug, Default, Deserialize)]
 pub struct StatsQuery {
-    month: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    preset: Option<String>,
     key_id: Option<String>,
     model: Option<String>,
     status_class: Option<String>,
+}
+
+/// The inclusive UTC day range of one view: the days the `from` and `to`
+/// parameters name, or the days a shortcut resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DateRange {
+    /// The first day of the range, inclusive.
+    from: Date,
+    /// The last day of the range, inclusive for the admin. The SQL predicate
+    /// compares with `<`, so it reads the bound [`DateRange::end`] builds:
+    /// the first instant of the following day.
+    to: Date,
+}
+
+impl DateRange {
+    /// The first day of `day`'s month through `day` itself.
+    fn month_to_date(day: Date) -> Self {
+        DateRange {
+            from: month_start(day),
+            to: day,
+        }
+    }
+
+    /// The inclusive lower bound in the canonical stored timestamp format.
+    fn start(&self) -> String {
+        format!("{} 00:00:00", day_text(self.from))
+    }
+
+    /// The exclusive upper bound in the canonical stored timestamp format.
+    ///
+    /// The admin's `to` day is inclusive and the SQL predicate compares with
+    /// `<`, so the bound is the first instant of the day after it; a request
+    /// of the `to` day, at any hour, stays inside. The last day of the
+    /// supported calendar has no day after it, and the bound then names the
+    /// end of that day, which no stored timestamp reaches.
+    fn end(&self) -> String {
+        match self.to.next_day() {
+            Some(next) => format!("{} 00:00:00", day_text(next)),
+            None => format!("{} 24:00:00", day_text(self.to)),
+        }
+    }
+
+    /// How the range reads in the page's headings: `2026-11-01 to 2026-11-15`.
+    fn label(&self) -> String {
+        format!("{} to {}", day_text(self.from), day_text(self.to))
+    }
+}
+
+/// One shortcut button of the filter bar: the `preset` value it submits and
+/// the label it shows.
+pub struct PresetButton {
+    pub value: &'static str,
+    pub label: &'static str,
+}
+
+/// The shortcut buttons, in the order the bar offers them.
+fn preset_buttons() -> Vec<PresetButton> {
+    PRESETS
+        .iter()
+        .map(|(value, label)| PresetButton { value, label })
+        .collect()
+}
+
+/// The accepted `preset` values, in the order the buttons offer them, so the
+/// banner and the controls cannot list different vocabularies.
+fn preset_values() -> String {
+    PRESETS
+        .iter()
+        .map(|(value, _)| *value)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The current UTC day, the day the default range ends on.
+fn today_utc() -> Date {
+    OffsetDateTime::now_utc().date()
+}
+
+/// The `YYYY-MM-DD` text of a day, the shape a `type="date"` input and the
+/// `from` and `to` parameters carry.
+fn day_text(day: Date) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        day.year(),
+        u8::from(day.month()),
+        day.day()
+    )
+}
+
+/// Reads a `YYYY-MM-DD` day; `None` for anything else, including a day its
+/// month does not have (`2026-02-30`), a year that is not four digits and a
+/// month outside 1 through 12.
+fn parse_day(raw: &str) -> Option<Date> {
+    let (year, rest) = raw.split_once('-')?;
+    let (month, day) = rest.split_once('-')?;
+    if !digits(year, 4) || !digits(month, 2) || !digits(day, 2) {
+        return None;
+    }
+    let month = time::Month::try_from(month.parse::<u8>().ok()?).ok()?;
+    Date::from_calendar_date(year.parse().ok()?, month, day.parse().ok()?).ok()
+}
+
+/// Exactly `width` ASCII digits.
+fn digits(text: &str, width: usize) -> bool {
+    text.len() == width && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The first day of the month a day falls in.
+fn month_start(day: Date) -> Date {
+    Date::from_calendar_date(day.year(), day.month(), 1).expect("the first of a month exists")
+}
+
+/// The last day of the month a day falls in, the length of that month in the
+/// leap-year sense included.
+fn month_end(day: Date) -> Date {
+    let last = time::util::days_in_month(day.month(), day.year());
+    Date::from_calendar_date(day.year(), day.month(), last).expect("the month has a last day")
+}
+
+/// The Monday of the ISO week a day falls in; the day itself when it is a
+/// Monday.
+fn week_start(day: Date) -> Date {
+    let offset = Duration::days(i64::from(day.weekday().number_days_from_monday()));
+    // Only a day in the first week of the supported calendar has no Monday
+    // behind it, and no shortcut produces one.
+    day.checked_sub(offset).unwrap_or(day)
+}
+
+/// The days one shortcut stands for, relative to `today`: the current day,
+/// the week it falls in, or the month it falls in.
+fn preset_range(name: &str, today: Date) -> Option<DateRange> {
+    match name {
+        PRESET_TODAY => Some(DateRange {
+            from: today,
+            to: today,
+        }),
+        // The week runs through its Sunday, which is later than today for
+        // every day but Sunday itself; those days simply have no data yet.
+        PRESET_WEEK => {
+            let monday = week_start(today);
+            let sunday = monday.checked_add(Duration::days(6)).unwrap_or(today);
+            Some(DateRange {
+                from: monday,
+                to: sunday,
+            })
+        }
+        // The whole month, the days that have not started included.
+        PRESET_MONTH => Some(DateRange {
+            from: month_start(today),
+            to: month_end(today),
+        }),
+        _ => None,
+    }
+}
+
+/// A parameter's value when it carries something other than whitespace.
+fn non_blank(raw: Option<&str>) -> Option<&str> {
+    raw.map(str::trim).filter(|value| !value.is_empty())
 }
 
 /// The key, model and status class filters of one view, after parsing. Every
@@ -145,7 +331,7 @@ pub struct DisplaySums {
 }
 
 /// The charts of the view, already rendered as SVG. Present only when the
-/// filtered month has rows to plot.
+/// filtered range has rows to plot.
 pub struct Charts {
     /// Tokens per day, input and output stacked.
     pub tokens_svg: String,
@@ -177,30 +363,30 @@ pub struct StatusCodeRow {
 pub struct StatsPage {
     pub version: &'static str,
     pub section: &'static str,
-    /// The rendered month, `YYYY-MM`.
-    pub month_label: String,
-    /// The same month as the `month` input value.
-    pub month_value: String,
+    /// The rendered range, `2026-11-01 to 2026-11-15`.
+    pub range_label: String,
+    /// The first day of the range, as the `from` input value.
+    pub from_value: String,
+    /// The last day of the range, as the `to` input value.
+    pub to_value: String,
+    /// The shortcut buttons of the filter bar.
+    pub preset_buttons: Vec<PresetButton>,
     pub rows: Vec<StatsRow>,
     pub grand: DisplaySums,
     /// The Key select: `All keys` plus every stored key, soft-deleted ones
     /// included.
     pub key_options: Vec<SelectOption>,
-    /// The Model select: `All models` plus every model logged in the month.
+    /// The Model select: `All models` plus every model logged in the range.
     pub model_options: Vec<SelectOption>,
     /// The Status select: `All statuses` plus the four classes the requests
     /// chart stacks.
     pub status_options: Vec<SelectOption>,
-    /// The status code table of the period, busiest code first; empty when
+    /// The status code table of the range, busiest code first; empty when
     /// the filters select no request, which is when the template leaves the
     /// whole panel out.
     pub status_codes: Vec<StatusCodeRow>,
-    /// Absent when the filtered month has nothing to plot.
+    /// Absent when the filtered range has nothing to plot.
     pub charts: Option<Charts>,
-    pub prev_url: String,
-    pub next_url: String,
-    pub current_url: String,
-    pub is_current_month: bool,
     pub empty_message: String,
     pub error: Option<String>,
 }
@@ -286,26 +472,24 @@ struct ChannelInfo {
     limitable: bool,
 }
 
-/// One key together with its usage groups for the selected month.
-struct KeyUsage {
-    key: ApiKey,
-    groups: Vec<ModelUsage>,
-}
-
 /// Everything the page needs out of the database.
 struct StatsData {
-    month: Month,
-    keys: Vec<KeyUsage>,
+    range: DateRange,
+    /// Every stored key, soft-deleted ones included: they fill the key select
+    /// and name the channel a row's cost comes from.
+    keys: Vec<ApiKey>,
     channels: HashMap<i64, ChannelInfo>,
-    /// Day-level rows of the filtered month, for the token and cost charts.
+    /// Day-level rows of the filtered range, the only usage the page reads:
+    /// the table folds them per key and model, the charts plot them as they
+    /// are.
     days: Vec<DayUsage>,
-    /// Day-level request counts per exact status code of the filtered month,
+    /// Day-level request counts per exact status code of the filtered range,
     /// for the requests chart.
     status_code_days: Vec<DayStatusCodeUsage>,
-    /// Request totals per exact status code of the filtered month, for the
+    /// Request totals per exact status code of the filtered range, for the
     /// status code table.
     status_code_totals: Vec<StatusCodeTotal>,
-    /// The distinct models logged in the month, for the Model select.
+    /// The distinct models logged in the range, for the Model select.
     models: Vec<String>,
 }
 
@@ -314,67 +498,79 @@ fn internal_error(error: &sqlx::Error) -> String {
     "internal server error".to_string()
 }
 
-/// The `YYYY-MM` label of a month, read from the same seven-byte bucket the
-/// limit flags key on.
-fn month_label(month: &Month) -> String {
-    String::from_utf8_lossy(&month.bucket()).to_string()
-}
-
-/// The link to one view of the page: the month always travels, a filter only
-/// when it carries a value, so a shared URL stays as short as it can.
-fn view_url(month: &Month, filters: &Filters) -> String {
-    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
-    serializer.append_pair("month", &month_label(month));
-    if let Some(key_id) = filters.key_id {
-        serializer.append_pair("key_id", &key_id.to_string());
-    }
-    if let Some(model) = &filters.model {
-        serializer.append_pair("model", model);
-    }
-    if let Some(status_class) = filters.status_class {
-        serializer.append_pair("status_class", status_class.label());
-    }
-    format!("/admin/ui/stats?{}", serializer.finish())
-}
-
-/// Resolves the `month` query parameter into the month to render: the
-/// requested one, or the current month when the parameter is absent or
-/// malformed. A malformed value also yields the banner text, so the page
-/// still shows usable numbers.
-fn resolve_month(query: &StatsQuery) -> (Month, Option<String>) {
-    let current = Month::current();
-    match query.month.as_deref().map(str::trim) {
-        None | Some("") => (current, None),
-        Some(raw) => match Month::parse(raw) {
-            Some(month) => (month, None),
+/// Resolves the range of one view out of the `preset`, `from` and `to`
+/// parameters, with the banner text of a value the page cannot use.
+///
+/// A shortcut wins over the two date fields, because the button that carries
+/// it has just computed them. Without one, an empty `from` is the first day
+/// of the current month and an empty `to` is today, so a bare page shows the
+/// month to date. A malformed day and a `from` after `to` both render that
+/// default range behind a banner, the same lenient reading the month
+/// parameter used to get.
+fn resolve_range(query: &StatsQuery) -> (DateRange, Option<String>) {
+    let today = today_utc();
+    let default = DateRange::month_to_date(today);
+    if let Some(name) = non_blank(query.preset.as_deref()) {
+        return match preset_range(name, today) {
+            Some(range) => (range, None),
             None => (
-                current,
+                default,
                 Some(format!(
-                    "month \"{raw}\" is not a YYYY-MM month; showing {}",
-                    month_label(&current)
+                    "preset \"{name}\" is not one of {}; showing {}",
+                    preset_values(),
+                    default.label()
                 )),
             ),
-        },
+        };
     }
+    let (from, from_error) = match non_blank(query.from.as_deref()) {
+        None => (default.from, None),
+        Some(raw) => match parse_day(raw) {
+            Some(day) => (day, None),
+            None => (
+                default.from,
+                Some(format!("from \"{raw}\" is not a YYYY-MM-DD date")),
+            ),
+        },
+    };
+    let (to, to_error) = match non_blank(query.to.as_deref()) {
+        None => (default.to, None),
+        Some(raw) => match parse_day(raw) {
+            Some(day) => (day, None),
+            None => (
+                default.to,
+                Some(format!("to \"{raw}\" is not a YYYY-MM-DD date")),
+            ),
+        },
+    };
+    if let Some(error) = from_error.or(to_error) {
+        return (
+            default,
+            Some(format!("{error}; showing {}", default.label())),
+        );
+    }
+    if from > to {
+        return (
+            default,
+            Some(format!(
+                "from {} is after to {}; showing {}",
+                day_text(from),
+                day_text(to),
+                default.label()
+            )),
+        );
+    }
+    (DateRange { from, to }, None)
 }
 
 /// Resolves the `key_id`, `model` and `status_class` query parameters into
 /// the view's filters. A blank value means "no filter", an unparsable key id
 /// or status class yields the banner text and no filter (the same lenient
-/// reading the month parameter gets), and the model name is trimmed so a
+/// reading the range parameters get), and the model name is trimmed so a
 /// stray space cannot hide every row.
 fn resolve_filters(query: &StatsQuery) -> (Filters, Option<String>) {
-    let model = query
-        .model
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    let raw_key = query
-        .key_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let model = non_blank(query.model.as_deref()).map(str::to_string);
+    let raw_key = non_blank(query.key_id.as_deref());
     let (key_id, key_error) = match raw_key {
         None => (None, None),
         Some(value) => match value.parse::<i64>() {
@@ -387,11 +583,7 @@ fn resolve_filters(query: &StatsQuery) -> (Filters, Option<String>) {
             ),
         },
     };
-    let raw_class = query
-        .status_class
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let raw_class = non_blank(query.status_class.as_deref());
     let (status_class, class_error) = match raw_class {
         None => (None, None),
         Some(value) => match StatusBucket::parse(value) {
@@ -467,19 +659,22 @@ async fn channel_info(db: &Db) -> sqlx::Result<HashMap<i64, ChannelInfo>> {
         .collect())
 }
 
-/// Loads the key list, the channel price tables, one month-to-date aggregate
-/// per key, the day rows the token and cost charts plot, the day rows per
-/// exact status code, the status code totals of the period and the model
-/// names of the month.
+/// Loads the key list, the channel price tables, the day rows the table and
+/// the charts are both built from, the day rows per exact status code, the
+/// status code totals of the range and the model names of the range.
 ///
-/// The month aggregate is per key and is narrowed in memory by [`build_page`];
-/// the day rows are narrowed by their own queries, which already carry the
-/// key and model predicates, and the status queries carry the status class
-/// filter on top. The model list of the select stays month-scoped and
-/// unfiltered on purpose, so the control always offers every model of the
-/// month rather than only the surviving one.
-async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<StatsData, String> {
-    let key_list = keys::list(&state.db)
+/// Every usage query carries the range and the key and model filters, and the
+/// status queries carry the status class filter on top, so one set of day
+/// rows answers the table, the charts and the status table alike. The model
+/// list of the select stays range-scoped and unfiltered on purpose, so the
+/// control always offers every model of the range rather than only the
+/// surviving one.
+async fn load(state: &AppState, range: &DateRange, filters: &Filters) -> Result<StatsData, String> {
+    // The bounds the aggregates compare against: the first instant of the
+    // range and the first instant after its last day.
+    let start = range.start();
+    let end = range.end();
+    let keys = keys::list(&state.db)
         .await
         .map_err(|error| internal_error(&error))?;
     let channels = channel_info(&state.db)
@@ -487,8 +682,8 @@ async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<Stat
         .map_err(|error| internal_error(&error))?;
     let days = request_logs::day_usage(
         &state.db,
-        &month.start(),
-        &month.end(),
+        &start,
+        &end,
         filters.key_id,
         filters.model.clone(),
     )
@@ -496,8 +691,8 @@ async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<Stat
     .map_err(|error| internal_error(&error))?;
     let status_days = request_logs::day_status_code_usage(
         &state.db,
-        &month.start(),
-        &month.end(),
+        &start,
+        &end,
         filters.key_id,
         filters.model.clone(),
         filters.status_class,
@@ -506,26 +701,19 @@ async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<Stat
     .map_err(|error| internal_error(&error))?;
     let status_code_totals = request_logs::status_code_totals(
         &state.db,
-        &month.start(),
-        &month.end(),
+        &start,
+        &end,
         filters.key_id,
         filters.model.clone(),
         filters.status_class,
     )
     .await
     .map_err(|error| internal_error(&error))?;
-    let models = request_logs::distinct_models(&state.db, &month.start(), &month.end())
+    let models = request_logs::distinct_models(&state.db, &start, &end)
         .await
         .map_err(|error| internal_error(&error))?;
-    let mut keys = Vec::with_capacity(key_list.len());
-    for key in key_list {
-        let groups = request_logs::month_to_date_usage(&state.db, key.id, month)
-            .await
-            .map_err(|error| internal_error(&error))?;
-        keys.push(KeyUsage { key, groups });
-    }
     Ok(StatsData {
-        month: *month,
+        range: *range,
         keys,
         channels,
         days,
@@ -575,23 +763,23 @@ fn share_label(requests: i64, total: i64) -> String {
 /// selected id the list does not carry leaves no option selected, and the
 /// browser then shows the first one, `All keys`; the alternative, a
 /// hand-typed id no key ever had, filters the view to nothing anyway.
-fn key_options(keys: &[KeyUsage], selected: Option<i64>) -> Vec<SelectOption> {
+fn key_options(keys: &[ApiKey], selected: Option<i64>) -> Vec<SelectOption> {
     let mut options = vec![SelectOption {
         value: String::new(),
         label: "All keys".to_string(),
         selected: selected.is_none(),
     }];
-    options.extend(keys.iter().map(|usage| SelectOption {
-        value: usage.key.id.to_string(),
-        label: key_label(&usage.key),
-        selected: Some(usage.key.id) == selected,
+    options.extend(keys.iter().map(|key| SelectOption {
+        value: key.id.to_string(),
+        label: key_label(key),
+        selected: Some(key.id) == selected,
     }));
     options
 }
 
-/// The Model select: `All models` plus every model logged in the month,
-/// alphabetically. A selected model the month has no rows for is added to
-/// the list, so switching months behind a model filter never leaves the
+/// The Model select: `All models` plus every model logged in the range,
+/// alphabetically. A selected model the range has no rows for is added to
+/// the list, so narrowing the range behind a model filter never leaves the
 /// control claiming "All models" while the table is filtered to one.
 fn model_options(models: &[String], selected: Option<&str>) -> Vec<SelectOption> {
     let mut names = models.to_vec();
@@ -643,26 +831,28 @@ fn class_label(class: StatusBucket) -> &'static str {
     }
 }
 
-/// The page with its navigation, filter widgets and empty table in place;
-/// the rows, the grand totals and the charts are filled in by [`build_page`].
-fn page_shell(month: &Month, filters: &Filters, error: Option<String>) -> StatsPage {
-    let label = month_label(month);
-    let current = Month::current();
+/// The page with its filter widgets and empty table in place; the rows, the
+/// grand totals and the charts are filled in by [`build_page`].
+fn page_shell(range: &DateRange, filters: &Filters, error: Option<String>) -> StatsPage {
+    let from = day_text(range.from);
+    let to = day_text(range.to);
     let empty_message = if error.is_some() {
         String::new()
     } else if filters.is_set() {
-        format!("No usage matches the current filters in {label}.")
+        format!("No usage matches the current filters between {from} and {to}.")
     } else {
         format!(
-            "No requests logged in {label}. Usage appears here as clients call \
-             /v1/chat/completions."
+            "No requests logged between {from} and {to}. Usage appears here as \
+             clients call /v1/chat/completions."
         )
     };
     StatsPage {
         version: env!("CARGO_PKG_VERSION"),
         section: "stats",
-        month_value: label.clone(),
-        month_label: label,
+        range_label: range.label(),
+        from_value: from,
+        to_value: to,
+        preset_buttons: preset_buttons(),
         rows: Vec::new(),
         grand: Sums::default().display(),
         key_options: key_options(&[], filters.key_id),
@@ -670,17 +860,13 @@ fn page_shell(month: &Month, filters: &Filters, error: Option<String>) -> StatsP
         status_options: status_options(filters.status_class),
         status_codes: Vec::new(),
         charts: None,
-        prev_url: view_url(&month.previous(), filters),
-        next_url: view_url(&month.next(), filters),
-        current_url: view_url(&current, filters),
-        is_current_month: *month == current,
         empty_message,
         error,
     }
 }
 
 /// One day group as the shape the pricing fold reads, so a day is priced by
-/// the same [`usage::group_cost`] call the table's month groups go through.
+/// the same [`usage::group_cost`] call the table's folded groups go through.
 fn day_group(day: &DayUsage) -> ModelUsage {
     ModelUsage {
         model: day.model.clone(),
@@ -697,7 +883,7 @@ fn day_group(day: &DayUsage) -> ModelUsage {
 /// pricing every day group from the price table of the key that spent it, and
 /// the daily requests bars stacked by exact status code. A key whose channel
 /// is missing or prices nothing contributes zero, exactly as it does in the
-/// table. `None` when the filtered month has no day rows at all, which is
+/// table. `None` when the filtered range has no day rows at all, which is
 /// when the page shows its empty state instead of an empty plot; the requests
 /// chart is dropped on its own when the status filter leaves it no row.
 fn charts(data: &StatsData) -> Option<Charts> {
@@ -709,10 +895,10 @@ fn charts(data: &StatsData) -> Option<Charts> {
     let channels: HashMap<i64, &ChannelInfo> = data
         .keys
         .iter()
-        .filter_map(|usage| {
+        .filter_map(|key| {
             data.channels
-                .get(&usage.key.channel_id)
-                .map(|info| (usage.key.id, info))
+                .get(&key.channel_id)
+                .map(|info| (key.id, info))
         })
         .collect();
     let costs: Vec<(String, i64)> = data
@@ -735,49 +921,35 @@ fn charts(data: &StatsData) -> Option<Charts> {
 }
 
 /// Renders the table: the model lines of every key that saw usage in the
-/// month, each followed by the key's total line, plus the grand total.
+/// range, each followed by the key's total line, plus the grand total.
 ///
-/// The filters narrow this in memory. A key filter drops every other key's
-/// blocks, a model filter drops the groups of other models, and a block left
-/// with no group disappears whole, so a key with no usage under the current
-/// filters is omitted exactly like a key with no usage in the month.
+/// The rows are folded out of the same day rows the charts plot, and those
+/// rows already carry the range, key and model filters, so the table and the
+/// charts can never disagree about a request. A key left with no group
+/// disappears whole, exactly like a key with no usage in the range at all.
 fn build_page(data: StatsData, filters: &Filters, error: Option<String>) -> StatsPage {
-    let mut page = page_shell(&data.month, filters, error);
+    let mut page = page_shell(&data.range, filters, error);
     let mut grand = Sums::default();
     let mut rows: Vec<StatsRow> = Vec::new();
 
-    for key_usage in &data.keys {
-        if filters
-            .key_id
-            .is_some_and(|key_id| key_id != key_usage.key.id)
-        {
+    for key in &data.keys {
+        let mut groups = key_groups(key.id, &data.days);
+        if groups.is_empty() {
             continue;
         }
-        let mut order: Vec<&ModelUsage> = key_usage
-            .groups
-            .iter()
-            .filter(|group| match filters.model.as_deref() {
-                Some(model) => group.model.as_deref() == Some(model),
-                None => true,
-            })
-            .collect();
-        if order.is_empty() {
-            continue;
-        }
-        let info = data.channels.get(&key_usage.key.channel_id);
+        let info = data.channels.get(&key.channel_id);
         let prices = info.and_then(|info| info.prices.as_ref());
         let limit_inactive =
-            key_usage.key.monthly_limit_micro_usd.is_some() && !info.is_some_and(|i| i.limitable);
-        let key_label = key_label(&key_usage.key);
-        let key_deleted = key_usage.key.deleted_at.is_some();
+            key.monthly_limit_micro_usd.is_some() && !info.is_some_and(|i| i.limitable);
+        let key_label = key_label(key);
+        let key_deleted = key.deleted_at.is_some();
 
-        order.sort_by(|left, right| sort_key(&left.model).cmp(&sort_key(&right.model)));
+        groups.sort_by(|left, right| sort_key(&left.model).cmp(&sort_key(&right.model)));
 
         // The key's total is the shared fold of the same per-group costs the
-        // rows below show, so the two can never disagree; only the surviving
-        // groups of the filter take part in it.
+        // rows below show, so the two can never disagree.
         let mut key_sums = Sums::default();
-        for group in order {
+        for group in &groups {
             let cost = usage::group_cost(group, prices);
             key_sums.add_group(group);
             key_sums.add_cost(cost);
@@ -822,9 +994,44 @@ fn build_page(data: StatsData, filters: &Filters, error: Option<String>) -> Stat
     page
 }
 
-/// GET /admin/ui/stats: the usage table and the charts for one month, under
-/// the key and model filters of the URL. Query deserialization cannot fail
-/// with string fields, but the rejection path is kept for robustness.
+/// The usage groups of one key: the day rows of that key folded per model,
+/// which is the shape the table's rows and costs are built from. The day
+/// rows already carry the range and the key and model filters, so this fold
+/// narrows nothing.
+fn key_groups(key_id: i64, days: &[DayUsage]) -> Vec<ModelUsage> {
+    let mut groups: Vec<ModelUsage> = Vec::new();
+    for day in days.iter().filter(|day| day.key_id == key_id) {
+        match groups.iter_mut().find(|group| group.model == day.model) {
+            Some(group) => add_day(group, day),
+            None => groups.push(day_group(day)),
+        }
+    }
+    groups
+}
+
+/// Adds one day group's counts onto the model group of the same model, so a
+/// key's models sum what its days sum.
+fn add_day(group: &mut ModelUsage, day: &DayUsage) {
+    group.prompt_tokens = group.prompt_tokens.saturating_add(day.prompt_tokens);
+    group.completion_tokens = group
+        .completion_tokens
+        .saturating_add(day.completion_tokens);
+    group.cached_input_tokens = group
+        .cached_input_tokens
+        .saturating_add(day.cached_input_tokens);
+    group.cached_output_tokens = group
+        .cached_output_tokens
+        .saturating_add(day.cached_output_tokens);
+    group.cache_write_input_tokens = group
+        .cache_write_input_tokens
+        .saturating_add(day.cache_write_input_tokens);
+    group.requests = group.requests.saturating_add(day.requests);
+}
+
+/// GET /admin/ui/stats: the usage table, the charts and the status code
+/// table for one date range, under the key, model and status filters of the
+/// URL. Query deserialization cannot fail with string fields, but the
+/// rejection path is kept for robustness.
 pub async fn page(
     State(state): State<AppState>,
     _auth: UiAuth,
@@ -834,12 +1041,12 @@ pub async fn page(
         Ok(Query(query)) => (query, None),
         Err(rejection) => (StatsQuery::default(), Some(rejection.body_text())),
     };
-    let (month, month_error) = resolve_month(&query);
+    let (range, range_error) = resolve_range(&query);
     let (filters, filter_error) = resolve_filters(&query);
-    let error = rejection.or(month_error).or(filter_error);
-    match load(&state, &month, &filters).await {
+    let error = rejection.or(range_error).or(filter_error);
+    match load(&state, &range, &filters).await {
         Ok(data) => build_page(data, &filters, error),
-        Err(message) => page_shell(&month, &filters, Some(message)),
+        Err(message) => page_shell(&range, &filters, Some(message)),
     }
 }
 
@@ -853,20 +1060,24 @@ pub fn router() -> Router<AppState> {
 mod tests {
     use super::*;
 
-    fn usage(model: &str, prompt: i64, completion: i64, requests: i64) -> ModelUsage {
-        ModelUsage {
-            model: Some(model.to_string()),
-            prompt_tokens: prompt,
-            completion_tokens: completion,
-            cached_input_tokens: 0,
-            cached_output_tokens: 0,
-            cache_write_input_tokens: 0,
-            requests,
-        }
+    /// A day of the calendar, for the range and shortcut tests.
+    fn date(year: i32, month: u8, day: u8) -> Date {
+        let month = time::Month::try_from(month).expect("a month of the calendar");
+        Date::from_calendar_date(year, month, day).expect("a day of the calendar")
     }
 
-    /// One day-level row as the day aggregate hands it over. The cache
-    /// dimensions stay at zero unless a test sets them.
+    /// An inclusive day range.
+    fn span(from: Date, to: Date) -> DateRange {
+        DateRange { from, to }
+    }
+
+    /// The whole of November 2026, the range most table tests render.
+    fn november() -> DateRange {
+        span(date(2026, 11, 1), date(2026, 11, 30))
+    }
+
+    /// One day-level row as the day aggregate hands it over, with one
+    /// request and no cache counts unless a test sets them.
     fn day_row(day: &str, model: &str, prompt: i64, completion: i64) -> DayUsage {
         DayUsage {
             day: day.to_string(),
@@ -878,6 +1089,14 @@ mod tests {
             cached_output_tokens: 0,
             cache_write_input_tokens: 0,
             requests: 1,
+        }
+    }
+
+    /// The same row for an explicit key.
+    fn day_row_for(key_id: i64, day: &str, model: &str, prompt: i64, completion: i64) -> DayUsage {
+        DayUsage {
+            key_id,
+            ..day_row(day, model, prompt, completion)
         }
     }
 
@@ -931,106 +1150,273 @@ mod tests {
         }
     }
 
-    /// Loaded data for one month, without day rows or model names: the table
-    /// tests do not need the charts.
-    fn stats_data(
-        month: Month,
-        keys: Vec<KeyUsage>,
+    /// Loaded data for one range: the day rows the table and the charts read,
+    /// one stored key bound to the priced channel and nothing else.
+    fn stats_data(days: Vec<DayUsage>, channels: HashMap<i64, ChannelInfo>) -> StatsData {
+        stats_data_for(vec![stored_key(None)], days, channels)
+    }
+
+    /// The same with an explicit key list, for the tests that need a second
+    /// key or a key carrying a limit.
+    fn stats_data_for(
+        keys: Vec<ApiKey>,
+        days: Vec<DayUsage>,
         channels: HashMap<i64, ChannelInfo>,
     ) -> StatsData {
         StatsData {
-            month,
+            range: november(),
             keys,
             channels,
-            days: Vec::new(),
+            days,
             status_code_days: Vec::new(),
             status_code_totals: Vec::new(),
             models: Vec::new(),
         }
     }
 
-    fn november() -> Month {
-        Month::from_parts(2026, 11).unwrap()
+    #[test]
+    fn a_missing_or_blank_range_resolves_to_the_month_to_date() {
+        let today = today_utc();
+        let (range, error) = resolve_range(&StatsQuery::default());
+        assert!(error.is_none());
+        assert_eq!(range.to, today, "an empty to is today");
+        assert_eq!(range.from, month_start(today), "an empty from is the 1st");
+
+        let blank = StatsQuery {
+            from: Some("  ".to_string()),
+            to: Some(String::new()),
+            ..StatsQuery::default()
+        };
+        assert_eq!(resolve_range(&blank).0, range);
+        assert!(resolve_range(&blank).1.is_none());
     }
 
     #[test]
-    fn a_missing_or_blank_month_resolves_to_the_current_month() {
-        let current = Month::current();
-        assert_eq!(resolve_month(&StatsQuery::default()).0, current);
+    fn a_parseable_range_is_used_verbatim_and_a_bad_day_falls_back() {
         let query = StatsQuery {
-            month: Some("   ".to_string()),
+            from: Some(" 2026-01-05 ".to_string()),
+            to: Some("2026-02-09".to_string()),
             ..StatsQuery::default()
         };
-        assert_eq!(resolve_month(&query).0, current);
-        assert!(resolve_month(&StatsQuery::default()).1.is_none());
-    }
-
-    #[test]
-    fn a_parseable_month_is_used_verbatim_and_a_bad_one_falls_back() {
-        let query = StatsQuery {
-            month: Some("2026-01".to_string()),
-            ..StatsQuery::default()
-        };
-        let (month, error) = resolve_month(&query);
-        assert_eq!(month, Month::from_parts(2026, 1).unwrap());
+        let (range, error) = resolve_range(&query);
+        assert_eq!(range, span(date(2026, 1, 5), date(2026, 2, 9)));
         assert!(error.is_none());
 
+        // One bad bound is enough to fall back to the default range, and the
+        // banner names the parameter and the value.
         let query = StatsQuery {
-            month: Some("January".to_string()),
+            from: Some("January".to_string()),
+            to: Some("2026-02-09".to_string()),
             ..StatsQuery::default()
         };
-        let (month, error) = resolve_month(&query);
-        assert_eq!(month, Month::current());
-        let error = error.expect("a malformed month must be reported");
-        assert!(error.contains("January"), "{error}");
-        assert!(error.contains("YYYY-MM"), "{error}");
+        let (range, error) = resolve_range(&query);
+        assert_eq!(range, DateRange::month_to_date(today_utc()));
+        let error = error.expect("a malformed day is reported");
+        assert!(error.contains("from \"January\""), "{error}");
+        assert!(error.contains("YYYY-MM-DD"), "{error}");
+
+        let query = StatsQuery {
+            to: Some("2026-13-01".to_string()),
+            ..StatsQuery::default()
+        };
+        let (range, error) = resolve_range(&query);
+        assert_eq!(range, DateRange::month_to_date(today_utc()));
+        let error = error.expect("a malformed day is reported");
+        assert!(error.contains("to \"2026-13-01\""), "{error}");
     }
 
     #[test]
-    fn view_links_carry_the_month_and_only_the_filters_that_are_set() {
-        let january = Month::from_parts(2026, 1).unwrap();
+    fn a_from_after_to_falls_back_to_the_default_range_behind_a_banner() {
+        let query = StatsQuery {
+            from: Some("2026-06-09".to_string()),
+            to: Some("2026-06-01".to_string()),
+            ..StatsQuery::default()
+        };
+        let (range, error) = resolve_range(&query);
         assert_eq!(
-            view_url(&january, &Filters::default()),
-            "/admin/ui/stats?month=2026-01"
+            range,
+            DateRange::month_to_date(today_utc()),
+            "an inverted range renders the default one"
+        );
+        let error = error.expect("an inverted range is reported");
+        assert!(error.contains("2026-06-09"), "{error}");
+        assert!(error.contains("2026-06-01"), "{error}");
+        assert!(error.contains("is after"), "{error}");
+
+        // The same day on both sides is a one-day range, not an inversion.
+        let query = StatsQuery {
+            from: Some("2026-06-09".to_string()),
+            to: Some("2026-06-09".to_string()),
+            ..StatsQuery::default()
+        };
+        let (range, error) = resolve_range(&query);
+        assert_eq!(range, span(date(2026, 6, 9), date(2026, 6, 9)));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn the_to_day_is_inclusive_so_the_bound_is_the_first_instant_after_it() {
+        let one_day = span(date(2026, 11, 15), date(2026, 11, 15));
+        assert_eq!(one_day.start(), "2026-11-15 00:00:00");
+        assert_eq!(
+            one_day.end(),
+            "2026-11-16 00:00:00",
+            "a request of the to day, at any hour, stays below the bound"
+        );
+        assert_eq!(one_day.label(), "2026-11-15 to 2026-11-15");
+
+        // The bound steps over the end of a month and over the end of a year.
+        assert_eq!(
+            span(date(2026, 2, 28), date(2026, 2, 28)).end(),
+            "2026-03-01 00:00:00"
         );
         assert_eq!(
-            view_url(&january.previous(), &Filters::default()),
-            "/admin/ui/stats?month=2025-12"
-        );
-        assert_eq!(
-            view_url(&january.next(), &Filters::default()),
-            "/admin/ui/stats?month=2026-02"
+            span(date(2026, 12, 30), date(2026, 12, 31)).end(),
+            "2027-01-01 00:00:00"
         );
 
-        let both = Filters {
-            key_id: Some(3),
-            model: Some("gpt-4o".to_string()),
-            ..Filters::default()
+        // The last day of the supported calendar has no day after it.
+        let last = span(date(9999, 12, 31), date(9999, 12, 31));
+        assert_eq!(last.end(), "9999-12-31 24:00:00");
+    }
+
+    #[test]
+    fn parse_day_reads_the_calendar_shape_and_nothing_else() {
+        assert_eq!(parse_day("2026-11-15"), Some(date(2026, 11, 15)));
+        assert_eq!(parse_day("2024-02-29"), Some(date(2024, 2, 29)));
+        for raw in [
+            "",
+            "2026",
+            "2026-11",
+            "26-11-15",
+            "2026-1-5",
+            "2026-11-5",
+            "2026-11-15x",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-11-00",
+            "2026-11-31",
+            "2023-02-29",
+            "January",
+        ] {
+            assert_eq!(parse_day(raw), None, "{raw} must not parse");
+        }
+
+        // The parameters are trimmed before they are read, so whitespace
+        // around a valid day is not an error on the page.
+        let query = StatsQuery {
+            from: Some(" 2026-11-15 ".to_string()),
+            ..StatsQuery::default()
         };
+        assert_eq!(resolve_range(&query).0.from, date(2026, 11, 15));
+        assert!(resolve_range(&query).1.is_none());
+    }
+
+    #[test]
+    fn the_shortcuts_resolve_to_the_current_day_week_and_month() {
+        // 2026-11-15 is a Sunday, the last day of its ISO week.
+        let sunday = date(2026, 11, 15);
         assert_eq!(
-            view_url(&january, &both),
-            "/admin/ui/stats?month=2026-01&key_id=3&model=gpt-4o"
+            preset_range(PRESET_TODAY, sunday),
+            Some(span(sunday, sunday))
         );
-        // Whitespace inside a model name survives as a URL-encoded value
-        // rather than splitting the query string.
-        let spaced = Filters {
-            model: Some("claude 3.5".to_string()),
-            ..Filters::default()
+        assert_eq!(
+            preset_range(PRESET_WEEK, sunday),
+            Some(span(date(2026, 11, 9), sunday)),
+            "the week runs from its Monday through its Sunday"
+        );
+        assert_eq!(
+            preset_range(PRESET_MONTH, sunday),
+            Some(span(date(2026, 11, 1), date(2026, 11, 30)))
+        );
+
+        // A Monday is the first day of its own week, and a week that spans a
+        // month boundary keeps its Monday.
+        let monday = date(2026, 11, 9);
+        assert_eq!(
+            preset_range(PRESET_WEEK, monday),
+            Some(span(monday, date(2026, 11, 15)))
+        );
+        assert_eq!(
+            preset_range(PRESET_WEEK, date(2026, 12, 1)),
+            Some(span(date(2026, 11, 30), date(2026, 12, 6)))
+        );
+
+        // The month shortcut always covers the whole month, the days that
+        // have not started included, and it follows the length of February.
+        assert_eq!(
+            preset_range(PRESET_MONTH, date(2026, 2, 3)),
+            Some(span(date(2026, 2, 1), date(2026, 2, 28)))
+        );
+        assert_eq!(
+            preset_range(PRESET_MONTH, date(2024, 2, 3)),
+            Some(span(date(2024, 2, 1), date(2024, 2, 29)))
+        );
+
+        assert_eq!(preset_range("yesterday", sunday), None);
+    }
+
+    #[test]
+    fn a_shortcut_wins_over_the_date_fields() {
+        let today = today_utc();
+        let query = StatsQuery {
+            preset: Some(PRESET_MONTH.to_string()),
+            from: Some("2020-01-01".to_string()),
+            to: Some("2020-01-02".to_string()),
+            ..StatsQuery::default()
         };
-        assert_eq!(
-            view_url(&january, &spaced),
-            "/admin/ui/stats?month=2026-01&model=claude+3.5"
-        );
-        // The status class travels by its label, the same string the SQL
-        // bucket expression emits.
-        let classed = Filters {
-            status_class: Some(StatusBucket::Client4xx),
-            ..Filters::default()
+        let (range, error) = resolve_range(&query);
+        assert_eq!(range, span(month_start(today), month_end(today)));
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn an_unknown_shortcut_shows_a_banner_over_the_default_range() {
+        let query = StatsQuery {
+            preset: Some("yesterday".to_string()),
+            ..StatsQuery::default()
         };
-        assert_eq!(
-            view_url(&january, &classed),
-            "/admin/ui/stats?month=2026-01&status_class=4xx"
+        let (range, error) = resolve_range(&query);
+        assert_eq!(range, DateRange::month_to_date(today_utc()));
+        let error = error.expect("an unknown shortcut is reported");
+        assert!(error.contains("yesterday"), "{error}");
+        assert!(
+            error.contains("today, week, month"),
+            "the banner lists the accepted shortcuts: {error}"
         );
+    }
+
+    #[test]
+    fn every_shortcut_button_submits_a_shortcut_the_handler_reads() {
+        let buttons = preset_buttons();
+        let values: Vec<&str> = buttons.iter().map(|button| button.value).collect();
+        assert_eq!(values, vec!["today", "week", "month"]);
+        let labels: Vec<&str> = buttons.iter().map(|button| button.label).collect();
+        assert_eq!(labels, vec!["Today", "Current week", "Current month"]);
+        for button in &buttons {
+            assert!(
+                preset_range(button.value, date(2026, 11, 15)).is_some(),
+                "{} must resolve",
+                button.value
+            );
+        }
+        assert_eq!(preset_values(), "today, week, month");
+    }
+
+    #[test]
+    fn the_month_helpers_read_the_calendar() {
+        assert_eq!(month_start(date(2026, 11, 15)), date(2026, 11, 1));
+        assert_eq!(month_end(date(2026, 11, 15)), date(2026, 11, 30));
+        assert_eq!(month_end(date(2026, 12, 5)), date(2026, 12, 31));
+        assert_eq!(month_end(date(2026, 2, 10)), date(2026, 2, 28));
+        assert_eq!(
+            month_end(date(2024, 2, 10)),
+            date(2024, 2, 29),
+            "a leap February has one more day"
+        );
+        assert_eq!(day_text(date(2026, 11, 5)), "2026-11-05");
+        assert_eq!(week_start(date(2026, 11, 15)), date(2026, 11, 9));
+        assert_eq!(week_start(date(2026, 11, 9)), date(2026, 11, 9));
     }
 
     #[test]
@@ -1136,12 +1522,12 @@ mod tests {
     #[test]
     fn model_lines_sort_by_name_with_the_unnamed_group_last() {
         let mut order = [
-            ModelUsage {
+            day_group(&DayUsage {
                 model: None,
-                ..usage("-", 1, 1, 1)
-            },
-            usage("gpt-4o", 1, 1, 1),
-            usage("claude-3", 1, 1, 1),
+                ..day_row("2026-11-02", "-", 1, 1)
+            }),
+            day_group(&day_row("2026-11-02", "gpt-4o", 1, 1)),
+            day_group(&day_row("2026-11-02", "claude-3", 1, 1)),
         ];
         order.sort_by(|left, right| sort_key(&left.model).cmp(&sort_key(&right.model)));
         let names: Vec<Option<&str>> = order.iter().map(|group| group.model.as_deref()).collect();
@@ -1149,33 +1535,49 @@ mod tests {
     }
 
     #[test]
+    fn a_keys_groups_fold_only_its_own_day_rows() {
+        let days = vec![
+            day_row("2026-11-02", "gpt-4o", 1000, 200),
+            day_row_for(2, "2026-11-02", "gpt-4o", 10, 1),
+            day_row("2026-11-03", "gpt-4o", 500, 100),
+            day_row("2026-11-03", "gpt-5-mini", 7, 1),
+        ];
+        let mut groups = key_groups(1, &days);
+        groups.sort_by(|left, right| sort_key(&left.model).cmp(&sort_key(&right.model)));
+        assert_eq!(groups.len(), 2, "one group per model of the key");
+        assert_eq!(groups[0].model.as_deref(), Some("gpt-4o"));
+        assert_eq!(groups[0].prompt_tokens, 1500, "the days of the model sum");
+        assert_eq!(groups[0].completion_tokens, 300);
+        assert_eq!(groups[0].requests, 2);
+        assert_eq!(groups[1].model.as_deref(), Some("gpt-5-mini"));
+        assert_eq!(groups[1].prompt_tokens, 7);
+
+        assert_eq!(
+            key_groups(2, &days).len(),
+            1,
+            "the other key's rows stay out of this key's groups"
+        );
+        assert!(key_groups(9, &days).is_empty());
+    }
+
+    #[test]
     fn a_page_builds_one_row_per_model_plus_a_key_total() {
         let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: vec![
-                    usage("gpt-4o", 1000, 200, 2),
-                    usage("gpt-5-mini", 500, 100, 1),
-                ],
-            }],
+            vec![
+                day_row("2026-11-02", "gpt-4o", 1000, 200),
+                day_row("2026-11-03", "gpt-5-mini", 500, 100),
+            ],
             HashMap::from([(7, channel_info_limitable())]),
         );
         let page = build_page(data, &Filters::default(), None);
         assert_eq!(page.rows.len(), 3, "two models plus the total line");
         assert_eq!(page.section, "stats");
-        assert_eq!(page.month_label, "2026-11");
-        assert_eq!(page.month_value, "2026-11");
-        assert_eq!(
-            page.is_current_month,
-            Month::from_parts(2026, 11).unwrap() == Month::current(),
-            "the flag follows the month the page renders"
-        );
-        assert!(page.prev_url.ends_with("month=2026-10"));
-        assert!(page.next_url.ends_with("month=2026-12"));
+        assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
+        assert_eq!(page.from_value, "2026-11-01");
+        assert_eq!(page.to_value, "2026-11-30");
         assert!(
-            page.charts.is_none(),
-            "a month with no day rows draws no chart"
+            page.charts.is_some(),
+            "the day rows of the table draw the charts"
         );
 
         // gpt-4o is priced (4500 micro-USD for 1000 prompt and 200
@@ -1198,14 +1600,14 @@ mod tests {
             total.sums.cache_write_input_tokens, "0",
             "a request that writes no cache shows the column at zero"
         );
-        assert_eq!(total.sums.requests, "3");
+        assert_eq!(total.sums.requests, "2");
         assert_eq!(total.key_label, "hyd-4f9dEg2x");
         assert!(!total.limit_inactive);
 
         assert_eq!(page.grand.cost, "$0.0045");
         assert_eq!(page.grand.prompt_tokens, "1,500");
         assert_eq!(page.grand.cache_write_input_tokens, "0");
-        assert_eq!(page.grand.requests, "3");
+        assert_eq!(page.grand.requests, "2");
     }
 
     #[test]
@@ -1214,17 +1616,10 @@ mod tests {
         // written) and 200 completions. At 2.50/1.25/3.125/10.00 USD per 1M
         // tokens the pinned formula charges 1000 * 2.50 + 250 * 1.25 +
         // 50 * 3.125 + 200 * 10.00 = 4968.75 micro-USD, floored to 4968.
-        let mut group = usage("claude", 1300, 200, 1);
-        group.cached_input_tokens = 250;
-        group.cache_write_input_tokens = 50;
-        let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: vec![group],
-            }],
-            HashMap::from([(7, channel_info_write_priced())]),
-        );
+        let mut day = day_row("2026-11-02", "claude", 1300, 200);
+        day.cached_input_tokens = 250;
+        day.cache_write_input_tokens = 50;
+        let data = stats_data(vec![day], HashMap::from([(7, channel_info_write_priced())]));
         let page = build_page(data, &Filters::default(), None);
         let row = &page.rows[0];
         assert_eq!(row.model_label, "claude");
@@ -1244,35 +1639,76 @@ mod tests {
     }
 
     #[test]
-    fn a_key_without_usage_in_the_month_is_omitted_entirely() {
-        let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: Vec::new(),
-            }],
+    fn a_second_key_gets_its_own_block_and_the_grand_total_sums_both() {
+        let mut second = stored_key(None);
+        second.id = 2;
+        second.display_prefix = "hyd-2b2b2b2b".to_string();
+        let data = stats_data_for(
+            vec![stored_key(None), second],
+            vec![
+                day_row("2026-11-02", "gpt-4o", 1000, 200),
+                day_row_for(2, "2026-11-02", "gpt-4o", 10, 1),
+            ],
             HashMap::from([(7, channel_info_limitable())]),
         );
         let page = build_page(data, &Filters::default(), None);
+        assert_eq!(page.rows.len(), 4, "one model line and one total per key");
+        assert_eq!(page.rows[0].key_label, "hyd-4f9dEg2x");
+        assert_eq!(page.rows[0].sums.cost, "$0.0045");
+        assert_eq!(page.rows[1].key_label, "hyd-4f9dEg2x");
+        assert!(page.rows[1].is_total);
+        assert_eq!(page.rows[2].key_label, "hyd-2b2b2b2b");
+        assert_eq!(
+            page.rows[2].sums.cost, "$0.000035",
+            "10 prompt tokens at 2.50 and 1 completion at 10.00 per 1M"
+        );
+        assert_eq!(page.rows[3].sums.prompt_tokens, "10");
+        assert_eq!(page.grand.prompt_tokens, "1,010");
+        assert_eq!(page.grand.cost, "$0.004535");
+    }
+
+    #[test]
+    fn a_key_without_usage_in_the_range_is_omitted_entirely() {
+        let data = stats_data(Vec::new(), HashMap::from([(7, channel_info_limitable())]));
+        let page = build_page(data, &Filters::default(), None);
         assert!(page.rows.is_empty());
         assert_eq!(page.grand.cost, "$0.00");
-        assert!(page.empty_message.contains("2026-11"));
+        assert!(page.empty_message.contains("2026-11-01"));
+        assert!(page.empty_message.contains("2026-11-30"));
         assert!(
             !page.empty_message.contains("filters"),
-            "an unfiltered empty month keeps the plain wording"
+            "an unfiltered empty range keeps the plain wording"
         );
+        assert!(
+            page.charts.is_none(),
+            "a range with no day rows draws no chart"
+        );
+    }
+
+    #[test]
+    fn an_empty_view_under_filters_says_the_filters_are_the_reason() {
+        let data = stats_data(Vec::new(), HashMap::from([(7, channel_info_limitable())]));
+        let page = build_page(
+            data,
+            &Filters {
+                key_id: Some(9),
+                ..Filters::default()
+            },
+            None,
+        );
+        assert!(page.rows.is_empty());
+        assert!(page
+            .empty_message
+            .contains("No usage matches the current filters"));
     }
 
     #[test]
     fn a_limited_key_on_an_unlimitable_channel_gets_the_warning_badge() {
         let mut unlimitable = channel_info_limitable();
         unlimitable.limitable = false;
-        let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(Some(50_000_000)),
-                groups: vec![usage("gpt-4o", 1000, 200, 1)],
-            }],
+        let data = stats_data_for(
+            vec![stored_key(Some(50_000_000))],
+            vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, unlimitable)]),
         );
         let page = build_page(data, &Filters::default(), None);
@@ -1284,12 +1720,9 @@ mod tests {
         // unpriced the channel is.
         let mut unlimitable = channel_info_limitable();
         unlimitable.limitable = false;
-        let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: vec![usage("gpt-4o", 1000, 200, 1)],
-            }],
+        let data = stats_data_for(
+            vec![stored_key(None)],
+            vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, unlimitable)]),
         );
         let page = build_page(data, &Filters::default(), None);
@@ -1298,12 +1731,9 @@ mod tests {
 
     #[test]
     fn a_key_bound_to_a_channel_that_vanished_costs_nothing_and_warns() {
-        let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(Some(50_000_000)),
-                groups: vec![usage("gpt-4o", 1000, 200, 1)],
-            }],
+        let data = stats_data_for(
+            vec![stored_key(Some(50_000_000))],
+            vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::new(),
         );
         let page = build_page(data, &Filters::default(), None);
@@ -1316,12 +1746,9 @@ mod tests {
     fn a_deleted_key_keeps_its_rows_and_is_marked() {
         let mut key = stored_key(None);
         key.deleted_at = Some("2026-11-02 00:00:00".to_string());
-        let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key,
-                groups: vec![usage("gpt-4o", 1000, 200, 1)],
-            }],
+        let data = stats_data_for(
+            vec![key],
+            vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, channel_info_limitable())]),
         );
         let page = build_page(data, &Filters::default(), None);
@@ -1330,148 +1757,12 @@ mod tests {
     }
 
     #[test]
-    fn a_key_filter_keeps_only_that_keys_blocks_and_totals() {
-        let mut second = stored_key(None);
-        second.id = 2;
-        second.display_prefix = "hyd-2b2b2b2b".to_string();
-        let keys = || {
-            vec![
-                KeyUsage {
-                    key: stored_key(None),
-                    groups: vec![usage("gpt-4o", 1000, 200, 1)],
-                },
-                KeyUsage {
-                    key: second.clone(),
-                    groups: vec![usage("gpt-4o", 10, 1, 1)],
-                },
-            ]
-        };
-        let data = stats_data(
-            november(),
-            keys(),
-            HashMap::from([(7, channel_info_limitable())]),
-        );
-        let page = build_page(
-            data,
-            &Filters {
-                key_id: Some(2),
-                ..Filters::default()
-            },
-            None,
-        );
-        assert_eq!(page.rows.len(), 2, "one model line and one total");
-        assert_eq!(page.rows[0].key_label, "hyd-2b2b2b2b");
-        assert_eq!(page.rows[1].key_label, "hyd-2b2b2b2b");
-        assert_eq!(
-            page.grand.prompt_tokens, "10",
-            "the totals follow the filter"
-        );
-        assert_eq!(
-            page.grand.cost, "$0.000035",
-            "10 prompt tokens at 2.50 and 1 completion at 10.00 per 1M"
-        );
-
-        // A key id no row carries selects nothing, and the empty state says
-        // the filters are the reason.
-        let data = stats_data(
-            november(),
-            keys(),
-            HashMap::from([(7, channel_info_limitable())]),
-        );
-        let page = build_page(
-            data,
-            &Filters {
-                key_id: Some(9),
-                ..Filters::default()
-            },
-            None,
-        );
-        assert!(page.rows.is_empty());
-        assert_eq!(page.grand.cost, "$0.00");
-        assert!(page
-            .empty_message
-            .contains("No usage matches the current filters"));
-    }
-
-    #[test]
-    fn a_model_filter_keeps_one_model_line_per_key() {
-        let groups = || {
-            vec![
-                usage("gpt-4o", 1000, 200, 1),
-                usage("gpt-5-mini", 100, 50, 1),
-            ]
-        };
-        let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: groups(),
-            }],
-            HashMap::from([(7, channel_info_limitable())]),
-        );
-        let page = build_page(
-            data,
-            &Filters {
-                model: Some("gpt-5-mini".to_string()),
-                ..Filters::default()
-            },
-            None,
-        );
-        assert_eq!(
-            page.rows.len(),
-            2,
-            "the surviving model line plus the key total"
-        );
-        assert_eq!(page.rows[0].model_label, "gpt-5-mini");
-        assert_eq!(
-            page.rows[0].sums.cost, "$0.00",
-            "an unpriced model stays zero"
-        );
-        assert_eq!(
-            page.rows[1].sums.prompt_tokens, "100",
-            "the total is filtered"
-        );
-        assert_eq!(page.grand.prompt_tokens, "100");
-
-        // A model nothing logged empties the table and changes the wording.
-        let data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: groups(),
-            }],
-            HashMap::from([(7, channel_info_limitable())]),
-        );
-        let page = build_page(
-            data,
-            &Filters {
-                model: Some("nope".to_string()),
-                ..Filters::default()
-            },
-            None,
-        );
-        assert!(page.rows.is_empty());
-        assert!(page
-            .empty_message
-            .contains("No usage matches the current filters"));
-    }
-
-    #[test]
     fn the_key_select_lists_every_key_of_the_page_with_the_selected_one_marked() {
         let mut deleted = stored_key(None);
         deleted.id = 2;
         deleted.display_prefix = "hyd-9a9a9a9a".to_string();
         deleted.deleted_at = Some("2026-11-03 00:00:00".to_string());
-        let keys = vec![
-            KeyUsage {
-                key: stored_key(None),
-                groups: Vec::new(),
-            },
-            KeyUsage {
-                key: deleted,
-                groups: Vec::new(),
-            },
-        ];
+        let keys = vec![stored_key(None), deleted];
 
         let options = key_options(&keys, Some(2));
         let labels: Vec<&str> = options.iter().map(|option| option.label.as_str()).collect();
@@ -1489,7 +1780,7 @@ mod tests {
     }
 
     #[test]
-    fn the_model_select_keeps_a_selected_model_the_month_has_no_rows_for() {
+    fn the_model_select_keeps_a_selected_model_the_range_has_no_rows_for() {
         let models = vec!["gpt-4o".to_string(), "claude-3".to_string()];
         let options = model_options(&models, Some("gpt-5-mini"));
         let labels: Vec<&str> = options.iter().map(|option| option.label.as_str()).collect();
@@ -1518,23 +1809,12 @@ mod tests {
     }
 
     #[test]
-    fn the_charts_render_for_a_month_with_day_rows_and_price_a_day_like_the_table() {
-        // The same usage as a month group and as one day group: 1000 prompt
-        // tokens with 400 of them cached and 200 completions, which the
-        // pinned formula prices at 4000 micro-USD.
-        let mut group = usage("gpt-4o", 1000, 200, 1);
-        group.cached_input_tokens = 400;
+    fn the_charts_render_for_a_range_with_day_rows_and_price_a_day_like_the_table() {
+        // 1000 prompt tokens with 400 of them cached and 200 completions,
+        // which the pinned formula prices at 4000 micro-USD.
         let mut day = day_row("2026-11-02", "gpt-4o", 1000, 200);
         day.cached_input_tokens = 400;
-        let mut data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: vec![group],
-            }],
-            HashMap::from([(7, channel_info_limitable())]),
-        );
-        data.days = vec![day];
+        let mut data = stats_data(vec![day], HashMap::from([(7, channel_info_limitable())]));
         data.models = vec!["gpt-4o".to_string()];
 
         let page = build_page(data, &Filters::default(), None);
@@ -1558,36 +1838,15 @@ mod tests {
             page.grand.cost, "$0.004",
             "the chart and the table price the same rows the same way"
         );
-    }
-
-    #[test]
-    fn the_charts_stay_absent_when_the_filtered_month_has_no_day_rows() {
-        let mut data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: vec![usage("gpt-4o", 1000, 200, 1)],
-            }],
-            HashMap::from([(7, channel_info_limitable())]),
-        );
-        data.models = vec!["gpt-4o".to_string()];
-        let page = build_page(data, &Filters::default(), None);
-        assert!(page.charts.is_none());
-        assert_eq!(page.rows.len(), 2, "the table still renders");
+        assert_eq!(page.rows[0].sums.cost, "$0.004");
     }
 
     #[test]
     fn the_requests_chart_renders_with_status_rows_and_is_dropped_without_them() {
-        let day = day_row("2026-11-02", "gpt-4o", 1000, 200);
         let mut data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: vec![usage("gpt-4o", 1000, 200, 1)],
-            }],
+            vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        data.days = vec![day];
         data.status_code_days = vec![DayStatusCodeUsage {
             day: "2026-11-02".to_string(),
             status: Some(500),
@@ -1625,19 +1884,13 @@ mod tests {
         assert_eq!(page.status_codes[1].class, "other");
         assert_eq!(page.status_codes[1].share, "33.3%");
 
-        // A status filter that selects nothing drops the chart alone and
-        // leaves the token and cost bars of the same view in place, with no
-        // status code table either.
-        let day = day_row("2026-11-02", "gpt-4o", 1000, 200);
+        // A status filter that selects nothing leaves the status rows empty,
+        // which drops that chart alone and keeps the token and cost bars of
+        // the same view, with no status code table either.
         let mut data = stats_data(
-            november(),
-            vec![KeyUsage {
-                key: stored_key(None),
-                groups: vec![usage("gpt-4o", 1000, 200, 1)],
-            }],
+            vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        data.days = vec![day];
         data.status_code_days = Vec::new();
         let page = build_page(
             data,
@@ -1691,7 +1944,7 @@ mod tests {
     }
 
     #[test]
-    fn a_share_of_a_period_without_requests_reads_zero_instead_of_dividing() {
+    fn a_share_of_a_range_without_requests_reads_zero_instead_of_dividing() {
         assert_eq!(share_label(0, 0), "0.0%");
         assert_eq!(share_label(1, 3), "33.3%");
         assert_eq!(share_label(2, 3), "66.7%");
@@ -1700,10 +1953,38 @@ mod tests {
     }
 
     #[test]
-    fn the_failure_shell_keeps_the_navigation_and_drops_the_empty_message() {
-        let month = november();
+    fn the_filter_widgets_show_the_range_and_the_shortcut_buttons() {
+        let page = page_shell(&november(), &Filters::default(), None);
+        assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
+        assert_eq!(page.from_value, "2026-11-01");
+        assert_eq!(page.to_value, "2026-11-30");
+        let values: Vec<&str> = page
+            .preset_buttons
+            .iter()
+            .map(|button| button.value)
+            .collect();
+        assert_eq!(values, vec!["today", "week", "month"]);
+        assert!(page.empty_message.contains("2026-11-01"));
+        assert!(!page.empty_message.contains("filters"));
+
+        let filtered = page_shell(
+            &november(),
+            &Filters {
+                key_id: Some(4),
+                model: Some("gpt-4o".to_string()),
+                status_class: Some(StatusBucket::Server5xx),
+            },
+            None,
+        );
+        assert!(filtered
+            .empty_message
+            .contains("No usage matches the current filters"));
+    }
+
+    #[test]
+    fn the_failure_shell_keeps_the_filter_widgets_and_drops_the_empty_message() {
         let page = page_shell(
-            &month,
+            &november(),
             &Filters::default(),
             Some("internal server error".into()),
         );
@@ -1711,8 +1992,7 @@ mod tests {
         assert_eq!(page.error.as_deref(), Some("internal server error"));
         assert!(page.empty_message.is_empty());
         assert!(page.charts.is_none());
-        assert_eq!(page.prev_url, "/admin/ui/stats?month=2026-10");
-        assert_eq!(page.next_url, "/admin/ui/stats?month=2026-12");
+        assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
         assert_eq!(
             page.key_options.len(),
             1,
@@ -1721,38 +2001,5 @@ mod tests {
         assert!(page.key_options[0].selected);
         assert!(page.status_options[0].selected);
         assert_eq!(page.status_options.len(), 5);
-    }
-
-    #[test]
-    fn the_current_month_is_flagged_and_linked() {
-        let page = page_shell(&Month::current(), &Filters::default(), None);
-        assert!(page.is_current_month);
-        assert_eq!(
-            page.current_url,
-            view_url(&Month::current(), &Filters::default())
-        );
-        assert!(!page.empty_message.is_empty());
-    }
-
-    #[test]
-    fn the_navigation_links_of_a_filtered_view_keep_the_filters() {
-        let month = november();
-        let filters = Filters {
-            key_id: Some(4),
-            model: Some("gpt-4o".to_string()),
-            status_class: Some(StatusBucket::Server5xx),
-        };
-        let page = page_shell(&month, &filters, None);
-        assert_eq!(
-            page.prev_url,
-            "/admin/ui/stats?month=2026-10&key_id=4&model=gpt-4o&status_class=5xx"
-        );
-        assert_eq!(
-            page.next_url,
-            "/admin/ui/stats?month=2026-12&key_id=4&model=gpt-4o&status_class=5xx"
-        );
-        assert!(page
-            .empty_message
-            .contains("No usage matches the current filters"));
     }
 }

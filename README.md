@@ -328,10 +328,10 @@ set, and every model in that
 whitelist carries a price entry; those prices feed the per-key cost and
 monthly limit described below.
 
-The Stat tab (`/admin/ui/stats`) shows month-to-date token usage per key,
-grouped by model, with input, output, cached input, cached output, cache-write
-input, request count and computed cost, for a month chosen with a picker or the
-previous/next links.
+The Stat tab (`/admin/ui/stats`) shows token usage per key, grouped by model,
+with input, output, cached input, cached output, cache-write input, request
+count and computed cost, for a date range chosen with a From and a To day
+picker or with the Today, Current week and Current month shortcuts.
 
 ![Keys page](docs/screenshots/keys.png)
 
@@ -583,11 +583,12 @@ and not enforced, which the admin UI marks with `limit inactive: channel prices
 incomplete` on the keys page and the Stat tab. This is deliberate: prices are
 often filled in after the key is issued.
 
-The Stat tab (`/admin/ui/stats`) is where the numbers are visible: month-to-date
-usage per key, grouped by model, with input, output, cached input, cached output
-and cache-write tokens, request count and computed cost in USD, plus a total row
-for all keys.
-The month is selectable with a picker and previous/next links.
+The Stat tab (`/admin/ui/stats`) is where the numbers are visible: usage per key
+over a selectable date range, grouped by model, with input, output, cached input,
+cached output and cache-write tokens, request count and computed cost in USD,
+plus a total row for all keys.
+The range is chosen with two day pickers or the Today, Current week and Current
+month shortcuts, and it travels in the URL.
 
 ### Known limitations
 

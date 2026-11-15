@@ -429,12 +429,13 @@ pub struct DayUsage {
     pub requests: i64,
 }
 
-/// Day-level token and request totals inside a month window, one group per
+/// Day-level token and request totals inside a date range, one group per
 /// day, key and model.
 ///
-/// The month window is a range predicate on `created_at` in the WHERE clause,
-/// which is what the `(api_key_id, created_at)` index serves;
-/// `substr(created_at, 1, 10)` appears only as the label of the grouping,
+/// The window is a half-open range on `created_at` in the WHERE clause
+/// (`>= start` and `< end`), which is what the `(api_key_id, created_at)`
+/// index serves; `substr(created_at, 1, 10)` appears only as the label of
+/// the grouping,
 /// never as a filter that would defeat that index. Every token dimension the
 /// pricing path reads is summed, the cache dimensions included, so a caller
 /// that prices a day gets the same figure the month aggregate prices. Rows
@@ -447,8 +448,8 @@ pub struct DayUsage {
 /// must read back as `i64`.
 pub async fn day_usage(
     db: &Db,
-    month_start: &str,
-    month_end: &str,
+    range_start: &str,
+    range_end: &str,
     key_id: Option<i64>,
     model: Option<String>,
 ) -> sqlx::Result<Vec<DayUsage>> {
@@ -463,9 +464,9 @@ pub async fn day_usage(
         )
         .push("COUNT(*) AS request_count FROM request_logs ")
         .push("WHERE api_key_id IS NOT NULL AND created_at >= ")
-        .bind(Arg::Text(Some(month_start.to_string())))
+        .bind(Arg::Text(Some(range_start.to_string())))
         .push(" AND created_at < ")
-        .bind(Arg::Text(Some(month_end.to_string())));
+        .bind(Arg::Text(Some(range_end.to_string())));
     if let Some(key_id) = key_id {
         sql.push(" AND api_key_id = ").bind(Arg::Int(key_id));
     }
@@ -505,11 +506,12 @@ pub struct DayStatusUsage {
     pub requests: i64,
 }
 
-/// Request counts per day and status class inside a month window.
+/// Request counts per day and status class inside a date range.
 ///
-/// The month window is a range predicate on `created_at` in the WHERE
-/// clause, which is what the `(api_key_id, created_at)` index serves;
-/// `substr(created_at, 1, 10)` appears only as the label of the grouping,
+/// The window is a half-open range on `created_at` in the WHERE clause
+/// (`>= start` and `< end`), which is what the `(api_key_id, created_at)`
+/// index serves; `substr(created_at, 1, 10)` appears only as the label of
+/// the grouping,
 /// never as a filter that would defeat that index. Rows without an
 /// `api_key_id` (rejections whose key never resolved) are excluded, exactly
 /// as in [`day_usage`], so the status chart counts the same requests the
@@ -520,8 +522,8 @@ pub struct DayStatusUsage {
 /// its token columns hold and returns an integer on both backends.
 pub async fn day_status_usage(
     db: &Db,
-    month_start: &str,
-    month_end: &str,
+    range_start: &str,
+    range_end: &str,
     key_id: Option<i64>,
     model: Option<String>,
     status_class: Option<StatusBucket>,
@@ -530,10 +532,10 @@ pub async fn day_status_usage(
     sql.push("SELECT substr(created_at, 1, 10) AS day, ")
         .push(STATUS_BUCKET_SQL)
         .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ");
-    push_status_window(
+    push_status_range(
         &mut sql,
-        month_start,
-        month_end,
+        range_start,
+        range_end,
         key_id,
         model,
         status_class,
@@ -556,27 +558,28 @@ fn map_day_status_usage(row: &Row) -> sqlx::Result<DayStatusUsage> {
     })
 }
 
-/// Adds the month window and the optional key, model and status class
+/// Adds the date range and the optional key, model and status class
 /// predicates the status aggregates share to a SQL body.
 ///
-/// The window is a range predicate on `created_at`, which is what the
-/// `(api_key_id, created_at)` index serves, and rows without an `api_key_id`
-/// (rejections whose key never resolved) are excluded, so every status
+/// The window is a half-open range on `created_at` (`>= start` and `< end`),
+/// which is what the `(api_key_id, created_at)` index serves, and the rows
+/// without an `api_key_id` (rejections whose key never resolved) are
+/// excluded, so every status
 /// aggregate counts the same requests the token aggregates count. The class
 /// predicate compares the bucket expression the queries group by, so
 /// filtering and grouping can never disagree.
-fn push_status_window(
+fn push_status_range(
     sql: &mut Sql,
-    month_start: &str,
-    month_end: &str,
+    range_start: &str,
+    range_end: &str,
     key_id: Option<i64>,
     model: Option<String>,
     status_class: Option<StatusBucket>,
 ) {
     sql.push("WHERE api_key_id IS NOT NULL AND created_at >= ")
-        .bind(Arg::Text(Some(month_start.to_string())))
+        .bind(Arg::Text(Some(range_start.to_string())))
         .push(" AND created_at < ")
-        .bind(Arg::Text(Some(month_end.to_string())));
+        .bind(Arg::Text(Some(range_end.to_string())));
     if let Some(key_id) = key_id {
         sql.push(" AND api_key_id = ").bind(Arg::Int(key_id));
     }
@@ -608,7 +611,7 @@ pub struct DayStatusCodeUsage {
     pub requests: i64,
 }
 
-/// Request counts per day and exact status code inside a month window, the
+/// Request counts per day and exact status code inside a date range, the
 /// per-code detail of the requests chart.
 ///
 /// Same window, filters and exclusions as [`day_status_usage`], which this
@@ -622,8 +625,8 @@ pub struct DayStatusCodeUsage {
 /// with the requests that carry no status last.
 pub async fn day_status_code_usage(
     db: &Db,
-    month_start: &str,
-    month_end: &str,
+    range_start: &str,
+    range_end: &str,
     key_id: Option<i64>,
     model: Option<String>,
     status_class: Option<StatusBucket>,
@@ -632,10 +635,10 @@ pub async fn day_status_code_usage(
     sql.push("SELECT substr(created_at, 1, 10) AS day, status AS status_code, ")
         .push(STATUS_BUCKET_SQL)
         .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ");
-    push_status_window(
+    push_status_range(
         &mut sql,
-        month_start,
-        month_end,
+        range_start,
+        range_end,
         key_id,
         model,
         status_class,
@@ -673,7 +676,7 @@ pub struct StatusCodeTotal {
     pub requests: i64,
 }
 
-/// Request counts per exact status code over a month window, without the day
+/// Request counts per exact status code over a date range, without the day
 /// dimension, for the status code table.
 ///
 /// Same window, filters and exclusions as [`day_status_code_usage`]; the
@@ -683,8 +686,8 @@ pub struct StatusCodeTotal {
 /// to return NULLs in.
 pub async fn status_code_totals(
     db: &Db,
-    month_start: &str,
-    month_end: &str,
+    range_start: &str,
+    range_end: &str,
     key_id: Option<i64>,
     model: Option<String>,
     status_class: Option<StatusBucket>,
@@ -693,10 +696,10 @@ pub async fn status_code_totals(
     sql.push("SELECT status AS status_code, ")
         .push(STATUS_BUCKET_SQL)
         .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ");
-    push_status_window(
+    push_status_range(
         &mut sql,
-        month_start,
-        month_end,
+        range_start,
+        range_end,
         key_id,
         model,
         status_class,
@@ -718,22 +721,23 @@ fn map_status_code_total(row: &Row) -> sqlx::Result<StatusCodeTotal> {
     })
 }
 
-/// The distinct model names logged in a month window, sorted, for the model
+/// The distinct model names logged in a date range, sorted, for the model
 /// filter of the charts page.
 ///
-/// The window is a range predicate on `created_at`, so the same index serves
-/// it, and rows without a model contribute nothing to a list of names.
+/// The window is a half-open range on `created_at` (`>= start` and `< end`),
+/// so the same index serves it, and rows without a model contribute nothing
+/// to a list of names.
 pub async fn distinct_models(
     db: &Db,
-    month_start: &str,
-    month_end: &str,
+    range_start: &str,
+    range_end: &str,
 ) -> sqlx::Result<Vec<String>> {
     let mut sql = Sql::for_db(db);
     sql.push("SELECT DISTINCT model FROM request_logs ")
         .push("WHERE model IS NOT NULL AND created_at >= ")
-        .bind(Arg::Text(Some(month_start.to_string())))
+        .bind(Arg::Text(Some(range_start.to_string())))
         .push(" AND created_at < ")
-        .bind(Arg::Text(Some(month_end.to_string())))
+        .bind(Arg::Text(Some(range_end.to_string())))
         .push(" ORDER BY model");
     let rows = db.fetch_all(sql).await?;
     rows.iter().map(|row| row.text("model")).collect()
@@ -2304,5 +2308,171 @@ mod tests {
         .await
         .unwrap()
         .is_empty());
+    }
+
+    /// The aggregates take a half-open range: a row of the day the caller
+    /// named as the end bound is already outside. The stats page turns the
+    /// admin's inclusive `to` day into that bound, so the `to` day itself
+    /// stays inside.
+    #[tokio::test]
+    async fn day_usage_reads_an_arbitrary_half_open_range() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "day-arbitrary").await;
+
+        // The instant before the range, both of its edges, and the first
+        // instant outside it.
+        for (at, tokens) in [
+            ("2026-11-04 23:59:59", 1000),
+            ("2026-11-05 00:00:00", 10),
+            ("2026-11-07 23:59:59", 20),
+            ("2026-11-08 00:00:00", 1000),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row(Some("alpha"), Some(tokens), Some(0), None, None),
+                at,
+            )
+            .await;
+        }
+
+        // The days 2026-11-05 through 2026-11-07 inclusive.
+        let usage = day_usage(
+            &db,
+            "2026-11-05 00:00:00",
+            "2026-11-08 00:00:00",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 2, "{usage:?}");
+        assert_eq!(usage[0].day, "2026-11-05");
+        assert_eq!(usage[0].prompt_tokens, 10);
+        assert_eq!(usage[1].day, "2026-11-07");
+        assert_eq!(usage[1].prompt_tokens, 20);
+
+        // Bounds that are equal select nothing rather than the whole table.
+        assert!(day_usage(
+            &db,
+            "2026-11-05 00:00:00",
+            "2026-11-05 00:00:00",
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn day_status_code_usage_reads_an_arbitrary_half_open_range() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "code-arbitrary").await;
+
+        for (status, at) in [
+            (Some(200), "2026-11-04 23:59:59"),
+            (Some(200), "2026-11-05 10:00:00"),
+            (Some(500), "2026-11-07 10:00:00"),
+            (Some(500), "2026-11-08 00:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, Some("alpha")),
+                at,
+            )
+            .await;
+        }
+
+        let usage = day_status_code_usage(
+            &db,
+            "2026-11-05 00:00:00",
+            "2026-11-08 00:00:00",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codes(&usage),
+            vec![
+                ("2026-11-05".to_string(), Some(200), 1),
+                ("2026-11-07".to_string(), Some(500), 1),
+            ],
+            "{usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_code_totals_read_an_arbitrary_half_open_range() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "totals-arbitrary").await;
+
+        for (status, at) in [
+            (Some(200), "2026-11-04 23:59:59"),
+            (Some(200), "2026-11-05 10:00:00"),
+            (Some(404), "2026-11-06 10:00:00"),
+            (Some(200), "2026-11-07 23:59:59"),
+            (Some(200), "2026-11-08 00:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, Some("alpha")),
+                at,
+            )
+            .await;
+        }
+
+        let rows = status_code_totals(
+            &db,
+            "2026-11-05 00:00:00",
+            "2026-11-08 00:00:00",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            totals(&rows),
+            vec![(Some(200), 2), (Some(404), 1)],
+            "the rows on both sides of the range stay out: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn distinct_models_lists_the_models_of_the_range() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "distinct-range").await;
+
+        for (model, at) in [
+            (Some("outside"), "2026-11-04 23:59:59"),
+            (Some("inside"), "2026-11-05 10:00:00"),
+            (Some("also-inside"), "2026-11-07 10:00:00"),
+            (Some("outside"), "2026-11-08 00:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row(model, Some(1), Some(1), None, None),
+                at,
+            )
+            .await;
+        }
+
+        let models = distinct_models(&db, "2026-11-05 00:00:00", "2026-11-08 00:00:00")
+            .await
+            .unwrap();
+        assert_eq!(
+            models,
+            vec!["also-inside".to_string(), "inside".to_string()]
+        );
     }
 }
