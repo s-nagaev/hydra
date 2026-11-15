@@ -652,6 +652,71 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn every_page_applies_the_theme_before_its_stylesheet_and_carries_the_toggle() {
+        let state = test_state().await;
+        let (status, body) = get_page(state, "/admin/ui/channels", Some(&auth_header())).await;
+        assert_eq!(status, StatusCode::OK);
+        // The stored theme is applied by an inline script ahead of the
+        // stylesheet, which is what keeps a dark page from flashing light.
+        let bootstrap = body
+            .find("setAttribute(\"data-theme\"")
+            .unwrap_or_else(|| panic!("the theme bootstrap must be inline: {body}"));
+        let stylesheet = body
+            .find("/admin/ui/static/admin.css")
+            .expect("the stylesheet is linked");
+        assert!(
+            bootstrap < stylesheet,
+            "the theme has to be applied before the stylesheet paints: {body}"
+        );
+        assert!(
+            body.contains("window.localStorage.getItem(\"hydra-theme\")"),
+            "the stored choice is read first: {body}"
+        );
+        assert!(
+            body.contains("matchMedia(\"(prefers-color-scheme: dark)\")"),
+            "the operating system decides without a stored choice: {body}"
+        );
+        assert!(
+            body.contains("document.cookie = \"theme=\" + theme"),
+            "the server-rendered charts read the cookie: {body}"
+        );
+        assert!(body.contains("id=\"theme-toggle\""), "{body}");
+        assert!(
+            body.contains("aria-label=\"Switch to dark theme\""),
+            "{body}"
+        );
+        assert!(
+            body.contains("class=\"icon-sun\"") && body.contains("class=\"icon-moon\""),
+            "the button carries both icons: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_login_page_applies_the_stored_theme_without_a_header_toggle() {
+        let state = test_state().await;
+        let answer = send(state, "GET", "/admin/ui/login", &[]).await;
+        assert_eq!(answer.status, StatusCode::OK);
+        let bootstrap = answer
+            .body
+            .find("setAttribute(\"data-theme\"")
+            .unwrap_or_else(|| panic!("the theme bootstrap must be inline: {}", answer.body));
+        let stylesheet = answer
+            .body
+            .find("/admin/ui/static/admin.css")
+            .expect("the stylesheet is linked");
+        assert!(
+            bootstrap < stylesheet,
+            "the login page must not flash either: {}",
+            answer.body
+        );
+        assert!(
+            !answer.body.contains("id=\"theme-toggle\""),
+            "the login page carries no header toggle: {}",
+            answer.body
+        );
+    }
+
     #[test]
     fn the_body_highlighter_never_builds_html_from_body_text() {
         let source = std::str::from_utf8(ADMIN_JS).unwrap();
@@ -660,5 +725,41 @@ mod tests {
             "log bodies are attacker-influenced: they must be handled as text"
         );
         assert!(source.contains("textContent"));
+    }
+
+    #[test]
+    fn the_theme_choice_is_stored_only_when_the_toggle_is_clicked() {
+        let source = std::str::from_utf8(ADMIN_JS).unwrap();
+        // The theme a page load resolves is the operating system's answer
+        // whenever the visitor has made no choice. Writing it to the store on
+        // that path would turn the answer of the first visit into a choice of
+        // the visitor's and stop `prefers-color-scheme` from being followed,
+        // so the store gets exactly one writer and one caller, both reached
+        // from the click handler.
+        let writes: Vec<usize> = source
+            .match_indices("window.localStorage.setItem")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(writes.len(), 1, "the store has a single writer: {writes:?}");
+        let calls: Vec<usize> = source
+            .match_indices("persistTheme(")
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(calls.len(), 2, "one definition and one call: {calls:?}");
+        assert!(
+            source[..calls[0]].ends_with("function "),
+            "the first mention defines the helper"
+        );
+        assert!(
+            calls[0] < writes[0] && writes[0] < calls[1],
+            "the write belongs to that helper: {calls:?} {writes:?}"
+        );
+        let click = source
+            .find("button.addEventListener(\"click\"")
+            .expect("the toggle listens for clicks");
+        assert!(
+            calls[0] < click && click < calls[1],
+            "the only call sits in the click handler: {calls:?} around {click}"
+        );
     }
 }

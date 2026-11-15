@@ -1,20 +1,115 @@
 /* Hydra admin UI. Desktop-first, single custom stylesheet, no framework. */
 
+/* Every color the UI paints is one of these custom properties. The light set
+   is the palette the UI has always used; the dark set below is GitHub's dark
+   scale. The two sets are declared twice on purpose, because plain CSS cannot
+   share one declaration block between an attribute selector and a media
+   query: a dark block for the choice stored by the header toggle, and the
+   same block inside the media query for the preference of the operating
+   system, which a stored choice overrides. Keep the two dark blocks
+   identical. */
+
 :root {
+  color-scheme: light;
+
   --bg: #f5f6f8;
   --surface: #ffffff;
+  /* A row under the pointer, and the total lines of a stats table. */
+  --surface-alt: #fafbfc;
   --border: #d9dde3;
   --text: #1f2430;
   --text-muted: #6a7280;
   --accent: #2563eb;
   --accent-dark: #1e50c8;
+  /* Tinted accent surfaces: the active nav entry, the model badges and the
+     current page of a pagination strip. */
+  --accent-soft: #eaf1fe;
+  --accent-soft-border: #b9d0f7;
+  /* Text on a tinted accent surface, which the dark palette lightens until it
+     separates from the tint. */
+  --accent-soft-text: #1e50c8;
+  /* Text on an accent-filled control. */
+  --on-accent: #ffffff;
   --danger: #b91c1c;
   --danger-bg: #fdeaea;
+  --danger-border: #e5b4b4;
   --ok: #15803d;
   --ok-bg: #e8f7ee;
+  --ok-border: #b7e0c6;
   --warn: #92400e;
   --warn-bg: #fdf3e3;
+  --backdrop: rgba(31, 36, 48, 0.55);
+  /* The JSON highlighter colors of the log detail page. */
+  --json-key: #0550ae;
+  --json-string: #0a7d33;
+  --json-number: #a13d00;
+  --json-literal: #8250df;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-alt: #1c2128;
+  --border: #30363d;
+  --text: #e6edf3;
+  --text-muted: #8b949e;
+  --accent: #2f81f7;
+  --accent-dark: #1f6feb;
+  --accent-soft: rgba(47, 129, 247, 0.1);
+  --accent-soft-border: rgba(47, 129, 247, 0.4);
+  --accent-soft-text: #79c0ff;
+  --on-accent: #0d1117;
+  --danger: #f85149;
+  --danger-bg: rgba(248, 81, 73, 0.12);
+  --danger-border: rgba(248, 81, 73, 0.4);
+  --ok: #3fb950;
+  --ok-bg: rgba(63, 185, 80, 0.15);
+  --ok-border: rgba(63, 185, 80, 0.4);
+  --warn: #d29922;
+  --warn-bg: rgba(210, 153, 34, 0.15);
+  --backdrop: rgba(1, 4, 9, 0.8);
+  --json-key: #79c0ff;
+  --json-string: #7ee787;
+  --json-number: #ffa657;
+  --json-literal: #d2aaff;
+}
+
+/* The dark palette again, for the operating system preference. A page that
+   runs no JavaScript is painted from this block alone; the toggle writes the
+   stored choice and puts the block above in charge. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+
+    --bg: #0d1117;
+    --surface: #161b22;
+    --surface-alt: #1c2128;
+    --border: #30363d;
+    --text: #e6edf3;
+    --text-muted: #8b949e;
+    --accent: #2f81f7;
+    --accent-dark: #1f6feb;
+    --accent-soft: rgba(47, 129, 247, 0.1);
+    --accent-soft-border: rgba(47, 129, 247, 0.4);
+    --accent-soft-text: #79c0ff;
+    --on-accent: #0d1117;
+    --danger: #f85149;
+    --danger-bg: rgba(248, 81, 73, 0.12);
+    --danger-border: rgba(248, 81, 73, 0.4);
+    --ok: #3fb950;
+    --ok-bg: rgba(63, 185, 80, 0.15);
+    --ok-border: rgba(63, 185, 80, 0.4);
+    --warn: #d29922;
+    --warn-bg: rgba(210, 153, 34, 0.15);
+    --backdrop: rgba(1, 4, 9, 0.8);
+    --json-key: #79c0ff;
+    --json-string: #7ee787;
+    --json-number: #ffa657;
+    --json-literal: #d2aaff;
+  }
 }
 
 * {
@@ -34,7 +129,7 @@ body {
 /* Header */
 
 .topbar {
-  background: #ffffff;
+  background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
 
@@ -78,7 +173,7 @@ body {
 
 .main-nav a.active {
   color: var(--accent);
-  background: #eaf1fe;
+  background: var(--accent-soft);
   font-weight: 600;
 }
 
@@ -90,6 +185,47 @@ body {
 
 .api-link:hover {
   color: var(--text);
+}
+
+/* The theme toggle of the header: one square icon button carrying a sun and a
+   moon, of which CSS shows the one matching the palette in force, so the icon
+   is right even before the script runs and with no script at all. The header
+   of the login page carries no toggle, because the pages it links to would
+   send the visitor straight back to it. */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
+.theme-toggle:hover {
+  color: var(--text);
+}
+
+.theme-toggle .icon-moon {
+  display: none;
+}
+
+:root[data-theme="dark"] .theme-toggle .icon-sun {
+  display: none;
+}
+
+:root[data-theme="dark"] .theme-toggle .icon-moon {
+  display: inline;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .theme-toggle .icon-sun {
+    display: none;
+  }
+
+  :root:not([data-theme="light"]) .theme-toggle .icon-moon {
+    display: inline;
+  }
 }
 
 /* Page */
@@ -145,7 +281,7 @@ body {
 }
 
 .data-table tbody tr:hover {
-  background: #fafbfc;
+  background: var(--surface-alt);
 }
 
 /* The channels and keys tables take the card's width and never more: a fixed
@@ -309,7 +445,7 @@ button:hover,
 button.primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: #ffffff;
+  color: var(--on-accent);
   font-weight: 600;
 }
 
@@ -319,7 +455,7 @@ button.primary:hover {
 
 button.danger {
   color: var(--danger);
-  border-color: #e5b4b4;
+  border-color: var(--danger-border);
 }
 
 button.danger:hover {
@@ -357,7 +493,7 @@ button.danger:hover {
 .error-banner {
   background: var(--danger-bg);
   color: var(--danger);
-  border: 1px solid #e5b4b4;
+  border: 1px solid var(--danger-border);
   border-radius: 6px;
   padding: 10px 14px;
   margin-bottom: 14px;
@@ -366,7 +502,7 @@ button.danger:hover {
 .notice-banner {
   background: var(--ok-bg);
   color: var(--ok);
-  border: 1px solid #b7e0c6;
+  border: 1px solid var(--ok-border);
   border-radius: 6px;
   padding: 10px 14px;
   margin-bottom: 14px;
@@ -377,7 +513,7 @@ button.danger:hover {
 .modal-backdrop {
   position: fixed;
   inset: 0;
-  background: rgba(31, 36, 48, 0.55);
+  background: var(--backdrop);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -503,8 +639,8 @@ td.key-cell {
 
 .model-badge {
   display: inline-block;
-  background: #eaf1fe;
-  color: var(--accent-dark);
+  background: var(--accent-soft);
+  color: var(--accent-soft-text);
   border-radius: 4px;
   padding: 1px 6px;
   font-size: 12.5px;
@@ -566,19 +702,19 @@ td.key-cell {
 }
 
 .json-key {
-  color: #0550ae;
+  color: var(--json-key);
 }
 
 .json-string {
-  color: #0a7d33;
+  color: var(--json-string);
 }
 
 .json-number {
-  color: #a13d00;
+  color: var(--json-number);
 }
 
 .json-literal {
-  color: #8250df;
+  color: var(--json-literal);
 }
 
 .json-punct {
@@ -733,9 +869,9 @@ td.key-cell {
 }
 
 .pagination .current {
-  background: #eaf1fe;
-  border-color: #b9d0f7;
-  color: var(--accent-dark);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-border);
+  color: var(--accent-soft-text);
   font-weight: 600;
 }
 
@@ -917,7 +1053,7 @@ td.key-cell {
 /* Stats page: a key's total line and the grand total stand apart from the
    per-model lines above them. */
 .stats-table tr.total-row td {
-  background: #fafbfc;
+  background: var(--surface-alt);
   font-weight: 600;
 }
 
@@ -995,7 +1131,7 @@ td.key-cell {
 .login-error {
   background: var(--danger-bg);
   color: var(--danger);
-  border: 1px solid #e5b4b4;
+  border: 1px solid var(--danger-border);
   border-radius: 6px;
   padding: 10px 14px;
   margin: 0;

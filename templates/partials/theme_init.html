@@ -1,0 +1,24 @@
+{# Resolves the theme before the stylesheet paints and hands it to the server for
+   the next page. Inline and blocking on purpose: a deferred script would run
+   after the first paint, which is the flash of the wrong palette this avoids.
+   The stored choice wins; without one the operating system decides. The same
+   value goes into the `theme` cookie, because the charts are SVG built on the
+   server and cannot read a preference from the browser. #}
+<script>
+  (function () {
+    "use strict";
+    var stored = null;
+    try {
+      stored = window.localStorage.getItem("hydra-theme");
+    } catch (error) {
+      stored = null;
+    }
+    var prefersDark = window.matchMedia
+      && window.matchMedia("(prefers-color-scheme: dark)").matches;
+    var theme = stored === "dark" || stored === "light"
+      ? stored
+      : (prefersDark ? "dark" : "light");
+    document.documentElement.setAttribute("data-theme", theme);
+    document.cookie = "theme=" + theme + "; path=/; max-age=31536000; samesite=lax";
+  })();
+</script>
