@@ -666,6 +666,13 @@ td.key-cell {
   min-width: 0;
 }
 
+/* The date pickers need a fixed comfortable width rather than an equal
+   share: a day value always renders the same, while the selects and the
+   preset group absorb the rest of the row. */
+.filter-bar--stats .filter-field--date {
+  flex: 0 0 15em;
+}
+
 .filter-bar--stats .filter-field input,
 .filter-bar--stats .filter-field select {
   width: 100%;
