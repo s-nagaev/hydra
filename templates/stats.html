@@ -13,6 +13,9 @@
   {% endif %}
 
   <form class="filter-bar filter-grid" method="get" action="/admin/ui/stats">
+    <div class="filter-field filter-field--apply">
+      <button type="submit" class="primary">Apply</button>
+    </div>
     <div class="filter-field">
       <label for="stats-from">From (UTC)</label>
       <input type="date" id="stats-from" name="from" value="{{ from_value }}">
@@ -49,9 +52,6 @@
         <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
         {% endfor %}
       </select>
-    </div>
-    <div class="filter-field">
-      <button type="submit" class="primary">Apply</button>
     </div>
   </form>
 

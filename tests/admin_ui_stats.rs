@@ -394,8 +394,9 @@ async fn the_filter_bar_offers_two_day_pickers_and_three_shortcuts() {
         );
     }
 
-    // Reading order: the two day fields, the shortcuts, the three filters,
-    // then the submit button.
+    // Reading order: the two day fields, the shortcuts, the three filters.
+    // The submit button is not in this list, because it leads the markup
+    // although it reads last on screen; the test below pins that.
     let order = [
         "stats-from",
         "stats-to",
@@ -405,7 +406,6 @@ async fn the_filter_bar_offers_two_day_pickers_and_three_shortcuts() {
         "stats-key",
         "stats-model",
         "stats-status",
-        "Apply",
     ];
     let mut previous = 0;
     for needle in order {
@@ -415,6 +415,62 @@ async fn the_filter_bar_offers_two_day_pickers_and_three_shortcuts() {
         assert!(at >= previous, "{needle} is out of the bar's order: {bar}");
         previous = at;
     }
+}
+
+/// The markup of the first submit button of a form, which is the control a
+/// browser activates when the user presses Enter in one of its fields.
+fn first_submit_button(bar: &str) -> &str {
+    let at = bar.find("<button").expect("the bar carries buttons");
+    let (button, _) = bar[at..]
+        .split_once("</button>")
+        .expect("the first button is closed");
+    button
+}
+
+#[tokio::test]
+async fn enter_in_a_day_picker_applies_the_typed_range() {
+    let db = test_pool().await;
+    let (status, html) = get_page(&db, "/admin/ui/stats").await;
+    assert_eq!(status, StatusCode::OK);
+    let bar = filter_bar(&html);
+
+    let apply = first_submit_button(bar);
+    assert!(
+        apply.contains(">Apply"),
+        "the first submit button of the form is Apply, so Enter applies the typed range: {bar}"
+    );
+    assert!(
+        !apply.contains("name=") && !apply.contains("value="),
+        "Apply submits no parameter of its own, so Enter cannot fire a shortcut: {apply}"
+    );
+    assert!(
+        !bar.contains("<script") && !bar.contains("onkeydown") && !bar.contains("onsubmit"),
+        "the bar needs no script for Enter to apply the range: {bar}"
+    );
+
+    // The wrapper of the moved button leads the markup, and the sheet orders
+    // it back to the end of the line, so the controls read exactly as before.
+    let apply_field = bar
+        .find("filter-field--apply")
+        .expect("the apply field is marked for ordering");
+    let from_field = bar
+        .find("id=\"stats-from\"")
+        .expect("the From picker is in the bar");
+    assert!(
+        apply_field < from_field,
+        "the apply field leads the bar's markup: {bar}"
+    );
+
+    let (status, css) = send(&db, "/admin/ui/static/admin.css", None).await;
+    assert_eq!(status, StatusCode::OK);
+    let (_, rule) = css
+        .split_once(".filter-field--apply")
+        .expect("the sheet knows the apply field");
+    let (rule, _) = rule.split_once('}').expect("the rule is closed");
+    assert!(
+        rule.contains("order: 1"),
+        "the sheet moves the leading button to the end of the bar: {rule}"
+    );
 }
 
 #[tokio::test]
