@@ -60,6 +60,20 @@
     </tbody>
   </table>
 
+  {% if let Some(content) = request_content %}
+<details class="body-block" open>
+    <summary class="snippet-label">Request content</summary>
+    <pre class="code-snippet">{{ content }}</pre>
+  </details>
+  {% endif %}
+
+  {% if let Some(content) = response_content %}
+  <details class="body-block" open>
+    <summary class="snippet-label">Response content</summary>
+    <pre class="code-snippet">{{ content }}</pre>
+  </details>
+  {% endif %}
+
   {% if let Some(body) = request_body %}
   <details class="body-block" open>
     <summary class="snippet-label">Request body</summary>

@@ -853,6 +853,77 @@ async fn detail_page_wraps_each_captured_body_in_a_collapsible_section() {
 }
 
 #[tokio::test]
+async fn detail_page_shows_the_extracted_text_above_the_captured_bodies() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(12),
+        Some(4),
+        Some(
+            r#"{"model":"gpt-4o","messages":[{"role":"user","content":"\u041f\u0440\u0438\u0432\u0435\u0442"}]}"#,
+        ),
+        Some("data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\ndata: [DONE]\n\n"),
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(r#"<pre class="code-snippet">user: Привет</pre>"#),
+        "the request text is decoded and rendered on its own: {body}"
+    );
+    assert!(
+        body.contains(r#"<pre class="code-snippet">Hello</pre>"#),
+        "the streamed answer is rendered on its own: {body}"
+    );
+    assert!(
+        body.find("Request content").unwrap() < body.find("Request body").unwrap(),
+        "the request text sits above the captured request body"
+    );
+    assert!(
+        body.find("Response content").unwrap() < body.find("Response body").unwrap(),
+        "the response text sits above the captured response body"
+    );
+}
+
+#[tokio::test]
+async fn detail_page_renders_no_content_block_for_bodies_without_text() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    // A truncated request capture and an upstream error page: neither carries
+    // anything the extraction can read, so neither direction gets a block.
+    let log_id = insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(502),
+        None,
+        None,
+        Some(r#"{"model":"gpt-4o","messages":[{"role":"user","content":"\u041f"#),
+        Some(r#"{"error":{"message":"bad model"}}"#),
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, &format!("/admin/ui/logs/{log_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.matches(">Request content<").count(), 0, "{body}");
+    assert_eq!(body.matches(">Response content<").count(), 0, "{body}");
+    // The bodies themselves are still rendered below.
+    assert!(body.contains("<summary class=\"snippet-label\">Request body</summary>"));
+    assert!(body.contains("<summary class=\"snippet-label\">Response body</summary>"));
+}
+
+#[tokio::test]
 async fn detail_page_decodes_unicode_escapes_in_bodies_that_are_not_json() {
     let db = test_pool().await;
     let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
