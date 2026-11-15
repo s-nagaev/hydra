@@ -24,6 +24,11 @@ mod docs;
 mod openai_error;
 mod proxy;
 mod proxy_auth;
+// The stats page consumes these builders; until that call site lands the
+// module has no in-crate caller, so the dead-code lint is silenced once here
+// instead of on every item.
+#[allow(dead_code)]
+pub(crate) mod stats_chart;
 mod ui_auth;
 
 use std::time::Duration;
