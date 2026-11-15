@@ -919,10 +919,18 @@ async fn pg_stats_page_renders_priced_range_rows() {
     log_usage_at(&db, key.id, priced.channel.id, "2026-01-05 10:00:00").await;
     log_usage_at(&db, key.id, priced.channel.id, "2026-02-05 10:00:00").await;
 
+    // Every other test of this binary shares this database, and the January
+    // 2026 window is not this test's own: the month-to-date test logs rows on
+    // 2026-01-05, 06, 20 and 31 under its own keys. Without a key in the URL
+    // the pages count those rows too, so both URLs below name this test's
+    // key, which leaves the assertions reading its rows alone.
     let response = within(
         router(app_state(&db)).oneshot(
             Request::builder()
-                .uri("/admin/ui/stats?from=2026-01-01&to=2026-01-31")
+                .uri(format!(
+                    "/admin/ui/stats?from=2026-01-01&to=2026-01-31&key_id={}",
+                    key.id
+                ))
                 .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
@@ -949,11 +957,15 @@ async fn pg_stats_page_renders_priced_range_rows() {
     );
 
     // The Requests page reads the same range out of the status aggregates on
-    // the PG schema, which count the January request alone.
+    // the PG schema, which count the January request alone once the key is
+    // named.
     let response = within(
         router(app_state(&db)).oneshot(
             Request::builder()
-                .uri("/admin/ui/stats/requests?from=2026-01-01&to=2026-01-31")
+                .uri(format!(
+                    "/admin/ui/stats/requests?from=2026-01-01&to=2026-01-31&key_id={}",
+                    key.id
+                ))
                 .header("authorization", auth_header())
                 .body(Body::empty())
                 .unwrap(),
@@ -972,9 +984,16 @@ async fn pg_stats_page_renders_priced_range_rows() {
         html.contains("Day 5: 1 requests (1 200)"),
         "one January request only: {html}"
     );
+    // The whole table of the view, whitespace flattened: one line for code
+    // 200 carrying the one request of the range. The February request of the
+    // same key would make it two, so this line pins the range boundary too.
+    let cells = html.split_whitespace().collect::<Vec<_>>().join(" ");
     assert!(
-        html.contains("<td class=\"mono\">200</td>"),
-        "the status code table names the logged code: {html}"
+        cells.contains(
+            "<td class=\"mono\">200</td> <td>2xx</td> <td class=\"mono\">1</td> \
+             <td class=\"mono\">100.0%</td>"
+        ),
+        "the status code table counts the logged code alone: {html}"
     );
     assert!(html.contains("2026-01-01 to 2026-01-31"), "{html}");
 }
