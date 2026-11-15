@@ -468,7 +468,7 @@ async fn enter_in_a_day_picker_applies_the_typed_range() {
         .expect("the sheet knows the apply field");
     let (rule, _) = rule.split_once('}').expect("the rule is closed");
     assert!(
-        rule.contains("order: 1"),
+        rule.contains("order: 10"),
         "the sheet moves the leading button to the end of the bar: {rule}"
     );
 }
