@@ -653,36 +653,51 @@ td.key-cell {
 
 /* The stats date-range bar is laid out in two fixed rows: From, To and the
    shortcuts on the first one, Key, Model, Status and Apply on the second.
-   The break element forces the wrap regardless of the viewport width.
-   The bar still leads its markup with the Apply field, because a browser
-   submitting a form on Enter sends the first submit button of the form: with
-   Apply first, Enter inside a day picker applies the typed range, and the
-   three shortcuts stay ordinary buttons that need a click. `order` then puts
-   the button back at the end of the second row, so the control sequence on
-   screen is untouched. */
-.filter-bar .filter-field--apply {
+   The break element forces the wrap regardless of the viewport width, and
+   every field stretches with an equal share of its row, so the controls fill
+   the line edge to edge. The bar still leads its markup with the Apply
+   field, because a browser submitting a form on Enter sends the first submit
+   button of the form: with Apply first, Enter inside a day picker applies
+   the typed range, and the three shortcuts stay ordinary buttons that need a
+   click. `order` then puts the button back at the end of the second row, so
+   the control sequence on screen is untouched. */
+.filter-bar--stats .filter-field {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.filter-bar--stats .filter-field input,
+.filter-bar--stats .filter-field select {
+  width: 100%;
+  min-width: 0;
+}
+
+.filter-bar--stats .filter-field--apply {
   order: 10;
 }
 
-.filter-bar .filter-break {
+.filter-bar--stats .filter-field--apply button,
+.filter-bar--stats .filter-field--presets button {
+  white-space: nowrap;
+}
+
+/* The shortcuts stay one horizontal group and share their cell equally. */
+.filter-bar--stats .filter-field--presets {
+  flex-direction: row;
+  gap: 8px;
+}
+
+.filter-bar--stats .filter-field--presets button {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.filter-bar--stats .filter-break {
   flex-basis: 100%;
   height: 0;
 }
 
-/* The three range shortcuts share one field as a horizontal button group:
-   three separate fields would line up as three more columns. */
-.filter-bar .filter-field--presets {
-  flex-direction: row;
-  flex-wrap: nowrap;
-  gap: 8px;
-}
-
-.filter-bar .filter-field--presets button {
-  white-space: nowrap;
-}
-
-
-.table-meta {.table-meta {
+.table-meta {
   color: var(--text-muted);
   font-size: 13px;
   margin-top: 12px;
