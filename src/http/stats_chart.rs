@@ -21,9 +21,17 @@
 //! Rows whose day label does not parse to a day of the month are skipped,
 //! and a series that maps to no bar at all renders a placeholder note inside
 //! a valid, empty chart rather than an error.
+//!
+//! Colors travel as [`ChartTheme`] rather than through CSS: the SVG is built
+//! here, so the palette of the theme the page is showing is chosen on the
+//! server. The values are the same ones `assets/admin.css` defines for the
+//! light and the dark palette, and the page reads the theme from the cookie
+//! the toggle script writes (see [`theme_from_headers`]).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+
+use axum::http::HeaderMap;
 
 /// The aggregate row the SQL layer defines, reused here so both branches of
 /// the stats page read one shape instead of two identical copies.
@@ -56,24 +64,44 @@ const BAR_W: f64 = SLOT_W * 0.62;
 /// Y coordinate of the baseline every bar grows from.
 const BASE_Y: f64 = PAD_TOP + PLOT_H;
 
-/// `--accent` from `assets/admin.css`, the input-token segment.
+/// The light `--accent` from `assets/admin.css`, the input-token segment.
 const ACCENT_FILL: &str = "#2563eb";
-/// `--text-muted` from `assets/admin.css`, the output-token segment.
+/// The light `--text-muted` from `assets/admin.css`, the output-token
+/// segment.
 const MUTED_FILL: &str = "#6a7280";
-/// `--accent-dark` from `assets/admin.css`, the cost bars and the fifth slot
-/// of the per-code palette.
+/// The light `--accent-dark` from `assets/admin.css`, the cost bars and the
+/// fifth slot of the per-code palette.
 const COST_FILL: &str = "#1e50c8";
-/// `--ok` from `assets/admin.css`, the green slot of the per-code palette.
+/// The light `--ok` from `assets/admin.css`, the green slot of the per-code
+/// palette.
 const OK_FILL: &str = "#15803d";
-/// `--warn` from `assets/admin.css`, the amber slot of the per-code palette.
+/// The light `--warn` from `assets/admin.css`, the amber slot of the per-code
+/// palette.
 const WARN_FILL: &str = "#92400e";
-/// `--danger` from `assets/admin.css`, the red slot of the per-code palette.
+/// The light `--danger` from `assets/admin.css`, the red slot of the per-code
+/// palette.
 const DANGER_FILL: &str = "#b91c1c";
-/// `--border` from `assets/admin.css`, the axis rules.
+/// The light `--border` from `assets/admin.css`, the axis rules.
 const BORDER_STROKE: &str = "#d9dde3";
 
+/// The dark `--accent` from `assets/admin.css`: GitHub's link blue.
+const DARK_ACCENT_FILL: &str = "#2f81f7";
+/// The dark `--text-muted` from `assets/admin.css`.
+const DARK_MUTED_FILL: &str = "#8b949e";
+/// The dark `--accent-dark` from `assets/admin.css`, kept apart from the dark
+/// accent so the cost bars stay distinguishable from the input-token bars.
+const DARK_COST_FILL: &str = "#1f6feb";
+/// The dark `--ok` from `assets/admin.css`: GitHub's green.
+const DARK_OK_FILL: &str = "#3fb950";
+/// The dark `--warn` from `assets/admin.css`: GitHub's attention amber.
+const DARK_WARN_FILL: &str = "#d29922";
+/// The dark `--danger` from `assets/admin.css`: GitHub's red.
+const DARK_DANGER_FILL: &str = "#f85149";
+/// The dark `--border` from `assets/admin.css`, the axis rules.
+const DARK_BORDER_STROKE: &str = "#30363d";
+
 /// The segment colors of the requests chart, cycled over the status codes in
-/// their canonical order: `--ok`, `--warn`, `--danger`, `--accent`,
+/// their canonical order: the light `--ok`, `--warn`, `--danger`, `--accent`,
 /// `--accent-dark` and `--text-muted` from `assets/admin.css`, so the three
 /// named classes keep the colors the class chart used. A series with more
 /// codes than slots repeats the palette rather than inventing a color.
@@ -85,6 +113,110 @@ const STATUS_CODE_PALETTE: [&str; 6] = [
     COST_FILL,
     MUTED_FILL,
 ];
+
+/// The same cycle in the dark palette, in the same order, so a code keeps the
+/// slot it would take in the light theme.
+const DARK_STATUS_CODE_PALETTE: [&str; 6] = [
+    DARK_OK_FILL,
+    DARK_WARN_FILL,
+    DARK_DANGER_FILL,
+    DARK_ACCENT_FILL,
+    DARK_COST_FILL,
+    DARK_MUTED_FILL,
+];
+
+/// The name of the cookie the admin UI toggle script writes, and the only
+/// place the theme of a page request is carried.
+pub(crate) const THEME_COOKIE: &str = "theme";
+
+/// Which palette a chart is painted in. The admin stylesheet resolves the
+/// same choice for the page around the chart, so the two stay in step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ChartTheme {
+    /// The light palette, the values the stylesheet defines in `:root`.
+    #[default]
+    Light,
+    /// The dark palette, the values the stylesheet applies on
+    /// `prefers-color-scheme: dark` and on the stored dark choice.
+    Dark,
+}
+
+impl ChartTheme {
+    /// The theme a cookie value names. Only the exact value the toggle script
+    /// writes selects the dark palette; every other value, including a cookie
+    /// another application set, keeps the light one the stylesheet paints
+    /// without a stored choice.
+    pub(crate) fn from_cookie(value: &str) -> Self {
+        if value.trim() == "dark" {
+            ChartTheme::Dark
+        } else {
+            ChartTheme::Light
+        }
+    }
+
+    /// The palette of this theme.
+    fn palette(self) -> &'static Palette {
+        match self {
+            ChartTheme::Light => &LIGHT_PALETTE,
+            ChartTheme::Dark => &DARK_PALETTE,
+        }
+    }
+}
+
+/// The colors one theme paints the charts in, named after the custom
+/// properties of `assets/admin.css` they mirror.
+struct Palette {
+    /// `--accent`: input-token segments, and the fourth status slot.
+    accent: &'static str,
+    /// `--text-muted`: output-token segments, axis labels, the empty note and
+    /// the sixth status slot.
+    muted: &'static str,
+    /// `--accent-dark`: cost bars and the fifth status slot.
+    cost: &'static str,
+    /// `--border`: the axis rules.
+    border: &'static str,
+    /// The per-code colors in their canonical cycle order.
+    status: [&'static str; 6],
+}
+
+/// The light palette, unchanged from the stylesheet this chart has always
+/// mirrored.
+const LIGHT_PALETTE: Palette = Palette {
+    accent: ACCENT_FILL,
+    muted: MUTED_FILL,
+    cost: COST_FILL,
+    border: BORDER_STROKE,
+    status: STATUS_CODE_PALETTE,
+};
+
+/// The GitHub Dark palette.
+const DARK_PALETTE: Palette = Palette {
+    accent: DARK_ACCENT_FILL,
+    muted: DARK_MUTED_FILL,
+    cost: DARK_COST_FILL,
+    border: DARK_BORDER_STROKE,
+    status: DARK_STATUS_CODE_PALETTE,
+};
+
+/// The chart theme a page request asks for, read from the `theme` cookie of
+/// its `Cookie` header and defaulting to the light palette. The toggle script
+/// writes the cookie, so the server-rendered charts follow the choice the
+/// stylesheet shows on the same paint.
+pub(crate) fn theme_from_headers(headers: &HeaderMap) -> ChartTheme {
+    for header in headers.get_all(axum::http::header::COOKIE) {
+        let Ok(value) = header.to_str() else {
+            continue;
+        };
+        for pair in value.split(';') {
+            if let Some((name, value)) = pair.split_once('=') {
+                if name.trim() == THEME_COOKIE {
+                    return ChartTheme::from_cookie(value);
+                }
+            }
+        }
+    }
+    ChartTheme::Light
+}
 
 /// Accessible name of the tokens chart.
 const TOKENS_LABEL: &str = "Tokens per day";
@@ -209,31 +341,32 @@ pub(crate) fn aggregate_daily(rows: &[DayUsage]) -> Vec<(String, i64, i64, i64)>
 }
 
 /// Renders the tokens-per-day chart: one stacked bar per day that has data,
-/// input tokens at the bottom and output tokens on top.
+/// input tokens at the bottom and output tokens on top, in the palette of
+/// `theme`.
 ///
 /// Heights are normalized to the largest daily total, and days without data
 /// stay empty slots so the axis keeps a fixed 1 through 31 extent. An empty
 /// result or a series of unparsable day labels renders a placeholder note.
-pub(crate) fn daily_token_bars(rows: &[DayUsage]) -> String {
+pub(crate) fn daily_token_bars(rows: &[DayUsage], theme: ChartTheme) -> String {
     let bars = token_series(rows);
     if bars.is_empty() {
-        return placeholder_chart(TOKENS_LABEL);
+        return placeholder_chart(TOKENS_LABEL, theme);
     }
-    render_chart(TOKENS_LABEL, &bars, ChartKind::Stacked)
+    render_chart(TOKENS_LABEL, &bars, ChartKind::Stacked, theme)
 }
 
 /// Renders the cost-per-day chart: one bar per day, already priced by the
-/// caller.
+/// caller, in the palette of `theme`.
 ///
 /// The series is `(day label, micro-USD)` and is summed per day here, so the
 /// caller can hand over one entry per query group instead of pre-bucketing.
 /// See the module docs for why cost does not travel as [`DayUsage`].
-pub(crate) fn daily_cost_bars(costs: &[(String, i64)]) -> String {
+pub(crate) fn daily_cost_bars(costs: &[(String, i64)], theme: ChartTheme) -> String {
     let bars = cost_series(costs);
     if bars.is_empty() {
-        return placeholder_chart(COST_LABEL);
+        return placeholder_chart(COST_LABEL, theme);
     }
-    render_chart(COST_LABEL, &bars, ChartKind::Single)
+    render_chart(COST_LABEL, &bars, ChartKind::Single, theme)
 }
 
 /// Buckets the token rows into the fixed day slots.
@@ -282,13 +415,13 @@ fn cost_series(costs: &[(String, i64)]) -> Vec<DayBar> {
 /// and the tooltip figures always agree, and the class filter that narrows
 /// the aggregate narrows what the chart shows. An empty series renders a
 /// placeholder note, exactly like the other two charts.
-pub(crate) fn daily_status_code_bars(rows: &[DayStatusCodeUsage]) -> String {
+pub(crate) fn daily_status_code_bars(rows: &[DayStatusCodeUsage], theme: ChartTheme) -> String {
     let bars = status_code_series(rows);
     if bars.is_empty() {
-        return placeholder_chart(STATUS_LABEL);
+        return placeholder_chart(STATUS_LABEL, theme);
     }
-    let palette = code_palette(&bars);
-    render_status_code_chart(&bars, &palette)
+    let palette = code_palette(&bars, theme);
+    render_status_code_chart(&bars, &palette, theme)
 }
 
 /// Buckets the per-code rows into the fixed day slots, folding the codes of
@@ -317,7 +450,8 @@ fn status_code_series(rows: &[DayStatusCodeUsage]) -> Vec<StatusCodeBar> {
 /// Every code the series carries in canonical order, each with its color: the
 /// palette cycles in that order, so a code keeps one color across the bars and
 /// the legend, and two codes share a color only once the palette wraps.
-fn code_palette(bars: &[StatusCodeBar]) -> Vec<(Option<i64>, &'static str)> {
+fn code_palette(bars: &[StatusCodeBar], theme: ChartTheme) -> Vec<(Option<i64>, &'static str)> {
+    let status = theme.palette().status;
     let mut codes: Vec<Option<i64>> = bars
         .iter()
         .flat_map(|bar| bar.counts.iter().map(|(code, _)| *code))
@@ -327,17 +461,22 @@ fn code_palette(bars: &[StatusCodeBar]) -> Vec<(Option<i64>, &'static str)> {
     codes
         .into_iter()
         .enumerate()
-        .map(|(index, code)| (code, STATUS_CODE_PALETTE[index % STATUS_CODE_PALETTE.len()]))
+        .map(|(index, code)| (code, status[index % status.len()]))
         .collect()
 }
 
-/// The color of one code, from the series palette.
-fn code_fill(palette: &[(Option<i64>, &'static str)], status: Option<i64>) -> &'static str {
+/// The color of one code, from the series palette, or the muted color of the
+/// theme for a code the palette does not carry.
+fn code_fill(
+    palette: &[(Option<i64>, &'static str)],
+    status: Option<i64>,
+    muted: &'static str,
+) -> &'static str {
     palette
         .iter()
         .find(|(code, _)| *code == status)
         .map(|(_, fill)| *fill)
-        .unwrap_or(MUTED_FILL)
+        .unwrap_or(muted)
 }
 
 /// Day of the month a `YYYY-MM-DD` (or bare day) label names, `None` when
@@ -348,14 +487,14 @@ fn day_number(day: &str) -> Option<u32> {
 }
 
 /// One complete chart: frame, axes, bars, closing tag.
-fn render_chart(label: &str, bars: &[DayBar], kind: ChartKind) -> String {
+fn render_chart(label: &str, bars: &[DayBar], kind: ChartKind, theme: ChartTheme) -> String {
     let max = bars.iter().map(DayBar::total).max().unwrap_or(0);
     let scale = if max > 0 { PLOT_H / max as f64 } else { 0.0 };
     let mut svg = String::new();
     push_open(&mut svg, label);
-    push_axes(&mut svg, &kind.max_label(max));
+    push_axes(&mut svg, &kind.max_label(max), theme);
     for bar in bars {
-        push_bar(&mut svg, bar, kind, scale);
+        push_bar(&mut svg, bar, kind, scale, theme);
     }
     push_close(&mut svg);
     svg
@@ -367,31 +506,37 @@ fn render_chart(label: &str, bars: &[DayBar], kind: ChartKind) -> String {
 fn render_status_code_chart(
     bars: &[StatusCodeBar],
     palette: &[(Option<i64>, &'static str)],
+    theme: ChartTheme,
 ) -> String {
     let max = bars.iter().map(StatusCodeBar::total).max().unwrap_or(0);
     let scale = if max > 0 { PLOT_H / max as f64 } else { 0.0 };
     let mut svg = String::new();
     push_open(&mut svg, STATUS_LABEL);
-    push_axes(&mut svg, &format!("max {} requests", compact_count(max)));
+    push_axes(
+        &mut svg,
+        &format!("max {} requests", compact_count(max)),
+        theme,
+    );
     for bar in bars {
-        push_status_code_bar(&mut svg, bar, palette, scale);
+        push_status_code_bar(&mut svg, bar, palette, scale, theme);
     }
-    push_code_legend(&mut svg, palette);
+    push_code_legend(&mut svg, palette, theme);
     push_close(&mut svg);
     svg
 }
 
 /// A valid chart carrying only the note that the series is empty.
-fn placeholder_chart(label: &str) -> String {
+fn placeholder_chart(label: &str, theme: ChartTheme) -> String {
     let mut svg = String::new();
     push_open(&mut svg, label);
-    push_baseline(&mut svg);
+    push_baseline(&mut svg, theme);
     let _ = write!(
         svg,
         "<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"13\" \
-         fill=\"{MUTED_FILL}\">{EMPTY_NOTE}</text>",
+         fill=\"{}\">{EMPTY_NOTE}</text>",
         PAD_LEFT + PLOT_W / 2.0,
         PAD_TOP + PLOT_H / 2.0,
+        theme.palette().muted,
     );
     push_close(&mut svg);
     svg
@@ -414,20 +559,23 @@ fn push_close(svg: &mut String) {
 }
 
 /// Draws the top gridline, the baseline, the largest value and the sparse
-/// day labels.
-fn push_axes(svg: &mut String, max_label: &str) {
+/// day labels, in the rules and the muted color of `theme`.
+fn push_axes(svg: &mut String, max_label: &str, theme: ChartTheme) {
+    let palette = theme.palette();
     let right = PAD_LEFT + PLOT_W;
     let _ = write!(
         svg,
         "<line x1=\"{PAD_LEFT:.2}\" y1=\"{PAD_TOP:.2}\" x2=\"{right:.2}\" y2=\"{PAD_TOP:.2}\" \
-         stroke=\"{BORDER_STROKE}\" stroke-width=\"1\"/>",
+         stroke=\"{}\" stroke-width=\"1\"/>",
+        palette.border,
     );
-    push_baseline(svg);
+    push_baseline(svg, theme);
     let _ = write!(
         svg,
         "<text x=\"{PAD_LEFT:.2}\" y=\"{:.2}\" text-anchor=\"start\" font-size=\"11\" \
-         fill=\"{MUTED_FILL}\">{max_label}</text>",
+         fill=\"{}\">{max_label}</text>",
         PAD_TOP - 6.0,
+        palette.muted,
     );
     for day in 1..=DAY_SLOTS {
         if !labelled(day) {
@@ -436,20 +584,22 @@ fn push_axes(svg: &mut String, max_label: &str) {
         let _ = write!(
             svg,
             "<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"11\" \
-             fill=\"{MUTED_FILL}\">{day}</text>",
+             fill=\"{}\">{day}</text>",
             slot_center(day),
             BASE_Y + 18.0,
+            palette.muted,
         );
     }
 }
 
 /// The x-axis rule bars grow from.
-fn push_baseline(svg: &mut String) {
+fn push_baseline(svg: &mut String, theme: ChartTheme) {
     let _ = write!(
         svg,
         "<line x1=\"{PAD_LEFT:.2}\" y1=\"{BASE_Y:.2}\" x2=\"{:.2}\" y2=\"{BASE_Y:.2}\" \
-         stroke=\"{BORDER_STROKE}\" stroke-width=\"1\"/>",
+         stroke=\"{}\" stroke-width=\"1\"/>",
         PAD_LEFT + PLOT_W,
+        theme.palette().border,
     );
 }
 
@@ -457,14 +607,15 @@ fn push_baseline(svg: &mut String) {
 ///
 /// A day whose total is zero keeps its title but draws no rectangle, so the
 /// chart never invents a height that carries no usage.
-fn push_bar(svg: &mut String, bar: &DayBar, kind: ChartKind, scale: f64) {
+fn push_bar(svg: &mut String, bar: &DayBar, kind: ChartKind, scale: f64, theme: ChartTheme) {
+    let palette = theme.palette();
     let input_h = (bar.input as f64 * scale).min(PLOT_H);
     let output_h = (bar.output as f64 * scale).min(PLOT_H - input_h);
     let _ = write!(svg, "<g><title>{}</title>", bar_title(bar, kind));
     if input_h > 0.0 {
         let fill = match kind {
-            ChartKind::Stacked => ACCENT_FILL,
-            ChartKind::Single => COST_FILL,
+            ChartKind::Stacked => palette.accent,
+            ChartKind::Single => palette.cost,
         };
         push_rect(svg, bar.day, BASE_Y - input_h, input_h, fill);
     }
@@ -474,7 +625,7 @@ fn push_bar(svg: &mut String, bar: &DayBar, kind: ChartKind, scale: f64) {
             bar.day,
             BASE_Y - input_h - output_h,
             output_h,
-            MUTED_FILL,
+            palette.muted,
         );
     }
     svg.push_str("</g>");
@@ -500,6 +651,7 @@ fn push_status_code_bar(
     bar: &StatusCodeBar,
     palette: &[(Option<i64>, &'static str)],
     scale: f64,
+    theme: ChartTheme,
 ) {
     let _ = write!(svg, "<g><title>{}</title>", status_code_bar_title(bar));
     let mut top = BASE_Y;
@@ -509,7 +661,8 @@ fn push_status_code_bar(
             continue;
         }
         top -= height;
-        push_rect(svg, bar.day, top, height, code_fill(palette, *code));
+        let fill = code_fill(palette, *code, theme.palette().muted);
+        push_rect(svg, bar.day, top, height, fill);
     }
     svg.push_str("</g>");
 }
@@ -521,7 +674,7 @@ fn push_status_code_bar(
 /// markup, so the colors are explained where they appear. The entries are
 /// laid out from the right edge with an estimated character width, which is
 /// enough for a row of three digit codes and costs no text metrics engine.
-fn push_code_legend(svg: &mut String, palette: &[(Option<i64>, &'static str)]) {
+fn push_code_legend(svg: &mut String, palette: &[(Option<i64>, &'static str)], theme: ChartTheme) {
     /// Side of a legend swatch.
     const SWATCH: f64 = 9.0;
     /// Gap between a swatch and its label.
@@ -541,8 +694,9 @@ fn push_code_legend(svg: &mut String, palette: &[(Option<i64>, &'static str)]) {
             legend,
             "<rect x=\"{swatch_x:.2}\" y=\"{:.2}\" width=\"{SWATCH:.2}\" height=\"{SWATCH:.2}\" \
              fill=\"{fill}\"/><text x=\"{text_x:.2}\" y=\"{baseline:.2}\" text-anchor=\"start\" \
-             font-size=\"11\" fill=\"{MUTED_FILL}\">{label}</text>",
+             font-size=\"11\" fill=\"{}\">{label}</text>",
             baseline - 4.0 - SWATCH / 2.0,
+            theme.palette().muted,
         );
         right = swatch_x - ENTRY_GAP;
     }
@@ -725,7 +879,7 @@ mod tests {
 
     #[test]
     fn empty_status_code_rows_render_a_placeholder_chart() {
-        let svg = daily_status_code_bars(&[]);
+        let svg = daily_status_code_bars(&[], ChartTheme::Light);
         assert!(svg.starts_with("<svg "));
         assert!(svg.ends_with("</svg>"));
         assert!(svg.contains(EMPTY_NOTE));
@@ -741,7 +895,7 @@ mod tests {
             code_row("2026-11-00", Some(200), 1),
             code_row("2026-11-32", Some(200), 1),
         ];
-        let svg = daily_status_code_bars(&rows);
+        let svg = daily_status_code_bars(&rows, ChartTheme::Light);
         assert!(svg.contains(EMPTY_NOTE));
         assert_eq!(count(&svg, "<rect"), 0);
     }
@@ -754,7 +908,7 @@ mod tests {
             code_row("2026-11-04", Some(200), 4),
             code_row("2026-11-04", Some(404), 3),
         ];
-        let svg = daily_status_code_bars(&rows);
+        let svg = daily_status_code_bars(&rows, ChartTheme::Light);
         let (bars, legend) = bars_only(&svg);
         assert_eq!(count(bars, "<rect"), 4, "one segment per code: {bars}");
         // The bottom segment is drawn first, so the order in the markup is
@@ -785,7 +939,7 @@ mod tests {
             code_row("2026-11-01", Some(503), 1),
             code_row("2026-11-01", None, 1),
         ];
-        let svg = daily_status_code_bars(&rows);
+        let svg = daily_status_code_bars(&rows, ChartTheme::Light);
         let (bars, legend) = bars_only(&svg);
         for label in ["200", "503", "n/a (other)"] {
             assert!(
@@ -839,7 +993,7 @@ mod tests {
             .iter()
             .map(|code| code_row("2026-11-01", *code, 1))
             .collect();
-        let svg = daily_status_code_bars(&rows);
+        let svg = daily_status_code_bars(&rows, ChartTheme::Light);
         let (bars, legend) = bars_only(&svg);
         assert_eq!(count(bars, "<rect"), codes.len());
         assert_eq!(
@@ -858,7 +1012,8 @@ mod tests {
 
     #[test]
     fn a_day_with_one_code_draws_one_segment_and_keeps_its_title() {
-        let svg = daily_status_code_bars(&[code_row("2026-11-07", Some(503), 2)]);
+        let svg =
+            daily_status_code_bars(&[code_row("2026-11-07", Some(503), 2)], ChartTheme::Light);
         let (bars, _) = bars_only(&svg);
         assert_eq!(count(bars, "<rect"), 1);
         assert_eq!(rects(bars, STATUS_CODE_PALETTE[0]), 1);
@@ -873,7 +1028,8 @@ mod tests {
 
     #[test]
     fn a_status_code_day_with_no_requests_keeps_a_title_without_a_segment() {
-        let svg = daily_status_code_bars(&[code_row("2026-11-07", Some(200), 0)]);
+        let svg =
+            daily_status_code_bars(&[code_row("2026-11-07", Some(200), 0)], ChartTheme::Light);
         let (bars, _) = bars_only(&svg);
         assert_eq!(count(bars, "<rect"), 0);
         assert_eq!(count(bars, "<title>"), 1);
@@ -887,7 +1043,7 @@ mod tests {
         let rows: Vec<DayStatusCodeUsage> = (1..=DAY_SLOTS)
             .map(|day| code_row(&format!("2026-11-{day:02}"), Some(200), 1))
             .collect();
-        let svg = daily_status_code_bars(&rows);
+        let svg = daily_status_code_bars(&rows, ChartTheme::Light);
         let (bars, _) = bars_only(&svg);
         assert_eq!(count(bars, "<g><title>"), DAY_SLOTS as usize);
         assert_eq!(count(bars, "<rect"), DAY_SLOTS as usize);
@@ -911,12 +1067,12 @@ mod tests {
         let mut reversed = sample();
         reversed.reverse();
         assert_eq!(
-            daily_status_code_bars(&sample()),
-            daily_status_code_bars(&sample())
+            daily_status_code_bars(&sample(), ChartTheme::Light),
+            daily_status_code_bars(&sample(), ChartTheme::Light)
         );
         assert_eq!(
-            daily_status_code_bars(&sample()),
-            daily_status_code_bars(&reversed),
+            daily_status_code_bars(&sample(), ChartTheme::Light),
+            daily_status_code_bars(&reversed, ChartTheme::Light),
             "the colors follow the canonical code order, not the row order"
         );
     }
@@ -927,7 +1083,7 @@ mod tests {
             code_row("2026-11-01", Some(200), i64::MAX),
             code_row("2026-11-01", Some(500), i64::MAX),
         ];
-        let svg = daily_status_code_bars(&rows);
+        let svg = daily_status_code_bars(&rows, ChartTheme::Light);
         let (bars, _) = bars_only(&svg);
         // Saturation drops the segment that no longer fits, but no
         // coordinate ever leaves the plot.
@@ -941,14 +1097,14 @@ mod tests {
 
     #[test]
     fn empty_rows_render_a_placeholder_chart() {
-        let svg = daily_token_bars(&[]);
+        let svg = daily_token_bars(&[], ChartTheme::Light);
         assert!(svg.starts_with("<svg "));
         assert!(svg.ends_with("</svg>"));
         assert!(svg.contains(EMPTY_NOTE));
         assert_eq!(count(&svg, "<rect"), 0);
         assert_eq!(count(&svg, "<title>"), 0);
 
-        let cost = daily_cost_bars(&[]);
+        let cost = daily_cost_bars(&[], ChartTheme::Light);
         assert!(cost.contains(EMPTY_NOTE));
         assert_eq!(count(&cost, "<rect"), 0);
     }
@@ -960,7 +1116,7 @@ mod tests {
             row("2026-11-00", None, 10, 10, 1),
             row("2026-11-32", None, 10, 10, 1),
         ];
-        let svg = daily_token_bars(&rows);
+        let svg = daily_token_bars(&rows, ChartTheme::Light);
         assert!(svg.contains(EMPTY_NOTE));
         assert_eq!(count(&svg, "<rect"), 0);
     }
@@ -968,7 +1124,7 @@ mod tests {
     #[test]
     fn single_day_fills_the_plot() {
         let rows = [row("2026-11-03", Some("gpt-4o"), 100, 100, 2)];
-        let svg = daily_token_bars(&rows);
+        let svg = daily_token_bars(&rows, ChartTheme::Light);
         // Two segments, both scaled by the same factor, the taller one
         // reaching the top gridline.
         assert_eq!(count(&svg, "<rect"), 2);
@@ -983,7 +1139,7 @@ mod tests {
         let rows: Vec<DayUsage> = (1..=DAY_SLOTS)
             .map(|day| row(&format!("2026-11-{day:02}"), None, 1, 0, 1))
             .collect();
-        let svg = daily_token_bars(&rows);
+        let svg = daily_token_bars(&rows, ChartTheme::Light);
         assert_eq!(count(&svg, "<g><title>"), DAY_SLOTS as usize);
         // One input segment per day; the output value is zero.
         assert_eq!(count(&svg, "<rect"), DAY_SLOTS as usize);
@@ -994,7 +1150,7 @@ mod tests {
     #[test]
     fn day_labels_are_sparse() {
         let rows = [row("2026-11-01", None, 1, 1, 1)];
-        let svg = daily_token_bars(&rows);
+        let svg = daily_token_bars(&rows, ChartTheme::Light);
         // Days 1, 5, 10, 15, 20, 25 and 30 carry a day label; the
         // largest-value label above the plot is the only left-anchored one.
         assert_eq!(count(&svg, "text-anchor=\"middle\""), 7);
@@ -1006,9 +1162,12 @@ mod tests {
     fn zero_values_draw_a_title_without_a_bar() {
         // Both segments are drawn while the values are non-zero.
         let rows = [row("2026-11-07", None, 1, 2, 3)];
-        assert_eq!(count(&daily_token_bars(&rows), "<rect"), 2);
+        assert_eq!(
+            count(&daily_token_bars(&rows, ChartTheme::Light), "<rect"),
+            2
+        );
         let zero = [row("2026-11-07", None, 0, 0, 0)];
-        let svg = daily_token_bars(&zero);
+        let svg = daily_token_bars(&zero, ChartTheme::Light);
         assert_eq!(count(&svg, "<title>"), 1);
         assert_eq!(count(&svg, "<rect"), 0);
         assert!(svg.contains("Day 7: 0 tokens (0 in, 0 out) in 0 requests"));
@@ -1023,7 +1182,7 @@ mod tests {
             row("2026-11-01", None, i64::MAX, i64::MAX, i64::MAX),
             row("2026-11-02", None, i64::MAX, 0, 0),
         ];
-        let svg = daily_token_bars(&rows);
+        let svg = daily_token_bars(&rows, ChartTheme::Light);
         // Saturation loses the second segment of the first day, but no
         // coordinate ever leaves the plot.
         assert_eq!(count(&svg, "<rect"), 2);
@@ -1043,7 +1202,7 @@ mod tests {
             row("2026-11-05", None, 10_000, 5, 1),
             row("2026-11-05", Some("gpt-4o"), 20_000, 5, 1),
         ];
-        let svg = daily_token_bars(&rows);
+        let svg = daily_token_bars(&rows, ChartTheme::Light);
         assert_eq!(count(&svg, "<rect"), 2);
         assert!(svg.contains("Day 5: 30,010 tokens (30,000 in, 10 out) in 2 requests"));
     }
@@ -1061,8 +1220,14 @@ mod tests {
         }
         let mut reversed = sample();
         reversed.reverse();
-        assert_eq!(daily_token_bars(&sample()), daily_token_bars(&sample()));
-        assert_eq!(daily_token_bars(&sample()), daily_token_bars(&reversed));
+        assert_eq!(
+            daily_token_bars(&sample(), ChartTheme::Light),
+            daily_token_bars(&sample(), ChartTheme::Light)
+        );
+        assert_eq!(
+            daily_token_bars(&sample(), ChartTheme::Light),
+            daily_token_bars(&reversed, ChartTheme::Light)
+        );
     }
 
     #[test]
@@ -1090,7 +1255,7 @@ mod tests {
             ("2026-11-03".to_owned(), 60_000),
             ("bogus".to_owned(), 1),
         ];
-        let svg = daily_cost_bars(&costs);
+        let svg = daily_cost_bars(&costs, ChartTheme::Light);
         assert_eq!(count(&svg, "<rect"), 2);
         assert_eq!(rects(&svg, COST_FILL), 2);
         assert_eq!(rects(&svg, ACCENT_FILL), 0);
@@ -1106,12 +1271,15 @@ mod tests {
             ("2026-11-01".to_owned(), i64::MAX),
             ("2026-11-02".to_owned(), i64::MAX),
         ];
-        let svg = daily_cost_bars(&costs);
+        let svg = daily_cost_bars(&costs, ChartTheme::Light);
         assert_eq!(count(&svg, "<rect"), 2);
         assert!(!svg.contains("NaN"));
         assert!(!svg.contains("y=\"-"));
         assert!(svg.contains("y=\"20.00\""));
-        assert_eq!(daily_cost_bars(&costs), daily_cost_bars(&costs));
+        assert_eq!(
+            daily_cost_bars(&costs, ChartTheme::Light),
+            daily_cost_bars(&costs, ChartTheme::Light)
+        );
     }
 
     #[test]
@@ -1136,5 +1304,96 @@ mod tests {
         assert_eq!(compact_usd(999_999_999), "$1000.00");
         assert_eq!(compact_usd(1_500_000_000), "$1.5K");
         assert_eq!(compact_usd(i64::MAX), "$9.2T");
+    }
+
+    /// A request carrying one `Cookie` header value.
+    fn cookies(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::COOKIE, value.parse().unwrap());
+        headers
+    }
+
+    #[test]
+    fn the_dark_theme_keeps_every_chart_in_the_dark_palette() {
+        let rows = [row("2026-11-01", None, 100, 50, 1)];
+        let svg = daily_token_bars(&rows, ChartTheme::Dark);
+        assert_eq!(rects(&svg, DARK_ACCENT_FILL), 1, "{svg}");
+        assert_eq!(rects(&svg, DARK_MUTED_FILL), 1, "{svg}");
+        assert_eq!(
+            rects(&svg, ACCENT_FILL),
+            0,
+            "no light color in a dark chart"
+        );
+        assert_eq!(rects(&svg, MUTED_FILL), 0, "no light color in a dark chart");
+        assert_eq!(
+            count(&svg, &format!("stroke=\"{DARK_BORDER_STROKE}\"")),
+            2,
+            "both axis rules follow the theme: {svg}"
+        );
+
+        let costs = [("2026-11-01".to_owned(), 1_000_000)];
+        let svg = daily_cost_bars(&costs, ChartTheme::Dark);
+        assert_eq!(rects(&svg, DARK_COST_FILL), 1, "{svg}");
+        assert_eq!(rects(&svg, COST_FILL), 0, "no light color in a dark chart");
+
+        let rows = [code_row("2026-11-01", Some(500), 2)];
+        let svg = daily_status_code_bars(&rows, ChartTheme::Dark);
+        let (bars, legend) = bars_only(&svg);
+        assert_eq!(rects(bars, DARK_STATUS_CODE_PALETTE[0]), 1, "{bars}");
+        assert_eq!(rects(bars, STATUS_CODE_PALETTE[0]), 0, "{bars}");
+        assert_eq!(
+            rects(legend, DARK_STATUS_CODE_PALETTE[0]),
+            1,
+            "the legend swatch keeps the dark color: {legend}"
+        );
+        assert!(
+            count(
+                &svg,
+                &format!("font-size=\"11\" fill=\"{DARK_MUTED_FILL}\"")
+            ) >= 8,
+            "the axis labels and the legend entry keep the dark muted color: {svg}"
+        );
+    }
+
+    #[test]
+    fn an_empty_series_notes_it_in_the_color_of_the_theme() {
+        let svg = daily_token_bars(&[], ChartTheme::Dark);
+        assert!(svg.contains(EMPTY_NOTE), "{svg}");
+        assert!(
+            svg.contains(&format!("fill=\"{DARK_MUTED_FILL}\"")),
+            "{svg}"
+        );
+        assert!(
+            !svg.contains(MUTED_FILL),
+            "the light note color is gone: {svg}"
+        );
+        assert!(
+            svg.contains(&format!("stroke=\"{DARK_BORDER_STROKE}\"")),
+            "the placeholder baseline follows the theme: {svg}"
+        );
+    }
+
+    #[test]
+    fn the_theme_cookie_of_a_page_selects_the_palette() {
+        assert_eq!(theme_from_headers(&HeaderMap::new()), ChartTheme::Light);
+        assert_eq!(theme_from_headers(&cookies("theme=dark")), ChartTheme::Dark);
+        assert_eq!(
+            theme_from_headers(&cookies("other=1; theme=dark ; more=2")),
+            ChartTheme::Dark,
+            "the cookie is found among others and its value is trimmed"
+        );
+        for value in [
+            "theme=light",
+            "theme=Dark",
+            "theme=",
+            "theme=darkish",
+            "hydra_admin_session=abc",
+        ] {
+            assert_eq!(
+                theme_from_headers(&cookies(value)),
+                ChartTheme::Light,
+                "{value} names no dark theme"
+            );
+        }
     }
 }

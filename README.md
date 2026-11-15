@@ -278,9 +278,12 @@ marked `Secure`, which browsers honour on https and on `localhost` and
 IP should get TLS. Pages are
 compiled from askama templates with vendored htmx 2.0.11 (self-hosted, no
 CDN, no JavaScript build step) and a small custom stylesheet, desktop-first
-by design. Every mutating UI request is checked against same-origin browser
-metadata (`Sec-Fetch-Site` and `Origin`) and rejected with 403 when it is
-cross-site.
+by design. That stylesheet carries a light and a dark theme; the dark one
+follows the colour preference of the operating system until the sun and moon
+button in the header stores a choice of its own, and the charts of the stats
+pages follow the same choice. Every mutating UI request is checked against
+same-origin browser metadata (`Sec-Fetch-Site` and `Origin`) and rejected
+with 403 when it is cross-site.
 
 ![Channels page](docs/screenshots/channels.png)
 

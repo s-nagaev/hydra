@@ -1,14 +1,15 @@
 // Admin UI helpers, self-hosted like admin.css and htmx.min.js: no build
 // step, no dependencies, embedded into the binary with include_bytes!.
 //
-// Two behaviors live here. The log detail page shows captured bodies inside
+// Three behaviors live here. The log detail page shows captured bodies inside
 // <pre class="code-snippet"> elements. A body is attacker-influenced input, so
 // the highlighter reads the element with textContent, tokenizes the JSON in
 // that string, and rebuilds the element out of text nodes and <span>
 // elements. Raw body text never becomes an HTML string. Forms on the detail
 // pages carry no htmx, so a destructive one names its question in
 // data-confirm and the submit listener asks the browser's own confirm dialog
-// before the request leaves.
+// before the request leaves. The header carries the theme toggle, which flips
+// the stored choice the inline head script already applied.
 (function () {
   "use strict";
 
@@ -76,10 +77,55 @@
     }
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", run);
-  } else {
+  // The theme toggle of the header. The inline script in <head> has already
+  // applied the stored theme and written the cookie the stats pages read, so
+  // this only has to keep the button in step and to handle the flip. A page
+  // carrying server-rendered charts reloads once: the SVG colors are chosen
+  // on the server, and the reload is what gives the new theme's palette to
+  // the bars, the axes and the legend of the page already on screen.
+  function applyTheme(theme) {
+    document.documentElement.setAttribute("data-theme", theme);
+    try {
+      window.localStorage.setItem("hydra-theme", theme);
+    } catch (error) {
+      // A browser that refuses storage keeps the theme of this page anyway.
+    }
+    document.cookie = "theme=" + theme + "; path=/; max-age=31536000; samesite=lax";
+    var button = document.getElementById("theme-toggle");
+    if (button) {
+      var dark = theme === "dark";
+      button.setAttribute("aria-pressed", dark ? "true" : "false");
+      button.setAttribute("aria-label", dark ? "Switch to light theme" : "Switch to dark theme");
+    }
+  }
+
+  function activeTheme() {
+    return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light";
+  }
+
+  function initToggle() {
+    var button = document.getElementById("theme-toggle");
+    if (!button) {
+      return;
+    }
+    applyTheme(activeTheme());
+    button.addEventListener("click", function () {
+      applyTheme(activeTheme() === "dark" ? "light" : "dark");
+      if (document.querySelector(".chart-block")) {
+        window.location.reload();
+      }
+    });
+  }
+
+  function start() {
     run();
+    initToggle();
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", start);
+  } else {
+    start();
   }
 
   // Confirmation for a destructive form on a page without htmx: the form

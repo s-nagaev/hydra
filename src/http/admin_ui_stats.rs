@@ -82,6 +82,7 @@ use askama::Template;
 use askama_web::WebTemplate;
 use axum::extract::rejection::QueryRejection;
 use axum::extract::{Query, State};
+use axum::http::HeaderMap;
 use axum::routing::get;
 use axum::Router;
 use serde::Deserialize;
@@ -996,7 +997,7 @@ fn day_group(day: &DayUsage) -> ModelUsage {
 /// contributes zero, exactly as it does in the table. `None` when the
 /// filtered range has no day rows at all, which is when the page shows its
 /// empty state instead of an empty plot.
-fn tokens_charts(data: &TokensData) -> Option<TokenCharts> {
+fn tokens_charts(data: &TokensData, theme: stats_chart::ChartTheme) -> Option<TokenCharts> {
     if data.days.is_empty() {
         return None;
     }
@@ -1022,8 +1023,8 @@ fn tokens_charts(data: &TokensData) -> Option<TokenCharts> {
         })
         .collect();
     Some(TokenCharts {
-        tokens_svg: stats_chart::daily_token_bars(&data.days),
-        cost_svg: stats_chart::daily_cost_bars(&costs),
+        tokens_svg: stats_chart::daily_token_bars(&data.days, theme),
+        cost_svg: stats_chart::daily_cost_bars(&costs, theme),
     })
 }
 
@@ -1035,7 +1036,12 @@ fn tokens_charts(data: &TokensData) -> Option<TokenCharts> {
 /// rows already carry the range, key and model filters, so the table and the
 /// charts can never disagree about a request. A key left with no group
 /// disappears whole, exactly like a key with no usage in the range at all.
-fn build_tokens_page(data: TokensData, filters: &Filters, error: Option<String>) -> TokensPage {
+fn build_tokens_page(
+    data: TokensData,
+    filters: &Filters,
+    error: Option<String>,
+    theme: stats_chart::ChartTheme,
+) -> TokensPage {
     let mut page = tokens_shell(&data.range, filters, error);
     let mut grand = Sums::default();
     let mut rows: Vec<StatsRow> = Vec::new();
@@ -1094,7 +1100,7 @@ fn build_tokens_page(data: TokensData, filters: &Filters, error: Option<String>)
 
     page.key_options = key_options(&data.keys, filters.key_id);
     page.model_options = model_options(&data.models, filters.model.as_deref());
-    page.charts = tokens_charts(&data);
+    page.charts = tokens_charts(&data, theme);
     page.grand = grand.display();
     page.rows = rows;
     page
@@ -1112,6 +1118,7 @@ fn build_requests_page(
     data: RequestsData,
     filters: &Filters,
     error: Option<String>,
+    theme: stats_chart::ChartTheme,
 ) -> RequestsPage {
     let mut page = requests_shell(&data.range, filters, error);
     page.key_options = key_options(&data.keys, filters.key_id);
@@ -1119,7 +1126,7 @@ fn build_requests_page(
     page.status_options = status_options(filters.status_class);
     page.status_codes = status_code_rows(&data.status_code_totals);
     page.status_svg = (!data.status_code_days.is_empty())
-        .then(|| stats_chart::daily_status_code_bars(&data.status_code_days));
+        .then(|| stats_chart::daily_status_code_bars(&data.status_code_days, theme));
     if page.status_svg.is_some() || !page.status_codes.is_empty() {
         page.empty_message.clear();
     }
@@ -1185,12 +1192,14 @@ fn resolve_view(
 /// date range, under the key and model filters of the URL.
 pub async fn tokens_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     _auth: UiAuth,
     query: Result<Query<StatsQuery>, QueryRejection>,
 ) -> TokensPage {
     let (range, filters, error) = resolve_view(query, false);
+    let theme = stats_chart::theme_from_headers(&headers);
     match load_tokens(&state, &range, &filters).await {
-        Ok(data) => build_tokens_page(data, &filters, error),
+        Ok(data) => build_tokens_page(data, &filters, error, theme),
         Err(message) => tokens_shell(&range, &filters, Some(message)),
     }
 }
@@ -1200,12 +1209,14 @@ pub async fn tokens_page(
 /// URL, which narrow the whole page.
 pub async fn requests_page(
     State(state): State<AppState>,
+    headers: HeaderMap,
     _auth: UiAuth,
     query: Result<Query<StatsQuery>, QueryRejection>,
 ) -> RequestsPage {
     let (range, filters, error) = resolve_view(query, true);
+    let theme = stats_chart::theme_from_headers(&headers);
     match load_requests(&state, &range, &filters).await {
-        Ok(data) => build_requests_page(data, &filters, error),
+        Ok(data) => build_requests_page(data, &filters, error, theme),
         Err(message) => requests_shell(&range, &filters, Some(message)),
     }
 }
@@ -1753,7 +1764,12 @@ mod tests {
             ],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         assert_eq!(page.rows.len(), 3, "two models plus the total line");
         assert_eq!(page.section, "tokens");
         assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
@@ -1804,7 +1820,12 @@ mod tests {
         day.cached_input_tokens = 250;
         day.cache_write_input_tokens = 50;
         let data = tokens_data(vec![day], HashMap::from([(7, channel_info_write_priced())]));
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         let row = &page.rows[0];
         assert_eq!(row.model_label, "claude");
         assert_eq!(row.sums.cache_write_input_tokens, "50");
@@ -1835,7 +1856,12 @@ mod tests {
             ],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         assert_eq!(page.rows.len(), 4, "one model line and one total per key");
         assert_eq!(page.rows[0].key_label, "hyd-4f9dEg2x");
         assert_eq!(page.rows[0].sums.cost, "$0.0045");
@@ -1854,7 +1880,12 @@ mod tests {
     #[test]
     fn a_key_without_usage_in_the_range_is_omitted_entirely() {
         let data = tokens_data(Vec::new(), HashMap::from([(7, channel_info_limitable())]));
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         assert!(page.rows.is_empty());
         assert_eq!(page.grand.cost, "$0.00");
         assert!(page.empty_message.contains("2026-11-01"));
@@ -1879,6 +1910,7 @@ mod tests {
                 ..Filters::default()
             },
             None,
+            stats_chart::ChartTheme::Light,
         );
         assert!(page.rows.is_empty());
         assert!(page
@@ -1895,7 +1927,12 @@ mod tests {
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, unlimitable)]),
         );
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         let total = page.rows.last().unwrap();
         assert!(total.is_total);
         assert!(total.limit_inactive, "the total line carries the warning");
@@ -1909,7 +1946,12 @@ mod tests {
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, unlimitable)]),
         );
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         assert!(!page.rows.last().unwrap().limit_inactive);
     }
 
@@ -1920,7 +1962,12 @@ mod tests {
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::new(),
         );
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         let total = page.rows.last().unwrap();
         assert_eq!(total.sums.cost, "$0.00");
         assert!(total.limit_inactive);
@@ -1935,7 +1982,12 @@ mod tests {
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         assert!(page.rows.iter().all(|row| row.key_deleted));
         assert_eq!(page.rows.len(), 2);
     }
@@ -2001,7 +2053,12 @@ mod tests {
         let mut data = tokens_data(vec![day], HashMap::from([(7, channel_info_limitable())]));
         data.models = vec!["gpt-4o".to_string()];
 
-        let page = build_tokens_page(data, &Filters::default(), None);
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         let plot = page.charts.expect("day rows draw both charts");
         assert!(plot.tokens_svg.starts_with("<svg "), "{}", plot.tokens_svg);
         assert!(plot.tokens_svg.contains("aria-label=\"Tokens per day\""));
@@ -2038,6 +2095,7 @@ mod tests {
                 ..Filters::default()
             },
             None,
+            stats_chart::ChartTheme::Light,
         );
         let plot = page
             .charts
@@ -2073,7 +2131,12 @@ mod tests {
                 },
             ],
         );
-        let page = build_requests_page(data, &Filters::default(), None);
+        let page = build_requests_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
         assert_eq!(page.section, "requests");
         assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
         let svg = page
@@ -2107,6 +2170,7 @@ mod tests {
                 ..Filters::default()
             },
             None,
+            stats_chart::ChartTheme::Light,
         );
         assert!(page.status_svg.is_none());
         assert!(page.status_codes.is_empty());

@@ -53,6 +53,27 @@ async fn get_page(db: &SqlitePool, uri: &str) -> Send {
     send(db, uri, Some(&auth_header())).await
 }
 
+/// One page request carrying the `theme` cookie the header toggle writes, so
+/// the server-side charts of the page are built for that theme.
+async fn get_page_with_theme(db: &SqlitePool, uri: &str, theme: &str) -> Send {
+    let app = test_app(db.clone());
+    let request = Request::builder()
+        .method("GET")
+        .uri(uri)
+        .header("Authorization", auth_header())
+        .header("Cookie", format!("theme={theme}"))
+        .body(Body::empty())
+        .unwrap();
+    let response = within(hydra::http::router(app).oneshot(request))
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = within(to_bytes(response.into_body(), usize::MAX))
+        .await
+        .unwrap();
+    (status, String::from_utf8(bytes.to_vec()).unwrap())
+}
+
 /// The `YYYY-MM` label of the current month, the prefix of the day range the
 /// page defaults to.
 fn current_month_label() -> String {
@@ -657,7 +678,13 @@ async fn the_selected_range_drives_the_rows_and_leaves_other_days_out() {
         !table_rows(&empty).contains(&prefix),
         "no rows for a range without usage"
     );
-    assert!(!empty.contains("<svg"), "no data means no chart: {empty}");
+    // The chart panel is where a chart would be drawn: the header carries
+    // its own icons, so the presence of an `<svg>` anywhere on the page no
+    // longer means a plot.
+    assert!(
+        !chart_panel(&empty).contains("<svg"),
+        "no data means no chart: {empty}"
+    );
 }
 #[tokio::test]
 async fn the_requests_page_reads_the_same_range_as_the_tokens_page() {
@@ -1327,10 +1354,84 @@ async fn the_charts_plot_the_range_and_agree_with_the_table() {
             .contains("No usage matches the current filters between 2026-06-01 and 2026-06-30"),
         "{filtered_out}"
     );
-    assert!(!filtered_out.contains("<svg"), "{filtered_out}");
+    assert!(
+        !chart_panel(&filtered_out).contains("<svg"),
+        "a filter that selects nothing draws no plot: {filtered_out}"
+    );
     assert!(
         option_is_selected(&filtered_out, "nope"),
         "the selection is visible even when it matches nothing: {filtered_out}"
+    );
+}
+
+#[tokio::test]
+async fn the_theme_cookie_decides_the_palette_of_the_charts() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "themed", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+
+    let uri = "/admin/ui/stats?from=2026-06-01&to=2026-06-30";
+    let (status, light) = get_page(&db, uri).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, dark) = get_page_with_theme(&db, uri, "dark").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The SVG is built on the server, so the palette of the page has to
+    // travel in a cookie: the toggle writes it, and a request without it
+    // keeps the light palette the stylesheet paints by default.
+    let light_charts = chart_panel(&light);
+    for fill in ["#2563eb", "#1e50c8", "#d9dde3"] {
+        assert!(
+            light_charts.contains(fill),
+            "the light charts use {fill}: {light_charts}"
+        );
+    }
+    let dark_charts = chart_panel(&dark);
+    for fill in ["#2f81f7", "#1f6feb", "#30363d", "#8b949e"] {
+        assert!(
+            dark_charts.contains(fill),
+            "the dark charts use {fill}: {dark_charts}"
+        );
+    }
+    for light_only in ["#2563eb", "#1e50c8", "#d9dde3"] {
+        assert!(
+            !dark_charts.contains(light_only),
+            "no light color survives in a dark chart: {dark_charts}"
+        );
+    }
+
+    // The requests chart cycles its status palette in the same theme.
+    let (status, dark_requests) = get_page_with_theme(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30",
+        "dark",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let requests_charts = chart_panel(&dark_requests);
+    assert!(
+        requests_charts.contains("fill=\"#3fb950\"/>"),
+        "the first dark status color: {requests_charts}"
+    );
+    assert!(
+        !requests_charts.contains("#15803d"),
+        "the light status palette is gone: {requests_charts}"
+    );
+
+    // A cookie holding anything else keeps the light charts, and an empty
+    // series keeps the note in the color of its theme.
+    let (_, other) = get_page_with_theme(&db, uri, "light").await;
+    assert!(chart_panel(&other).contains("#2563eb"), "{other}");
+    let (_, empty) = get_page_with_theme(
+        &db,
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&model=absent",
+        "dark",
+    )
+    .await;
+    assert!(
+        !chart_panel(&empty).contains("<svg"),
+        "an empty series draws no plot: {empty}"
     );
 }
 

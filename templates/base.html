@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Admin{% endblock %} · Hydra</title>
+  {% include "partials/theme_init.html" %}
   <link rel="stylesheet" href="/admin/ui/static/admin.css">
   <script src="/admin/ui/static/htmx.min.js" defer></script>
   <script src="/admin/ui/static/admin.js" defer></script>
@@ -24,6 +25,20 @@
         <a href="/admin/ui/stats/requests"
           {%- if section == "requests" %} class="active"{% endif %}>Requests</a>
       </nav>
+      <button class="theme-toggle" id="theme-toggle" type="button"
+        aria-label="Switch to dark theme" aria-pressed="false" title="Switch theme">
+        <svg class="icon-sun" viewBox="0 0 16 16" width="18" height="18"
+          aria-hidden="true" focusable="false">
+          <circle cx="8" cy="8" r="3.1" fill="currentColor"/>
+          <path d="M8 1.3v1.7M8 13v1.7M1.3 8h1.7M13 8h1.7M3.2 3.2l1.2 1.2M11.6 11.6l1.2 1.2M12.8 3.2l-1.2 1.2M4.4 11.6l-1.2 1.2"
+            stroke="currentColor" stroke-width="1.4" stroke-linecap="round" fill="none"/>
+        </svg>
+        <svg class="icon-moon" viewBox="0 0 16 16" width="18" height="18"
+          aria-hidden="true" focusable="false">
+          <path d="M6.88 1.49 A6.6 6.6 0 1 0 14.03 10.69 A6.0 6.0 0 0 1 6.88 1.49 Z"
+            fill="currentColor"/>
+        </svg>
+      </button>
       <a class="api-link" href="/swagger-ui">API</a>
       <form class="logout-form" method="post" action="/admin/ui/logout">
         <button type="submit">Log out</button>
