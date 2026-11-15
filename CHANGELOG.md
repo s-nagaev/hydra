@@ -8,6 +8,7 @@
 - Key and model filters on the admin UI Stat tab, combinable with the month picker and applied to the table and the charts alike. The month navigation links keep whatever filters are in force.
 - Requests-per-day chart on the admin UI Stat tab, stacking the response status classes (2xx, 4xx, 5xx and the rest, which includes requests that never reached an upstream) with a legend that names each color.
 - Status filter on the admin UI Stat tab: it narrows the requests chart to one status class, and the token and cost figures on the page keep counting every request of the month.
+- Per-status-code breakdown on the admin UI Stat tab: the requests-per-day chart stacks each exact response status code, a request that never reached an upstream being shown as n/a, and a status code table lists every code of the period with its class, its request count and its share of the requests the current filters select.
 
 ## 1.1.1 (2026-11-15)
 

@@ -1,8 +1,9 @@
 //! Integration tests for the admin UI stats page: the auth gate, month
 //! selection and navigation, per key and per model grouping with summed
 //! tokens and priced cost, the inactive-limit warning, the omission of keys
-//! without usage, soft-deleted keys, rows whose upstream reported no usage
-//! and the empty and malformed month states.
+//! without usage, soft-deleted keys, rows whose upstream reported no usage,
+//! the filters and charts, the per-status-code chart and table and the empty
+//! and malformed month states.
 //!
 //! Rows are seeded through the database layer with explicit timestamps, and
 //! the page itself is driven through the real router, so the tests pin the
@@ -73,6 +74,53 @@ fn chart_panel(html: &str) -> &str {
         Some((_, rest)) => rest,
         None => "",
     }
+}
+
+/// The status code panel, found by its heading. A page whose filters select
+/// no request renders no such panel, so the returned text is then empty.
+fn status_code_panel(html: &str) -> &str {
+    match html.split_once("<h2>Status codes") {
+        Some((_, rest)) => match rest.split_once("</section>") {
+            Some((panel, _)) => panel,
+            None => rest,
+        },
+        None => "",
+    }
+}
+
+/// The `(code, class, requests, share)` cells of the status code table, in
+/// the order the panel renders them.
+fn status_code_rows(html: &str) -> Vec<[String; 4]> {
+    let panel = status_code_panel(html);
+    let body = panel
+        .split_once("<tbody>")
+        .expect("the status code table renders")
+        .1;
+    let body = body.split_once("</tbody>").expect("the table is closed").0;
+    body.split("<tr>")
+        .skip(1)
+        .map(|row| {
+            let mut cells = row.split("<td").skip(1).map(|cell| {
+                cell.split_once('>')
+                    .expect("a cell opens")
+                    .1
+                    .split_once("</td>")
+                    .expect("a cell closes")
+                    .0
+                    .trim()
+                    .to_string()
+            });
+            let code = cells.next().expect("a code cell");
+            let class = cells.next().expect("a class cell");
+            let requests = cells.next().expect("a requests cell");
+            let share = cells.next().expect("a share cell");
+            assert!(
+                cells.next().is_none(),
+                "the table carries four columns: {row}"
+            );
+            [code, class, requests, share]
+        })
+        .collect()
 }
 
 /// Whether the option carrying `value` is the selected one.
@@ -856,13 +904,13 @@ async fn an_unparsable_key_id_shows_a_banner_and_filters_nothing() {
     );
 }
 
-// --- Status classes -------------------------------------------------------
+// --- Status codes and classes ---------------------------------------------
 
 #[tokio::test]
-async fn the_requests_chart_stacks_the_month_by_status_class() {
+async fn the_requests_chart_stacks_the_month_by_exact_status_code() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
-    let (key_id, _) = seed_key(&db, channel_id, "classes", None).await;
+    let (key_id, _) = seed_key(&db, channel_id, "codes", None).await;
     log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
     log_with_status(
         &db,
@@ -885,13 +933,13 @@ async fn the_requests_chart_stacks_the_month_by_status_class() {
         "{charts}"
     );
     assert!(
-        charts.contains("Day 1: 2 requests (1 2xx, 0 4xx, 1 5xx, 0 other)"),
-        "the bar splits the day by class: {charts}"
+        charts.contains("Day 1: 2 requests (1 200, 1 500)"),
+        "the bar splits the day by code: {charts}"
     );
-    for class in ["2xx", "4xx", "5xx", "other"] {
+    for code in ["200", "500"] {
         assert!(
-            charts.contains(&format!(">{class}</text>")),
-            "the legend names {class}: {charts}"
+            charts.contains(&format!(">{code}</text>")),
+            "the legend names {code}: {charts}"
         );
     }
 }
@@ -918,7 +966,7 @@ async fn the_status_filter_narrows_the_requests_chart_alone() {
     assert_eq!(status, StatusCode::OK);
     let charts = chart_panel(&html);
     assert!(
-        charts.contains("Day 1: 1 requests (0 2xx, 0 4xx, 1 5xx, 0 other)"),
+        charts.contains("Day 1: 1 requests (1 500)"),
         "the requests chart follows the filter: {charts}"
     );
     // Both requests of the day stay in the token and cost bars, and in the
@@ -942,10 +990,21 @@ async fn the_status_filter_narrows_the_requests_chart_alone() {
         option_is_selected(&html, "5xx"),
         "the filter in force is visible: {html}"
     );
+    // The status code table follows the same filter.
+    assert_eq!(
+        status_code_rows(&html),
+        vec![[
+            "500".to_string(),
+            "5xx".to_string(),
+            "1".to_string(),
+            "100.0%".to_string()
+        ]],
+        "{html}"
+    );
 
     // Without the filter the requests chart holds the whole day.
     let (_, unfiltered) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
-    assert!(chart_panel(&unfiltered).contains("Day 1: 2 requests (1 2xx, 0 4xx, 1 5xx, 0 other)"));
+    assert!(chart_panel(&unfiltered).contains("Day 1: 2 requests (1 200, 1 500)"));
     assert!(table_rows(&unfiltered).contains(">$0.00435<"));
 }
 
@@ -987,10 +1046,14 @@ async fn the_status_filter_rides_along_the_month_links() {
     assert!(html.contains("aria-label=\"Tokens per day\""), "{html}");
     assert!(html.contains("aria-label=\"Cost per day\""), "{html}");
     assert!(table_rows(&html).contains(">$0.004<"), "{html}");
+    assert!(
+        !html.contains("Status codes"),
+        "and so is the status code table: {html}"
+    );
 }
 
 #[tokio::test]
-async fn a_request_that_never_reached_an_upstream_counts_as_other() {
+async fn a_request_that_never_reached_an_upstream_is_listed_without_a_code() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (key_id, _) = seed_key(&db, channel_id, "failed", None).await;
@@ -1008,14 +1071,29 @@ async fn a_request_that_never_reached_an_upstream_counts_as_other() {
 
     let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
     assert_eq!(status, StatusCode::OK);
+    let charts = chart_panel(&html);
     assert!(
-        chart_panel(&html).contains("Day 2: 1 requests (0 2xx, 0 4xx, 0 5xx, 1 other)"),
+        charts.contains("Day 2: 1 requests (1 n/a)"),
+        "the unlabelled request is its own segment: {charts}"
+    );
+    assert!(
+        charts.contains(">n/a (other)</text>"),
+        "the legend names the bucket those requests land in: {charts}"
+    );
+    assert_eq!(
+        status_code_rows(&html),
+        vec![[
+            "n/a".to_string(),
+            "other".to_string(),
+            "1".to_string(),
+            "100.0%".to_string()
+        ]],
         "{html}"
     );
 
     let (_, other) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=other").await;
     assert!(
-        chart_panel(&other).contains("Day 2: 1 requests (0 2xx, 0 4xx, 0 5xx, 1 other)"),
+        chart_panel(&other).contains("Day 2: 1 requests (1 n/a)"),
         "the other class is selectable: {other}"
     );
 
@@ -1027,6 +1105,168 @@ async fn a_request_that_never_reached_an_upstream_counts_as_other() {
     assert!(
         table_rows(&success).contains(">$0.00<"),
         "the table still counts the failed request: {success}"
+    );
+}
+
+#[tokio::test]
+async fn the_status_code_table_lists_every_code_of_the_period_with_its_share() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "shares", None).await;
+    // Three 200s, one 404 and one request that never reached an upstream: the
+    // shares are 60, 20 and 20 percent of the five requests of the period,
+    // the busiest code first.
+    for (status, at) in [
+        (Some(200), "2026-06-01 10:00:00"),
+        (Some(200), "2026-06-01 11:00:00"),
+        (Some(200), "2026-06-02 10:00:00"),
+        (Some(404), "2026-06-02 11:00:00"),
+        (None, "2026-06-03 10:00:00"),
+    ] {
+        log_with_status(
+            &db,
+            key_id,
+            channel_id,
+            Some("gpt-4o"),
+            status,
+            Some(10),
+            Some(1),
+            at,
+        )
+        .await;
+    }
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Status codes"), "{html}");
+    let rows = status_code_rows(&html);
+    assert_eq!(
+        rows,
+        vec![
+            [
+                "200".to_string(),
+                "2xx".to_string(),
+                "3".to_string(),
+                "60.0%".to_string()
+            ],
+            [
+                "404".to_string(),
+                "4xx".to_string(),
+                "1".to_string(),
+                "20.0%".to_string()
+            ],
+            [
+                "n/a".to_string(),
+                "other".to_string(),
+                "1".to_string(),
+                "20.0%".to_string()
+            ],
+        ],
+        "{html}"
+    );
+    let summed: f64 = rows
+        .iter()
+        .map(|row| row[3].trim_end_matches('%').parse::<f64>().unwrap())
+        .sum();
+    assert!(
+        (summed - 100.0).abs() < 0.2,
+        "the shares cover the whole period: {summed}"
+    );
+
+    // The requests chart of the same view stacks the same codes.
+    let charts = chart_panel(&html);
+    assert!(charts.contains("Day 1: 2 requests (2 200)"), "{charts}");
+    assert!(
+        charts.contains("Day 2: 2 requests (1 200, 1 404)"),
+        "{charts}"
+    );
+    assert!(charts.contains("Day 3: 1 requests (1 n/a)"), "{charts}");
+
+    // A month without requests renders no status code panel at all.
+    let (_, empty) = get_page(&db, "/admin/ui/stats?month=2026-04").await;
+    assert!(!empty.contains("Status codes"), "{empty}");
+}
+
+#[tokio::test]
+async fn the_status_code_table_follows_the_key_model_and_status_filters() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (first_id, _) = seed_key(&db, channel_id, "first", None).await;
+    let (second_id, _) = seed_key(&db, channel_id, "second", None).await;
+    log_with_status(
+        &db,
+        first_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(10),
+        Some(1),
+        "2026-06-01 10:00:00",
+    )
+    .await;
+    log_with_status(
+        &db,
+        first_id,
+        channel_id,
+        Some("gpt-5-mini"),
+        Some(500),
+        Some(10),
+        Some(1),
+        "2026-06-01 11:00:00",
+    )
+    .await;
+    log_with_status(
+        &db,
+        second_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(429),
+        Some(10),
+        Some(1),
+        "2026-06-01 12:00:00",
+    )
+    .await;
+
+    let (status, html) = get_page(
+        &db,
+        &format!("/admin/ui/stats?month=2026-06&key_id={first_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = status_code_rows(&html);
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0][0], "200");
+    assert_eq!(
+        rows[0][3], "50.0%",
+        "the share divides by the requests the filter selects: {rows:?}"
+    );
+    assert_eq!(rows[1][0], "500");
+    assert_eq!(rows[1][1], "5xx");
+
+    // The model filter narrows the codes and the total the shares divide by.
+    let (_, model) = get_page(&db, "/admin/ui/stats?month=2026-06&model=gpt-5-mini").await;
+    assert_eq!(
+        status_code_rows(&model),
+        vec![[
+            "500".to_string(),
+            "5xx".to_string(),
+            "1".to_string(),
+            "100.0%".to_string()
+        ]],
+        "{model}"
+    );
+
+    // The class filter keeps the codes of that class alone.
+    let (_, class) = get_page(&db, "/admin/ui/stats?month=2026-06&status_class=4xx").await;
+    assert_eq!(
+        status_code_rows(&class),
+        vec![[
+            "429".to_string(),
+            "4xx".to_string(),
+            "1".to_string(),
+            "100.0%".to_string()
+        ]],
+        "{class}"
     );
 }
 
@@ -1051,6 +1291,16 @@ async fn an_unknown_status_class_shows_a_banner_and_filters_nothing() {
     assert!(
         html.contains("aria-label=\"Requests per day\""),
         "the view stays unfiltered: {html}"
+    );
+    assert_eq!(
+        status_code_rows(&html),
+        vec![[
+            "200".to_string(),
+            "2xx".to_string(),
+            "1".to_string(),
+            "100.0%".to_string()
+        ]],
+        "{html}"
     );
     assert!(
         select_markup(&html, "stats-status").contains("<option value=\"\" selected>"),

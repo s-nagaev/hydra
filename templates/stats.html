@@ -148,9 +148,43 @@
     has usage. Token bars stack input tokens at the bottom and output tokens on
     top; heights are relative to the busiest day of the series. Cost is priced the
     same way the table prices it, so the daily bars add up to the same money.
-    Request bars stack the response status classes of the month, in the classes the
-    legend names, and follow the status filter, while the token and cost bars and
-    the table keep counting every request of the month.
+    Request bars stack the exact response status codes of the month, in the colors
+    the legend names, and follow the status filter, while the token and cost bars
+    and the table keep counting every request of the month.
+  </p>
+</section>
+{% endif %}
+
+{% if !status_codes.is_empty() %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>Status codes <span class="text-muted">{{ month_label }}</span></h2>
+  </div>
+  <table class="data-table stats-table">
+    <thead>
+      <tr>
+        <th>Status code</th>
+        <th>Class</th>
+        <th>Requests</th>
+        <th>Share</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for row in status_codes %}
+      <tr>
+        <td class="mono">{{ row.code }}</td>
+        <td>{{ row.class }}</td>
+        <td class="mono">{{ row.requests }}</td>
+        <td class="mono">{{ row.share }}</td>
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  <p class="table-meta">
+    Every exact status code the current filters select, the busiest code first,
+    with the class it belongs to and its share of the requests those filters
+    count. A request that never reached an upstream carries no code and is listed
+    as n/a.
   </p>
 </section>
 {% endif %}

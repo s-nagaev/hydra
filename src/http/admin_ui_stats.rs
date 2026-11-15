@@ -36,10 +36,11 @@
 //! model apply to the table and to every chart, which is why the table is
 //! narrowed by filtering the per-key aggregates the page already loaded
 //! rather than by a second query, while the day rows arrive pre-filtered from
-//! their own aggregate. The status class applies to the status chart alone:
-//! the table, the token bars and the cost bars are token-based and keep their
-//! meaning under it. The month links carry whatever filters are set, so
-//! stepping through months keeps the slice of usage the admin is looking at.
+//! their own aggregate. The status class applies to the requests chart and to
+//! the status code table, which are both request-based: the usage table, the
+//! token bars and the cost bars are token-based and keep their meaning under
+//! it. The month links carry whatever filters are set, so stepping through
+//! months keeps the slice of usage the admin is looking at.
 //!
 //! Under the table sit three charts of the same filtered month, tokens per
 //! day, cost per day and requests per day, drawn server-side by
@@ -47,9 +48,14 @@
 //! `|safe` filter. The cost of a day is the sum of [`crate::usage::group_cost`]
 //! over that day's groups, priced from the key's channel exactly like the
 //! table, so the bars and the table add up to the same money. The requests
-//! chart stacks the response status classes and is left out when the status
-//! filter selects no row at all; a view with no day rows renders no chart at
-//! all and keeps the table's empty state instead.
+//! chart stacks the exact response status codes and is left out when the
+//! status filter selects no row at all; a view with no day rows renders no
+//! chart at all and keeps the table's empty state instead.
+//!
+//! Under the charts sits the status code table of the same filters: one line
+//! per exact code of the period with its class, its request count and its
+//! share of the requests the filters select, the busiest code first. Like the
+//! requests chart it is left out entirely when the filters select no request.
 //!
 //! There is no mutating route here, so the CSRF guard has nothing to reject;
 //! the module is merged into the `/admin/ui` nest like the other read-only
@@ -67,7 +73,9 @@ use serde::Deserialize;
 
 use crate::db::channels::{self, PricedChannel};
 use crate::db::keys::{self, ApiKey};
-use crate::db::request_logs::{self, DayStatusUsage, DayUsage, ModelUsage, StatusBucket};
+use crate::db::request_logs::{
+    self, DayStatusCodeUsage, DayUsage, ModelUsage, StatusBucket, StatusCodeTotal,
+};
 use crate::db::Db;
 use crate::http::admin_ui_logs::{thousands, SelectOption};
 use crate::http::stats_chart;
@@ -98,8 +106,8 @@ struct Filters {
     key_id: Option<i64>,
     /// The trimmed model name; `None` when the parameter is absent or blank.
     model: Option<String>,
-    /// The status class the requests chart is narrowed to; `None` when the
-    /// parameter is absent or blank.
+    /// The status class the requests chart and the status code table are
+    /// narrowed to; `None` when the parameter is absent or blank.
     status_class: Option<StatusBucket>,
 }
 
@@ -143,9 +151,25 @@ pub struct Charts {
     pub tokens_svg: String,
     /// Cost per day, priced from each key's channel.
     pub cost_svg: String,
-    /// Requests per day, stacked by status class. Absent when the status
-    /// filter selects no row, because an empty plot says less than none.
+    /// Requests per day, one segment per exact status code. Absent when the
+    /// status filter selects no row, because an empty plot says less than
+    /// none.
     pub status_svg: Option<String>,
+}
+
+/// One line of the status code table: one exact code of the filtered period
+/// with its class, its request count and its share of the period.
+#[derive(Debug)]
+pub struct StatusCodeRow {
+    /// The exact code, or `n/a` for the requests that never reached an
+    /// upstream and so carry none.
+    pub code: String,
+    /// The class the code falls into, named as the status filter names it.
+    pub class: String,
+    pub requests: String,
+    /// The share of the period's requests this code carries, as a
+    /// percentage.
+    pub share: String,
 }
 
 #[derive(Template, WebTemplate)]
@@ -167,6 +191,10 @@ pub struct StatsPage {
     /// The Status select: `All statuses` plus the four classes the requests
     /// chart stacks.
     pub status_options: Vec<SelectOption>,
+    /// The status code table of the period, busiest code first; empty when
+    /// the filters select no request, which is when the template leaves the
+    /// whole panel out.
+    pub status_codes: Vec<StatusCodeRow>,
     /// Absent when the filtered month has nothing to plot.
     pub charts: Option<Charts>,
     pub prev_url: String,
@@ -271,9 +299,12 @@ struct StatsData {
     channels: HashMap<i64, ChannelInfo>,
     /// Day-level rows of the filtered month, for the token and cost charts.
     days: Vec<DayUsage>,
-    /// Day-level request counts per status class of the filtered month, for
-    /// the requests chart.
-    status_days: Vec<DayStatusUsage>,
+    /// Day-level request counts per exact status code of the filtered month,
+    /// for the requests chart.
+    status_code_days: Vec<DayStatusCodeUsage>,
+    /// Request totals per exact status code of the filtered month, for the
+    /// status code table.
+    status_code_totals: Vec<StatusCodeTotal>,
     /// The distinct models logged in the month, for the Model select.
     models: Vec<String>,
 }
@@ -438,11 +469,12 @@ async fn channel_info(db: &Db) -> sqlx::Result<HashMap<i64, ChannelInfo>> {
 
 /// Loads the key list, the channel price tables, one month-to-date aggregate
 /// per key, the day rows the token and cost charts plot, the day rows per
-/// status class and the model names of the month.
+/// exact status code, the status code totals of the period and the model
+/// names of the month.
 ///
 /// The month aggregate is per key and is narrowed in memory by [`build_page`];
 /// the day rows are narrowed by their own queries, which already carry the
-/// key and model predicates, and the status rows carry the status class
+/// key and model predicates, and the status queries carry the status class
 /// filter on top. The model list of the select stays month-scoped and
 /// unfiltered on purpose, so the control always offers every model of the
 /// month rather than only the surviving one.
@@ -462,7 +494,17 @@ async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<Stat
     )
     .await
     .map_err(|error| internal_error(&error))?;
-    let status_days = request_logs::day_status_usage(
+    let status_days = request_logs::day_status_code_usage(
+        &state.db,
+        &month.start(),
+        &month.end(),
+        filters.key_id,
+        filters.model.clone(),
+        filters.status_class,
+    )
+    .await
+    .map_err(|error| internal_error(&error))?;
+    let status_code_totals = request_logs::status_code_totals(
         &state.db,
         &month.start(),
         &month.end(),
@@ -487,9 +529,45 @@ async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<Stat
         keys,
         channels,
         days,
-        status_days,
+        status_code_days: status_days,
+        status_code_totals,
         models,
     })
+}
+
+/// The status code table of one view: one line per exact code the filters
+/// select, most requests first (the order the SQL aggregate returns), each
+/// with its class and its share of the period's requests.
+///
+/// The total the shares divide by is the sum of the same rows, so the column
+/// always adds up to a hundred percent of what the current filters select,
+/// whatever they are.
+fn status_code_rows(totals: &[StatusCodeTotal]) -> Vec<StatusCodeRow> {
+    let total = totals
+        .iter()
+        .fold(0_i64, |sum, row| sum.saturating_add(row.requests));
+    totals
+        .iter()
+        .map(|row| StatusCodeRow {
+            code: match row.status {
+                Some(code) => code.to_string(),
+                None => "n/a".to_string(),
+            },
+            class: row.status_class.label().to_string(),
+            requests: thousands(row.requests),
+            share: share_label(row.requests, total),
+        })
+        .collect()
+}
+
+/// One code's share of the requests a view selected, as a percentage with one
+/// decimal. A table without a single request (which the template does not
+/// render) reads `0.0%` rather than dividing by zero.
+fn share_label(requests: i64, total: i64) -> String {
+    if total <= 0 {
+        return "0.0%".to_string();
+    }
+    format!("{:.1}%", requests as f64 * 100.0 / total as f64)
 }
 
 /// The Key select: `All keys` plus every key the page loaded, soft-deleted
@@ -590,6 +668,7 @@ fn page_shell(month: &Month, filters: &Filters, error: Option<String>) -> StatsP
         key_options: key_options(&[], filters.key_id),
         model_options: model_options(&[], filters.model.as_deref()),
         status_options: status_options(filters.status_class),
+        status_codes: Vec::new(),
         charts: None,
         prev_url: view_url(&month.previous(), filters),
         next_url: view_url(&month.next(), filters),
@@ -616,10 +695,10 @@ fn day_group(day: &DayUsage) -> ModelUsage {
 
 /// The charts of one view: the daily token bars, the daily cost bars built by
 /// pricing every day group from the price table of the key that spent it, and
-/// the daily requests bars stacked by status class. A key whose channel is
-/// missing or prices nothing contributes zero, exactly as it does in the
+/// the daily requests bars stacked by exact status code. A key whose channel
+/// is missing or prices nothing contributes zero, exactly as it does in the
 /// table. `None` when the filtered month has no day rows at all, which is
-/// when the page shows its empty state instead of an empty plot; the status
+/// when the page shows its empty state instead of an empty plot; the requests
 /// chart is dropped on its own when the status filter leaves it no row.
 fn charts(data: &StatsData) -> Option<Charts> {
     if data.days.is_empty() {
@@ -646,8 +725,8 @@ fn charts(data: &StatsData) -> Option<Charts> {
             (day.day.clone(), usage::group_cost(&day_group(day), prices))
         })
         .collect();
-    let status_svg =
-        (!data.status_days.is_empty()).then(|| stats_chart::daily_status_bars(&data.status_days));
+    let status_svg = (!data.status_code_days.is_empty())
+        .then(|| stats_chart::daily_status_code_bars(&data.status_code_days));
     Some(Charts {
         tokens_svg: stats_chart::daily_token_bars(&data.days),
         cost_svg: stats_chart::daily_cost_bars(&costs),
@@ -736,6 +815,7 @@ fn build_page(data: StatsData, filters: &Filters, error: Option<String>) -> Stat
     page.key_options = key_options(&data.keys, filters.key_id);
     page.model_options = model_options(&data.models, filters.model.as_deref());
     page.status_options = status_options(filters.status_class);
+    page.status_codes = status_code_rows(&data.status_code_totals);
     page.charts = charts(&data);
     page.grand = grand.display();
     page.rows = rows;
@@ -863,7 +943,8 @@ mod tests {
             keys,
             channels,
             days: Vec::new(),
-            status_days: Vec::new(),
+            status_code_days: Vec::new(),
+            status_code_totals: Vec::new(),
             models: Vec::new(),
         }
     }
@@ -1507,25 +1588,46 @@ mod tests {
             HashMap::from([(7, channel_info_limitable())]),
         );
         data.days = vec![day];
-        data.status_days = vec![DayStatusUsage {
+        data.status_code_days = vec![DayStatusCodeUsage {
             day: "2026-11-02".to_string(),
+            status: Some(500),
             status_class: StatusBucket::Server5xx,
             requests: 2,
         }];
-        let plot = build_page(data, &Filters::default(), None)
+        data.status_code_totals = vec![
+            StatusCodeTotal {
+                status: Some(500),
+                status_class: StatusBucket::Server5xx,
+                requests: 2,
+            },
+            StatusCodeTotal {
+                status: None,
+                status_class: StatusBucket::Other,
+                requests: 1,
+            },
+        ];
+        let page = build_page(data, &Filters::default(), None);
+        let status = page
             .charts
-            .expect("day rows draw the charts");
-        let status = plot
-            .status_svg
+            .as_ref()
+            .and_then(|plot| plot.status_svg.as_ref())
             .expect("status rows draw the requests chart");
         assert!(
             status.contains("aria-label=\"Requests per day\""),
             "{status}"
         );
-        assert!(status.contains("Day 2: 2 requests (0 2xx, 0 4xx, 2 5xx, 0 other)"));
+        assert!(status.contains("Day 2: 2 requests (2 500)"), "{status}");
+        // The table of the same view lists both codes, most requests first.
+        assert_eq!(page.status_codes.len(), 2);
+        assert_eq!(page.status_codes[0].code, "500");
+        assert_eq!(page.status_codes[0].share, "66.7%");
+        assert_eq!(page.status_codes[1].code, "n/a");
+        assert_eq!(page.status_codes[1].class, "other");
+        assert_eq!(page.status_codes[1].share, "33.3%");
 
-        // A status filter that selects nothing drops that chart alone and
-        // leaves the token and cost bars of the same view in place.
+        // A status filter that selects nothing drops the chart alone and
+        // leaves the token and cost bars of the same view in place, with no
+        // status code table either.
         let day = day_row("2026-11-02", "gpt-4o", 1000, 200);
         let mut data = stats_data(
             november(),
@@ -1536,20 +1638,65 @@ mod tests {
             HashMap::from([(7, channel_info_limitable())]),
         );
         data.days = vec![day];
-        data.status_days = Vec::new();
-        let plot = build_page(
+        data.status_code_days = Vec::new();
+        let page = build_page(
             data,
             &Filters {
                 status_class: Some(StatusBucket::Client4xx),
                 ..Filters::default()
             },
             None,
-        )
-        .charts
-        .expect("the token and cost rows still draw their charts");
+        );
+        assert!(page.status_codes.is_empty());
+        let plot = page
+            .charts
+            .expect("the token and cost rows still draw their charts");
         assert!(plot.status_svg.is_none());
         assert!(plot.tokens_svg.contains("aria-label=\"Tokens per day\""));
         assert!(plot.cost_svg.contains("aria-label=\"Cost per day\""));
+    }
+
+    #[test]
+    fn the_status_code_table_labels_each_code_with_its_class_and_share() {
+        let totals = vec![
+            StatusCodeTotal {
+                status: Some(500),
+                status_class: StatusBucket::Server5xx,
+                requests: 3,
+            },
+            StatusCodeTotal {
+                status: Some(200),
+                status_class: StatusBucket::Ok2xx,
+                requests: 1,
+            },
+            StatusCodeTotal {
+                status: None,
+                status_class: StatusBucket::Other,
+                requests: 1,
+            },
+        ];
+        let rows = status_code_rows(&totals);
+        assert_eq!(rows.len(), 3, "one line per code: {rows:?}");
+        assert_eq!(rows[0].code, "500");
+        assert_eq!(rows[0].class, "5xx");
+        assert_eq!(rows[0].requests, "3");
+        assert_eq!(rows[0].share, "60.0%");
+        assert_eq!(rows[1].code, "200");
+        assert_eq!(rows[1].class, "2xx");
+        assert_eq!(rows[1].share, "20.0%");
+        assert_eq!(rows[2].code, "n/a");
+        assert_eq!(rows[2].class, "other");
+        assert_eq!(rows[2].share, "20.0%");
+        assert!(status_code_rows(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_share_of_a_period_without_requests_reads_zero_instead_of_dividing() {
+        assert_eq!(share_label(0, 0), "0.0%");
+        assert_eq!(share_label(1, 3), "33.3%");
+        assert_eq!(share_label(2, 3), "66.7%");
+        assert_eq!(share_label(5, 5), "100.0%");
+        assert_eq!(share_label(1_000, i64::MAX), "0.0%");
     }
 
     #[test]

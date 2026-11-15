@@ -529,8 +529,51 @@ pub async fn day_status_usage(
     let mut sql = Sql::for_db(db);
     sql.push("SELECT substr(created_at, 1, 10) AS day, ")
         .push(STATUS_BUCKET_SQL)
-        .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ")
-        .push("WHERE api_key_id IS NOT NULL AND created_at >= ")
+        .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ");
+    push_status_window(
+        &mut sql,
+        month_start,
+        month_end,
+        key_id,
+        model,
+        status_class,
+    );
+    sql.push(" GROUP BY substr(created_at, 1, 10), ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" ORDER BY day, status_class");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(map_day_status_usage).collect()
+}
+
+/// Maps one grouped row; a label the bucket expression does not know counts
+/// as `other` rather than dropping the requests behind it.
+fn map_day_status_usage(row: &Row) -> sqlx::Result<DayStatusUsage> {
+    let label = row.text("status_class")?;
+    Ok(DayStatusUsage {
+        day: row.text("day")?,
+        status_class: StatusBucket::parse(&label).unwrap_or(StatusBucket::Other),
+        requests: row.int("request_count")?,
+    })
+}
+
+/// Adds the month window and the optional key, model and status class
+/// predicates the status aggregates share to a SQL body.
+///
+/// The window is a range predicate on `created_at`, which is what the
+/// `(api_key_id, created_at)` index serves, and rows without an `api_key_id`
+/// (rejections whose key never resolved) are excluded, so every status
+/// aggregate counts the same requests the token aggregates count. The class
+/// predicate compares the bucket expression the queries group by, so
+/// filtering and grouping can never disagree.
+fn push_status_window(
+    sql: &mut Sql,
+    month_start: &str,
+    month_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) {
+    sql.push("WHERE api_key_id IS NOT NULL AND created_at >= ")
         .bind(Arg::Text(Some(month_start.to_string())))
         .push(" AND created_at < ")
         .bind(Arg::Text(Some(month_end.to_string())));
@@ -546,19 +589,130 @@ pub async fn day_status_usage(
             .push(" = ")
             .bind(Arg::Text(Some(status_class.label().to_string())));
     }
-    sql.push(" GROUP BY substr(created_at, 1, 10), ")
-        .push(STATUS_BUCKET_SQL)
-        .push(" ORDER BY day, status_class");
-    let rows = db.fetch_all(sql).await?;
-    rows.iter().map(map_day_status_usage).collect()
 }
 
-/// Maps one grouped row; a label the bucket expression does not know counts
-/// as `other` rather than dropping the requests behind it.
-fn map_day_status_usage(row: &Row) -> sqlx::Result<DayStatusUsage> {
+/// Request count of one (day, exact status code) group, as the per-code
+/// detail of the requests chart of the stats page reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct DayStatusCodeUsage {
+    /// The `YYYY-MM-DD` label of the row's day, the label of the grouping.
+    pub day: String,
+    /// The exact upstream HTTP status of the group. NULL for a request that
+    /// never reached an upstream, which is a group of its own rather than a
+    /// fabricated code.
+    pub status: Option<i64>,
+    /// The class the status falls into, from the same bucket expression the
+    /// `status_class` filter compares against.
+    pub status_class: StatusBucket,
+    /// Number of logged requests in the group.
+    pub requests: i64,
+}
+
+/// Request counts per day and exact status code inside a month window, the
+/// per-code detail of the requests chart.
+///
+/// Same window, filters and exclusions as [`day_status_usage`], which this
+/// query refines: where that one folds the codes of one day into their four
+/// classes, this one keeps every code apart, and the class travels along as
+/// the bucket the code falls into. `substr(created_at, 1, 10)` appears only
+/// as the label of the grouping and in the GROUP BY, never as a filter, so
+/// the index still serves the window. The class comes from the shared
+/// expression in the SELECT list and in the GROUP BY, which is also what the
+/// `status_class` predicate compares. Rows are ordered by day, then by code,
+/// with the requests that carry no status last.
+pub async fn day_status_code_usage(
+    db: &Db,
+    month_start: &str,
+    month_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) -> sqlx::Result<Vec<DayStatusCodeUsage>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT substr(created_at, 1, 10) AS day, status AS status_code, ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ");
+    push_status_window(
+        &mut sql,
+        month_start,
+        month_end,
+        key_id,
+        model,
+        status_class,
+    );
+    sql.push(" GROUP BY substr(created_at, 1, 10), status, ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" ORDER BY day, status IS NULL, status");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(map_day_status_code_usage).collect()
+}
+
+/// Maps one grouped per-code row; a label the bucket expression does not know
+/// counts as `other` rather than dropping the requests behind it.
+fn map_day_status_code_usage(row: &Row) -> sqlx::Result<DayStatusCodeUsage> {
     let label = row.text("status_class")?;
-    Ok(DayStatusUsage {
+    Ok(DayStatusCodeUsage {
         day: row.text("day")?,
+        status: row.opt_int("status_code")?,
+        status_class: StatusBucket::parse(&label).unwrap_or(StatusBucket::Other),
+        requests: row.int("request_count")?,
+    })
+}
+
+/// Request count of one exact status code over the whole month window, as the
+/// status code table of the stats page reads it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct StatusCodeTotal {
+    /// The exact upstream HTTP status; NULL for the requests of the period
+    /// that never reached an upstream, which are one group of their own.
+    pub status: Option<i64>,
+    /// The class the status falls into, from the same bucket expression the
+    /// `status_class` filter compares against.
+    pub status_class: StatusBucket,
+    /// Number of logged requests the period logged under this code.
+    pub requests: i64,
+}
+
+/// Request counts per exact status code over a month window, without the day
+/// dimension, for the status code table.
+///
+/// Same window, filters and exclusions as [`day_status_code_usage`]; the
+/// order is by request count, largest first, with the exact code as the
+/// tie-breaker and the requests that carry no status last, so the table reads
+/// the busiest code first and never depends on the order the backend happens
+/// to return NULLs in.
+pub async fn status_code_totals(
+    db: &Db,
+    month_start: &str,
+    month_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) -> sqlx::Result<Vec<StatusCodeTotal>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT status AS status_code, ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ");
+    push_status_window(
+        &mut sql,
+        month_start,
+        month_end,
+        key_id,
+        model,
+        status_class,
+    );
+    sql.push(" GROUP BY status, ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" ORDER BY request_count DESC, status IS NULL, status");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(map_status_code_total).collect()
+}
+
+/// Maps one grouped per-code row of the table aggregate.
+fn map_status_code_total(row: &Row) -> sqlx::Result<StatusCodeTotal> {
+    let label = row.text("status_class")?;
+    Ok(StatusCodeTotal {
+        status: row.opt_int("status_code")?,
         status_class: StatusBucket::parse(&label).unwrap_or(StatusBucket::Other),
         requests: row.int("request_count")?,
     })
@@ -1643,6 +1797,503 @@ mod tests {
         .await;
 
         assert!(day_status_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    }
+
+    /// The per-code aggregate hand-over used by the tests below: day, status
+    /// and request count, without the class the query also carries.
+    fn codes(usage: &[DayStatusCodeUsage]) -> Vec<(String, Option<i64>, i64)> {
+        usage
+            .iter()
+            .map(|row| (row.day.clone(), row.status, row.requests))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn day_status_code_usage_keeps_every_code_of_a_day_apart() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "code-groups").await;
+
+        for (status, at) in [
+            (Some(200), "2026-11-08 10:00:00"),
+            (Some(200), "2026-11-08 11:00:00"),
+            (Some(204), "2026-11-08 12:00:00"),
+            (Some(404), "2026-11-08 13:00:00"),
+            (Some(200), "2026-11-09 10:00:00"),
+            (Some(503), "2026-11-09 11:00:00"),
+            (Some(503), "2026-11-09 12:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, Some("alpha")),
+                at,
+            )
+            .await;
+        }
+
+        let usage = day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codes(&usage),
+            vec![
+                ("2026-11-08".to_string(), Some(200), 2),
+                ("2026-11-08".to_string(), Some(204), 1),
+                ("2026-11-08".to_string(), Some(404), 1),
+                ("2026-11-09".to_string(), Some(200), 1),
+                ("2026-11-09".to_string(), Some(503), 2),
+            ],
+            "{usage:?}"
+        );
+        // Every row carries the class its code falls into, the same bucket
+        // the filter compares.
+        assert_eq!(usage[0].status_class, StatusBucket::Ok2xx);
+        assert_eq!(usage[2].status_class, StatusBucket::Client4xx);
+        assert_eq!(usage[4].status_class, StatusBucket::Server5xx);
+    }
+
+    #[tokio::test]
+    async fn day_status_code_usage_gives_the_requests_without_a_status_their_own_group() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "code-null").await;
+
+        // A NULL status is a request that never reached an upstream: it is
+        // not a code, so it stays a group of its own under the other class,
+        // ordered after the codes.
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(None, Some("alpha")),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(None, Some("alpha")),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(Some(302), Some("alpha")),
+            "2026-11-08 12:00:00",
+        )
+        .await;
+
+        let usage = day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codes(&usage),
+            vec![
+                ("2026-11-08".to_string(), Some(302), 1),
+                ("2026-11-08".to_string(), None, 2),
+            ],
+            "the unlabelled requests stay apart from every code, and last: {usage:?}"
+        );
+        assert_eq!(usage[0].status_class, StatusBucket::Other);
+        assert_eq!(usage[1].status_class, StatusBucket::Other);
+    }
+
+    #[tokio::test]
+    async fn day_status_code_usage_takes_only_rows_inside_the_month() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "code-range").await;
+
+        // Last October instant, both November edges, first December instant.
+        for at in [
+            "2026-10-31 23:59:59",
+            "2026-11-01 00:00:00",
+            "2026-11-30 23:59:59",
+            "2026-12-01 00:00:00",
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(Some(200), Some("alpha")),
+                at,
+            )
+            .await;
+        }
+
+        let usage = day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codes(&usage),
+            vec![
+                ("2026-11-01".to_string(), Some(200), 1),
+                ("2026-11-30".to_string(), Some(200), 1),
+            ],
+            "{usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn day_status_code_usage_excludes_rows_without_a_key() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "code-no-key").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(Some(200), Some("alpha")),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        // A rejection row whose key never resolved belongs to nobody, even
+        // though it carries a status.
+        insert_at(
+            &db,
+            &row_with_status(Some(401), Some("alpha")),
+            "2026-11-08 11:00:00",
+        )
+        .await
+        .unwrap();
+
+        let usage = day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codes(&usage),
+            vec![("2026-11-08".to_string(), Some(200), 1)],
+            "{usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn day_status_code_usage_filters_by_key_model_and_class() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "code-key-first").await;
+        let (second_key, second_channel) = seed(&db, "code-key-second").await;
+        for (key_id, channel_id, status, model, at) in [
+            (
+                first_key,
+                first_channel,
+                Some(200),
+                Some("alpha"),
+                "10:00:00",
+            ),
+            (first_key, first_channel, Some(200), None, "11:00:00"),
+            (
+                first_key,
+                first_channel,
+                Some(404),
+                Some("alpha"),
+                "12:00:00",
+            ),
+            (
+                second_key,
+                second_channel,
+                Some(200),
+                Some("alpha"),
+                "13:00:00",
+            ),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, model),
+                &format!("2026-11-08 {at}"),
+            )
+            .await;
+        }
+
+        let by_key = day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            Some(first_key),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codes(&by_key),
+            vec![
+                ("2026-11-08".to_string(), Some(200), 2),
+                ("2026-11-08".to_string(), Some(404), 1),
+            ],
+            "the other key's rows stay out: {by_key:?}"
+        );
+
+        // A model filter drops the rows that carry no model at all.
+        let by_model = day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            Some("alpha".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codes(&by_model),
+            vec![
+                ("2026-11-08".to_string(), Some(200), 2),
+                ("2026-11-08".to_string(), Some(404), 1),
+            ],
+            "{by_model:?}"
+        );
+
+        // The class filter narrows by the bucket each code falls into.
+        let by_class = day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Client4xx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            codes(&by_class),
+            vec![("2026-11-08".to_string(), Some(404), 1)],
+            "{by_class:?}"
+        );
+
+        let other = day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Other),
+        )
+        .await
+        .unwrap();
+        assert!(
+            other.is_empty(),
+            "no request of the day landed outside: {other:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn day_status_code_usage_is_empty_without_rows_in_the_month() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "code-empty").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(Some(200), Some("alpha")),
+            "2026-10-05 10:00:00",
+        )
+        .await;
+
+        assert!(day_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    }
+
+    /// The per-code total hand-over: status and request count.
+    fn totals(rows: &[StatusCodeTotal]) -> Vec<(Option<i64>, i64)> {
+        rows.iter().map(|row| (row.status, row.requests)).collect()
+    }
+
+    #[tokio::test]
+    async fn status_code_totals_order_the_busiest_code_first() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "totals-order").await;
+
+        for (status, at) in [
+            (Some(500), "10:00:00"),
+            (Some(500), "11:00:00"),
+            (Some(500), "12:00:00"),
+            (Some(404), "13:00:00"),
+            (Some(200), "14:00:00"),
+            (None, "15:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, Some("alpha")),
+                &format!("2026-11-08 {at}"),
+            )
+            .await;
+        }
+
+        let rows = status_code_totals(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            totals(&rows),
+            vec![(Some(500), 3), (Some(200), 1), (Some(404), 1), (None, 1)],
+            "largest first, ties by code, the unlabelled requests last: {rows:?}"
+        );
+        assert_eq!(rows[0].status_class, StatusBucket::Server5xx);
+        assert_eq!(rows[3].status_class, StatusBucket::Other);
+    }
+
+    #[tokio::test]
+    async fn status_code_totals_follow_the_filters_and_stay_inside_the_month() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "totals-key-first").await;
+        let (second_key, second_channel) = seed(&db, "totals-key-second").await;
+        for (key_id, channel_id, status, model, at) in [
+            (
+                first_key,
+                first_channel,
+                Some(200),
+                Some("alpha"),
+                "2026-11-08 10:00:00",
+            ),
+            (
+                first_key,
+                first_channel,
+                Some(200),
+                Some("beta"),
+                "2026-11-08 11:00:00",
+            ),
+            (
+                first_key,
+                first_channel,
+                Some(500),
+                Some("alpha"),
+                "2026-11-08 12:00:00",
+            ),
+            (
+                second_key,
+                second_channel,
+                Some(200),
+                Some("alpha"),
+                "2026-11-08 13:00:00",
+            ),
+            (
+                first_key,
+                first_channel,
+                Some(200),
+                Some("alpha"),
+                "2026-10-31 23:59:59",
+            ),
+        ] {
+            put(&db, key_id, channel_id, row_with_status(status, model), at).await;
+        }
+
+        let all = status_code_totals(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            totals(&all),
+            vec![(Some(200), 3), (Some(500), 1)],
+            "the October row stays out: {all:?}"
+        );
+
+        let by_key_model = status_code_totals(
+            &db,
+            &november().start(),
+            &november().end(),
+            Some(first_key),
+            Some("alpha".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            totals(&by_key_model),
+            vec![(Some(200), 1), (Some(500), 1)],
+            "{by_key_model:?}"
+        );
+
+        let by_class = status_code_totals(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Server5xx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(totals(&by_class), vec![(Some(500), 1)], "{by_class:?}");
+    }
+
+    #[tokio::test]
+    async fn status_code_totals_are_empty_without_rows_in_the_month() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "totals-empty").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_status(Some(200), Some("alpha")),
+            "2026-10-05 10:00:00",
+        )
+        .await;
+
+        assert!(status_code_totals(
             &db,
             &november().start(),
             &november().end(),
