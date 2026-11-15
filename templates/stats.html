@@ -24,11 +24,11 @@
       <label for="stats-to">To (UTC)</label>
       <input type="date" id="stats-to" name="to" value="{{ to_value }}">
     </div>
-    {% for preset in preset_buttons %}
-    <div class="filter-field">
+    <div class="filter-field filter-field--presets">
+      {% for preset in preset_buttons %}
       <button type="submit" name="preset" value="{{ preset.value }}">{{ preset.label }}</button>
+      {% endfor %}
     </div>
-    {% endfor %}
     <div class="filter-field">
       <label for="stats-key">Key</label>
       <select id="stats-key" name="key_id">

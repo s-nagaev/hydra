@@ -662,7 +662,22 @@ td.key-cell {
   order: 1;
 }
 
-.table-meta {
+
+/* The three range shortcuts share one grid cell and one flex line: as
+   standalone cells each track was at least 190px wide, so the auto-placement
+   wrapped them onto separate rows. */
+.filter-grid .filter-field--presets {
+  grid-column: span 2 / span 2;
+  display: flex;
+  gap: 8px;
+  flex-wrap: nowrap;
+}
+
+.filter-grid .filter-field--presets button {
+  white-space: nowrap;
+}
+
+.table-meta {.table-meta {
   color: var(--text-muted);
   font-size: 13px;
   margin-top: 12px;
