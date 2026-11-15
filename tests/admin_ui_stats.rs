@@ -55,6 +55,54 @@ fn current_month_label() -> String {
     String::from_utf8_lossy(&Month::current().bucket()).to_string()
 }
 
+/// The rows of the rendered table, between its opening and closing tags. The
+/// key and model filters list every key and every model of the month in the
+/// select boxes above it, so an assertion that a key or a model has no row
+/// has to look at the table rather than at the whole page.
+fn table_rows(html: &str) -> &str {
+    let (_, rest) = html.split_once("<table").expect("the stats table renders");
+    let (table, _) = rest.split_once("</table>").expect("the table is closed");
+    table
+}
+
+/// The chart panel, which is the part of the page after the table panel. A
+/// page with nothing to plot has no second panel, so the returned text then
+/// never carries an `aria-label` or a bar title.
+fn chart_panel(html: &str) -> &str {
+    match html.split_once("</section>") {
+        Some((_, rest)) => rest,
+        None => "",
+    }
+}
+
+/// Whether the option carrying `value` is the selected one.
+fn option_is_selected(html: &str, value: &str) -> bool {
+    html.contains(&format!("<option value=\"{value}\" selected>"))
+}
+
+/// The markup of one filter select, so an assertion about a selected option
+/// cannot be satisfied by the other select's own default.
+fn select_markup<'a>(html: &'a str, id: &str) -> &'a str {
+    let (_, rest) = html
+        .split_once(&format!("id=\"{id}\""))
+        .unwrap_or_else(|| panic!("the {id} select must render"));
+    let (markup, _) = rest
+        .split_once("</select>")
+        .expect("the select must be closed");
+    markup
+}
+
+/// Every link target of the page with its HTML escaping undone, so a link
+/// can be compared against the URL the handler built rather than against the
+/// escaped attribute the template emits.
+fn links(html: &str) -> Vec<String> {
+    html.split("href=\"")
+        .skip(1)
+        .filter_map(|rest| rest.split_once('"').map(|(url, _)| url.to_string()))
+        .map(|url| url.replace("&#38;", "&").replace("&amp;", "&"))
+        .collect()
+}
+
 /// A channel whitelisted to `gpt-4o` and priced for it, so it is limitable:
 /// this is the shape a key with a monthly limit is enforced against.
 async fn seed_priced_channel(db: &SqlitePool) -> i64 {
@@ -260,13 +308,15 @@ async fn the_selected_month_drives_the_rows_and_the_navigation_links() {
         "February links forward to March"
     );
 
-    // A month after the logged rows renders the empty state.
+    // A month after the logged rows renders the empty state, with the key
+    // still offered by the filter select but carrying no row.
     let (_, empty) = get_page(&db, "/admin/ui/stats?month=2026-05").await;
     assert!(empty.contains("No requests logged in 2026-05"), "{empty}");
     assert!(
-        !empty.contains(&prefix),
+        !table_rows(&empty).contains(&prefix),
         "no rows for a month without usage"
     );
+    assert!(!empty.contains("<svg"), "no data means no chart: {empty}");
 }
 
 #[tokio::test]
@@ -356,10 +406,15 @@ async fn a_key_without_usage_in_the_month_is_omitted() {
 
     let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-07").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(html.contains(&used_prefix));
+    let table = table_rows(&html);
+    assert!(table.contains(&used_prefix));
     assert!(
-        !html.contains(&idle_prefix),
-        "a key without usage in the month is omitted: {html}"
+        !table.contains(&idle_prefix),
+        "a key without usage in the month has no row: {table}"
+    );
+    assert!(
+        html.contains(&format!("<option value=\"{idle_id}\">")),
+        "the idle key is still offered by the filter: {html}"
     );
 }
 
@@ -574,5 +629,192 @@ async fn the_cache_write_column_shows_the_written_tokens_and_their_cost() {
     assert!(
         !html.contains(">$0.004812<"),
         "the write-blind figure must not appear: {html}"
+    );
+}
+
+// --- Filters and charts ---------------------------------------------------
+
+#[tokio::test]
+async fn the_key_filter_narrows_the_table_and_rides_along_the_month_links() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (first_id, first_prefix) = seed_key(&db, channel_id, "kept", None).await;
+    let (second_id, second_prefix) = seed_key(&db, channel_id, "dropped", None).await;
+    log_priced_request(&db, first_id, channel_id, "2026-06-01 10:00:00").await;
+    log_priced_request(&db, second_id, channel_id, "2026-06-02 10:00:00").await;
+
+    let (status, html) = get_page(
+        &db,
+        &format!("/admin/ui/stats?month=2026-06&key_id={first_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let table = table_rows(&html);
+    assert!(table.contains(&first_prefix), "{table}");
+    assert!(
+        !table.contains(&second_prefix),
+        "the other key is filtered out of the table: {table}"
+    );
+    assert!(
+        table.contains(">$0.004<"),
+        "the totals follow the filter, so one priced request is the grand total: {table}"
+    );
+    assert!(
+        option_is_selected(&html, &first_id.to_string()),
+        "the filtered key stays selected in the control: {html}"
+    );
+    let targets = links(&html);
+    assert!(
+        targets.contains(&format!("/admin/ui/stats?month=2026-05&key_id={first_id}")),
+        "the previous link keeps the filter: {html}"
+    );
+    assert!(
+        targets.contains(&format!("/admin/ui/stats?month=2026-07&key_id={first_id}")),
+        "the next link keeps the filter: {html}"
+    );
+    assert!(
+        select_markup(&html, "stats-key").contains(&format!("<option value=\"{second_id}\">")),
+        "the dropped key is still offered, so the filter can be widened: {html}"
+    );
+
+    // Without the filter both keys are back.
+    let (_, unfiltered) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    assert!(table_rows(&unfiltered).contains(&second_prefix));
+}
+
+#[tokio::test]
+async fn the_model_filter_narrows_the_table_and_the_charts() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "models", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+    log_at(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-5-mini"),
+        Some(100),
+        Some(50),
+        None,
+        "2026-06-03 10:00:00",
+    )
+    .await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&model=gpt-5-mini").await;
+    assert_eq!(status, StatusCode::OK);
+    let table = table_rows(&html);
+    assert!(table.contains("gpt-5-mini"), "{table}");
+    assert!(
+        !table.contains("gpt-4o"),
+        "the other model's line is filtered out: {table}"
+    );
+    assert!(
+        table.contains(">$0.00<"),
+        "the surviving model is outside the price table and costs zero: {table}"
+    );
+    assert!(
+        option_is_selected(&html, "gpt-5-mini"),
+        "the filtered model stays selected: {html}"
+    );
+    // The charts plot the filtered day rows: the surviving request's day
+    // keeps its bar and the filtered-out day leaves none.
+    let charts = chart_panel(&html);
+    assert!(charts.contains("Day 3:"), "{charts}");
+    assert!(
+        !charts.contains("Day 1:"),
+        "a filtered-out day draws no bar: {charts}"
+    );
+    // The control still lists the whole month, so the filter can be widened,
+    // and it does not fall back to its "All models" default.
+    let models = select_markup(&html, "stats-model");
+    assert!(models.contains("<option value=\"gpt-4o\">"), "{html}");
+    assert!(
+        !models.contains("<option value=\"\" selected>"),
+        "the filter in force is not hidden behind All models: {html}"
+    );
+}
+
+#[tokio::test]
+async fn the_charts_plot_the_month_and_agree_with_the_table() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "plot", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Usage over time"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(charts.contains("aria-label=\"Tokens per day\""), "{charts}");
+    assert!(charts.contains("aria-label=\"Cost per day\""), "{charts}");
+    assert!(
+        charts.contains("Day 1: 1,200 tokens (1,000 in, 200 out) in 1 requests"),
+        "the token bar carries the day's figures: {charts}"
+    );
+    // 1000 prompt tokens with 400 of them cached and 200 completions cost
+    // 4000 micro-USD, the same figure the table's total line carries.
+    assert!(charts.contains("Day 1: $0.004"), "{charts}");
+    assert!(table_rows(&html).contains(">$0.004<"), "{html}");
+
+    // A filter that selects nothing says so, keeps the empty styling and
+    // draws no chart at all.
+    let (status, filtered_out) = get_page(&db, "/admin/ui/stats?month=2026-06&model=nope").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        filtered_out.contains("No usage matches the current filters in 2026-06"),
+        "{filtered_out}"
+    );
+    assert!(!filtered_out.contains("<svg"), "{filtered_out}");
+    assert!(
+        option_is_selected(&filtered_out, "nope"),
+        "the selection is visible even when it matches nothing: {filtered_out}"
+    );
+}
+
+#[tokio::test]
+async fn a_soft_deleted_key_stays_selectable_in_the_key_filter() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, prefix) = seed_key(&db, channel_id, "gone", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-10-02 10:00:00").await;
+    within(keys::delete(&Db::from(db.clone()), key_id))
+        .await
+        .unwrap();
+
+    let (status, html) = get_page(
+        &db,
+        &format!("/admin/ui/stats?month=2026-10&key_id={key_id}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        select_markup(&html, "stats-key").contains(&prefix),
+        "the deleted key keeps its option: {html}"
+    );
+    assert!(
+        option_is_selected(&html, &key_id.to_string()),
+        "and it is the option the filter selects: {html}"
+    );
+    let table = table_rows(&html);
+    assert!(
+        table.contains("<span class=\"badge deleted\">deleted</span>"),
+        "its usage still renders under the filter: {table}"
+    );
+}
+
+#[tokio::test]
+async fn an_unparsable_key_id_shows_a_banner_and_filters_nothing() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, prefix) = seed_key(&db, channel_id, "kept", None).await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?month=2026-06&key_id=abc").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("is not a row id"), "{html}");
+    assert!(html.contains("abc"), "the banner names the value: {html}");
+    assert!(
+        table_rows(&html).contains(&prefix),
+        "the view stays unfiltered: {html}"
     );
 }

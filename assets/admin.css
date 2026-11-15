@@ -117,7 +117,8 @@ body {
   margin-bottom: 16px;
 }
 
-.panel-head h1 {
+.panel-head h1,
+.panel-head h2 {
   font-size: 18px;
   margin: 0;
 }
@@ -871,6 +872,27 @@ td.key-cell {
   border-top: 2px solid var(--border);
   border-bottom: none;
   color: var(--text-muted);
+}
+
+/* Stats page: the two daily charts under the table. The generated SVG fills
+   its block width through the viewBox, so the blocks only have to settle
+   into one column on a narrow page and two on a wide one. */
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 16px 20px;
+}
+
+.chart-title {
+  margin: 0 0 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.chart-block svg {
+  display: block;
+  width: 100%;
 }
 
 /* Session login: the page shown before a session exists, and the logout

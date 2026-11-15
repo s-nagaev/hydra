@@ -344,6 +344,13 @@ fn map_usage(row: &Row) -> sqlx::Result<ModelUsage> {
 
 /// Day-level usage of one (day, key, model) group, as the charts page reads
 /// it.
+///
+/// The token fields repeat the dimensions of [`ModelUsage`], cache
+/// dimensions included, so a day group can be priced by the same
+/// [`crate::usage::group_cost`] fold the table and the monthly-limit gate
+/// use: pricing a day from a row that dropped the cache counts would charge
+/// cached tokens at the full input rate and disagree with the table on the
+/// same page.
 #[derive(Debug, PartialEq, Eq)]
 pub struct DayUsage {
     /// The `YYYY-MM-DD` label of the row's day, the label of the grouping.
@@ -354,6 +361,13 @@ pub struct DayUsage {
     pub model: Option<String>,
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
+    /// Prompt tokens the day's rows served from the upstream cache.
+    pub cached_input_tokens: i64,
+    /// Completion tokens the day's rows served from the upstream cache.
+    pub cached_output_tokens: i64,
+    /// Prompt tokens the day's rows wrote into the upstream cache, the
+    /// dimension the write price applies to.
+    pub cache_write_input_tokens: i64,
     /// Number of logged requests in the group, whatever their status.
     pub requests: i64,
 }
@@ -364,14 +378,16 @@ pub struct DayUsage {
 /// The month window is a range predicate on `created_at` in the WHERE clause,
 /// which is what the `(api_key_id, created_at)` index serves;
 /// `substr(created_at, 1, 10)` appears only as the label of the grouping,
-/// never as a filter that would defeat that index. Rows without an
-/// `api_key_id` (rejections whose key never resolved) are excluded. A `model`
-/// filter naturally drops the NULL-model rows, while without it those rows
-/// form their own group. A NULL token count contributes nothing, so a group
-/// whose rows all lack tokens still counts its requests and sums to zero. The
-/// sums are cast to `BIGINT` because PostgreSQL's `SUM` over `BIGINT` returns
-/// `NUMERIC` while SQLite's stays an integer, and both must read back as
-/// `i64`.
+/// never as a filter that would defeat that index. Every token dimension the
+/// pricing path reads is summed, the cache dimensions included, so a caller
+/// that prices a day gets the same figure the month aggregate prices. Rows
+/// without an `api_key_id` (rejections whose key never resolved) are
+/// excluded. A `model` filter naturally drops the NULL-model rows, while
+/// without it those rows form their own group. A NULL token count contributes
+/// nothing, so a group whose rows all lack tokens still counts its requests
+/// and sums to zero. The sums are cast to `BIGINT` because PostgreSQL's `SUM`
+/// over `BIGINT` returns `NUMERIC` while SQLite's stays an integer, and both
+/// must read back as `i64`.
 pub async fn day_usage(
     db: &Db,
     month_start: &str,
@@ -383,6 +399,11 @@ pub async fn day_usage(
     sql.push("SELECT substr(created_at, 1, 10) AS day, api_key_id, model, ")
         .push("CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS prompt_tokens, ")
         .push("CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS completion_tokens, ")
+        .push("CAST(COALESCE(SUM(cached_input_tokens), 0) AS BIGINT) AS cached_input_tokens, ")
+        .push("CAST(COALESCE(SUM(cached_output_tokens), 0) AS BIGINT) AS cached_output_tokens, ")
+        .push(
+            "CAST(COALESCE(SUM(cache_write_input_tokens), 0) AS BIGINT) AS cache_write_input_tokens, ",
+        )
         .push("COUNT(*) AS request_count FROM request_logs ")
         .push("WHERE api_key_id IS NOT NULL AND created_at >= ")
         .bind(Arg::Text(Some(month_start.to_string())))
@@ -407,6 +428,9 @@ fn map_day_usage(row: &Row) -> sqlx::Result<DayUsage> {
         model: row.opt_text("model")?,
         prompt_tokens: row.int("prompt_tokens")?,
         completion_tokens: row.int("completion_tokens")?,
+        cached_input_tokens: row.int("cached_input_tokens")?,
+        cached_output_tokens: row.int("cached_output_tokens")?,
+        cache_write_input_tokens: row.int("cache_write_input_tokens")?,
         requests: row.int("request_count")?,
     })
 }
@@ -928,6 +952,52 @@ mod tests {
         assert_eq!(usage.len(), 1, "{usage:?}");
         assert_eq!(usage[0].prompt_tokens, 0);
         assert_eq!(usage[0].completion_tokens, 0);
+        assert_eq!(usage[0].requests, 2);
+    }
+
+    #[tokio::test]
+    async fn day_usage_sums_the_cache_dimensions_a_day_was_priced_from() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "day-cache").await;
+        // An Anthropic row: 1300 prompt tokens (1000 uncached, 250 read, 50
+        // written), 200 completions, 10 of them cached.
+        put(
+            &db,
+            key_id,
+            channel_id,
+            NewRequestLog {
+                cached_output_tokens: Some(10),
+                ..row_with_cache_writes(Some("claude"), Some(1300), Some(200), Some(250), Some(50))
+            },
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        // A row the upstream reported no cache counts for adds nothing to the
+        // sums, and a NULL count never becomes a fabricated zero per row.
+        put(
+            &db,
+            key_id,
+            channel_id,
+            NewRequestLog {
+                cached_output_tokens: Some(4),
+                ..row_with_cache_writes(Some("claude"), Some(100), Some(5), None, None)
+            },
+            "2026-11-08 11:00:00",
+        )
+        .await;
+
+        let usage = day_usage(&db, &november().start(), &november().end(), None, None)
+            .await
+            .unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].prompt_tokens, 1400);
+        assert_eq!(usage[0].completion_tokens, 205);
+        assert_eq!(usage[0].cached_input_tokens, 250);
+        assert_eq!(usage[0].cached_output_tokens, 14);
+        assert_eq!(
+            usage[0].cache_write_input_tokens, 50,
+            "the write count is summed per day like the other dimensions"
+        );
         assert_eq!(usage[0].requests, 2);
     }
 

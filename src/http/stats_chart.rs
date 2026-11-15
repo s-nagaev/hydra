@@ -18,40 +18,13 @@
 //! Rows whose day label does not parse to a day of the month are skipped,
 //! and a series that maps to no bar at all renders a placeholder note inside
 //! a valid, empty chart rather than an error.
-//!
-//! This branch carries its own copy of the pinned row shape, because the SQL
-//! aggregate that defines it lands on its own branch. When the two branches
-//! meet, the struct below becomes a re-export of
-//! `crate::db::request_logs::DayUsage` and the charts keep reading the same
-//! fields.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-/// One aggregate row of the stats page: the tokens and requests one day, key
-/// and model accounted for.
-///
-/// The shape is fixed by the SQL aggregate that fills it, so the chart code
-/// never queries the database itself. Its derives match that aggregate's
-/// type, which is what lets the copy collapse into a re-export.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct DayUsage {
-    /// The day the row was grouped by, `YYYY-MM-DD` for the canonical
-    /// `created_at` text form. Only the day of the month is read here.
-    pub day: String,
-    /// The key the row was grouped by. The daily charts sum across keys, so
-    /// the field exists for the caller's filtering.
-    pub key_id: i64,
-    /// The logged model name, NULL for rows logged without one. Irrelevant
-    /// to a daily total and kept for the caller's grouping.
-    pub model: Option<String>,
-    /// Input tokens of the day's rows.
-    pub prompt_tokens: i64,
-    /// Output tokens of the day's rows.
-    pub completion_tokens: i64,
-    /// Logged requests of the day's rows, whatever their status.
-    pub requests: i64,
-}
+/// The aggregate row the SQL layer defines, reused here so both branches of
+/// the stats page read one shape instead of two identical copies.
+pub(crate) use crate::db::request_logs::DayUsage;
 
 /// Viewport width in user units; the root element scales it to the card.
 const VIEW_W: f64 = 720.0;
@@ -449,7 +422,8 @@ fn format_usd(micro_usd: i64) -> String {
 mod tests {
     use super::*;
 
-    /// A row as the SQL aggregate would hand it over.
+    /// A row as the SQL aggregate would hand it over. The cache dimensions
+    /// take no part in a daily token total, so they stay at zero here.
     fn row(
         day: &str,
         model: Option<&str>,
@@ -463,6 +437,9 @@ mod tests {
             model: model.map(str::to_owned),
             prompt_tokens: prompt,
             completion_tokens: completion,
+            cached_input_tokens: 0,
+            cached_output_tokens: 0,
+            cache_write_input_tokens: 0,
             requests,
         }
     }

@@ -31,6 +31,22 @@
 //! shareable and reloadable without JavaScript, and a malformed value falls
 //! back to the current month behind a banner instead of failing the page.
 //!
+//! Two optional filters narrow the view, a key and a model, read from the
+//! same query string and combined with the month. They apply to the table
+//! and to the charts alike, which is why the table is narrowed by filtering
+//! the per-key aggregates the page already loaded rather than by a second
+//! query, while the day rows arrive pre-filtered from their own aggregate.
+//! The month links carry whatever filters are set, so stepping through
+//! months keeps the slice of usage the admin is looking at.
+//!
+//! Under the table sit two charts of the same filtered month, tokens per day
+//! and cost per day, drawn server-side by [`crate::http::stats_chart`] as
+//! plain SVG and injected with askama's `|safe` filter. The cost of a day is
+//! the sum of [`crate::usage::group_cost`] over that day's groups, priced
+//! from the key's channel exactly like the table, so the bars and the table
+//! add up to the same money. A view with no day rows renders no chart at all
+//! and keeps the table's empty state instead.
+//!
 //! There is no mutating route here, so the CSRF guard has nothing to reject;
 //! the module is merged into the `/admin/ui` nest like the other read-only
 //! pages.
@@ -47,9 +63,10 @@ use serde::Deserialize;
 
 use crate::db::channels::{self, PricedChannel};
 use crate::db::keys::{self, ApiKey};
-use crate::db::request_logs::{self, ModelUsage};
+use crate::db::request_logs::{self, DayUsage, ModelUsage};
 use crate::db::Db;
-use crate::http::admin_ui_logs::thousands;
+use crate::http::admin_ui_logs::{thousands, SelectOption};
+use crate::http::stats_chart;
 use crate::http::ui_auth::UiAuth;
 use crate::http::AppState;
 use crate::limits;
@@ -57,11 +74,32 @@ use crate::month::Month;
 use crate::prices::ModelPrices;
 use crate::usage;
 
-/// The month query parameter. Kept as a string so a malformed value becomes
-/// a banner over the current month instead of a rejected request.
+/// The view state of the page: the month and the two optional filters. Kept
+/// as strings so a malformed or empty value becomes a banner over an
+/// unfiltered view instead of a rejected request.
 #[derive(Debug, Default, Deserialize)]
 pub struct StatsQuery {
     month: Option<String>,
+    key_id: Option<String>,
+    model: Option<String>,
+}
+
+/// The key and model filters of one view, after parsing. Both are absent
+/// when the parameter is missing, blank or, for the key, not a row id.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Filters {
+    key_id: Option<i64>,
+    /// The trimmed model name; `None` when the parameter is absent or blank.
+    model: Option<String>,
+}
+
+impl Filters {
+    /// Whether the view narrows anything at all, which decides between the
+    /// "no requests logged" and the "no usage matches the filters" empty
+    /// text.
+    fn is_set(&self) -> bool {
+        self.key_id.is_some() || self.model.is_some()
+    }
 }
 
 /// One table line: either a key's usage of one model, or that key's total
@@ -88,6 +126,15 @@ pub struct DisplaySums {
     pub cost: String,
 }
 
+/// The two charts of the view, already rendered as SVG. Present only when
+/// the filtered month has rows to plot.
+pub struct Charts {
+    /// Tokens per day, input and output stacked.
+    pub tokens_svg: String,
+    /// Cost per day, priced from each key's channel.
+    pub cost_svg: String,
+}
+
 #[derive(Template, WebTemplate)]
 #[template(path = "stats.html")]
 pub struct StatsPage {
@@ -99,6 +146,13 @@ pub struct StatsPage {
     pub month_value: String,
     pub rows: Vec<StatsRow>,
     pub grand: DisplaySums,
+    /// The Key select: `All keys` plus every stored key, soft-deleted ones
+    /// included.
+    pub key_options: Vec<SelectOption>,
+    /// The Model select: `All models` plus every model logged in the month.
+    pub model_options: Vec<SelectOption>,
+    /// Absent when the filtered month has nothing to plot.
+    pub charts: Option<Charts>,
     pub prev_url: String,
     pub next_url: String,
     pub current_url: String,
@@ -199,6 +253,10 @@ struct StatsData {
     month: Month,
     keys: Vec<KeyUsage>,
     channels: HashMap<i64, ChannelInfo>,
+    /// Day-level rows of the filtered month, for the charts.
+    days: Vec<DayUsage>,
+    /// The distinct models logged in the month, for the Model select.
+    models: Vec<String>,
 }
 
 fn internal_error(error: &sqlx::Error) -> String {
@@ -212,9 +270,18 @@ fn month_label(month: &Month) -> String {
     String::from_utf8_lossy(&month.bucket()).to_string()
 }
 
-/// The link to one month's view of the page.
-fn month_url(month: &Month) -> String {
-    format!("/admin/ui/stats?month={}", month_label(month))
+/// The link to one view of the page: the month always travels, a filter only
+/// when it carries a value, so a shared URL stays as short as it can.
+fn view_url(month: &Month, filters: &Filters) -> String {
+    let mut serializer = url::form_urlencoded::Serializer::new(String::new());
+    serializer.append_pair("month", &month_label(month));
+    if let Some(key_id) = filters.key_id {
+        serializer.append_pair("key_id", &key_id.to_string());
+    }
+    if let Some(model) = &filters.model {
+        serializer.append_pair("model", model);
+    }
+    format!("/admin/ui/stats?{}", serializer.finish())
 }
 
 /// Resolves the `month` query parameter into the month to render: the
@@ -236,6 +303,38 @@ fn resolve_month(query: &StatsQuery) -> (Month, Option<String>) {
             ),
         },
     }
+}
+
+/// Resolves the `key_id` and `model` query parameters into the view's
+/// filters. A blank value means "no filter", an unparsable key id yields the
+/// banner text and no filter (the same lenient reading the month parameter
+/// gets), and the model name is trimmed so a stray space cannot hide every
+/// row.
+fn resolve_filters(query: &StatsQuery) -> (Filters, Option<String>) {
+    let model = query
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let raw_key = query
+        .key_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (key_id, error) = match raw_key {
+        None => (None, None),
+        Some(value) => match value.parse::<i64>() {
+            Ok(id) => (Some(id), None),
+            Err(_) => (
+                None,
+                Some(format!(
+                    "key_id \"{value}\" is not a row id; showing every key"
+                )),
+            ),
+        },
+    };
+    (Filters { key_id, model }, error)
 }
 
 /// `$0.004`, or `$0.000001` for an amount below one cent. A cost is never
@@ -282,13 +381,31 @@ async fn channel_info(db: &Db) -> sqlx::Result<HashMap<i64, ChannelInfo>> {
         .collect())
 }
 
-/// Loads the key list, the channel price tables and one month-to-date
-/// aggregate per key.
-async fn load(state: &AppState, month: &Month) -> Result<StatsData, String> {
+/// Loads the key list, the channel price tables, one month-to-date aggregate
+/// per key, the day rows the charts plot and the model names of the month.
+///
+/// The month aggregate is per key and is narrowed in memory by [`build_page`];
+/// the day rows are narrowed by their own query, which already carries the
+/// same two predicates. The model list of the select stays month-scoped and
+/// unfiltered on purpose, so the control always offers every model of the
+/// month rather than only the surviving one.
+async fn load(state: &AppState, month: &Month, filters: &Filters) -> Result<StatsData, String> {
     let key_list = keys::list(&state.db)
         .await
         .map_err(|error| internal_error(&error))?;
     let channels = channel_info(&state.db)
+        .await
+        .map_err(|error| internal_error(&error))?;
+    let days = request_logs::day_usage(
+        &state.db,
+        &month.start(),
+        &month.end(),
+        filters.key_id,
+        filters.model.clone(),
+    )
+    .await
+    .map_err(|error| internal_error(&error))?;
+    let models = request_logs::distinct_models(&state.db, &month.start(), &month.end())
         .await
         .map_err(|error| internal_error(&error))?;
     let mut keys = Vec::with_capacity(key_list.len());
@@ -302,16 +419,65 @@ async fn load(state: &AppState, month: &Month) -> Result<StatsData, String> {
         month: *month,
         keys,
         channels,
+        days,
+        models,
     })
 }
 
-/// The page with its navigation and empty table in place; the rows and the
-/// grand totals are filled in by [`build_page`].
-fn page_shell(month: &Month, error: Option<String>) -> StatsPage {
+/// The Key select: `All keys` plus every key the page loaded, soft-deleted
+/// ones included (they hold usage rows), labeled like the keys panel. A
+/// selected id the list does not carry leaves no option selected, and the
+/// browser then shows the first one, `All keys`; the alternative, a
+/// hand-typed id no key ever had, filters the view to nothing anyway.
+fn key_options(keys: &[KeyUsage], selected: Option<i64>) -> Vec<SelectOption> {
+    let mut options = vec![SelectOption {
+        value: String::new(),
+        label: "All keys".to_string(),
+        selected: selected.is_none(),
+    }];
+    options.extend(keys.iter().map(|usage| SelectOption {
+        value: usage.key.id.to_string(),
+        label: key_label(&usage.key),
+        selected: Some(usage.key.id) == selected,
+    }));
+    options
+}
+
+/// The Model select: `All models` plus every model logged in the month,
+/// alphabetically. A selected model the month has no rows for is added to
+/// the list, so switching months behind a model filter never leaves the
+/// control claiming "All models" while the table is filtered to one.
+fn model_options(models: &[String], selected: Option<&str>) -> Vec<SelectOption> {
+    let mut names = models.to_vec();
+    if let Some(selected) = selected {
+        if !names.iter().any(|name| name == selected) {
+            names.push(selected.to_string());
+        }
+    }
+    names.sort();
+    names.dedup();
+    let mut options = vec![SelectOption {
+        value: String::new(),
+        label: "All models".to_string(),
+        selected: selected.is_none(),
+    }];
+    options.extend(names.into_iter().map(|name| SelectOption {
+        value: name.clone(),
+        label: name.clone(),
+        selected: Some(name.as_str()) == selected,
+    }));
+    options
+}
+
+/// The page with its navigation, filter widgets and empty table in place;
+/// the rows, the grand totals and the charts are filled in by [`build_page`].
+fn page_shell(month: &Month, filters: &Filters, error: Option<String>) -> StatsPage {
     let label = month_label(month);
     let current = Month::current();
     let empty_message = if error.is_some() {
         String::new()
+    } else if filters.is_set() {
+        format!("No usage matches the current filters in {label}.")
     } else {
         format!(
             "No requests logged in {label}. Usage appears here as clients call \
@@ -325,24 +491,97 @@ fn page_shell(month: &Month, error: Option<String>) -> StatsPage {
         month_label: label,
         rows: Vec::new(),
         grand: Sums::default().display(),
-        prev_url: month_url(&month.previous()),
-        next_url: month_url(&month.next()),
-        current_url: month_url(&current),
+        key_options: key_options(&[], filters.key_id),
+        model_options: model_options(&[], filters.model.as_deref()),
+        charts: None,
+        prev_url: view_url(&month.previous(), filters),
+        next_url: view_url(&month.next(), filters),
+        current_url: view_url(&current, filters),
         is_current_month: *month == current,
         empty_message,
         error,
     }
 }
 
+/// One day group as the shape the pricing fold reads, so a day is priced by
+/// the same [`usage::group_cost`] call the table's month groups go through.
+fn day_group(day: &DayUsage) -> ModelUsage {
+    ModelUsage {
+        model: day.model.clone(),
+        prompt_tokens: day.prompt_tokens,
+        completion_tokens: day.completion_tokens,
+        cached_input_tokens: day.cached_input_tokens,
+        cached_output_tokens: day.cached_output_tokens,
+        cache_write_input_tokens: day.cache_write_input_tokens,
+        requests: day.requests,
+    }
+}
+
+/// The charts of one view: the daily token bars, and the daily cost bars
+/// built by pricing every day group from the price table of the key that
+/// spent it. A key whose channel is missing or prices nothing contributes
+/// zero, exactly as it does in the table. `None` when the filtered month has
+/// no day rows at all, which is when the page shows its empty state instead
+/// of an empty plot.
+fn charts(data: &StatsData) -> Option<Charts> {
+    if data.days.is_empty() {
+        return None;
+    }
+    // A day group names the key, not the channel, so the key's bound channel
+    // is where its prices come from.
+    let channels: HashMap<i64, &ChannelInfo> = data
+        .keys
+        .iter()
+        .filter_map(|usage| {
+            data.channels
+                .get(&usage.key.channel_id)
+                .map(|info| (usage.key.id, info))
+        })
+        .collect();
+    let costs: Vec<(String, i64)> = data
+        .days
+        .iter()
+        .map(|day| {
+            let prices = channels
+                .get(&day.key_id)
+                .and_then(|info| info.prices.as_ref());
+            (day.day.clone(), usage::group_cost(&day_group(day), prices))
+        })
+        .collect();
+    Some(Charts {
+        tokens_svg: stats_chart::daily_token_bars(&data.days),
+        cost_svg: stats_chart::daily_cost_bars(&costs),
+    })
+}
+
 /// Renders the table: the model lines of every key that saw usage in the
 /// month, each followed by the key's total line, plus the grand total.
-fn build_page(data: StatsData, error: Option<String>) -> StatsPage {
-    let mut page = page_shell(&data.month, error);
+///
+/// The filters narrow this in memory. A key filter drops every other key's
+/// blocks, a model filter drops the groups of other models, and a block left
+/// with no group disappears whole, so a key with no usage under the current
+/// filters is omitted exactly like a key with no usage in the month.
+fn build_page(data: StatsData, filters: &Filters, error: Option<String>) -> StatsPage {
+    let mut page = page_shell(&data.month, filters, error);
     let mut grand = Sums::default();
     let mut rows: Vec<StatsRow> = Vec::new();
 
     for key_usage in &data.keys {
-        if key_usage.groups.is_empty() {
+        if filters
+            .key_id
+            .is_some_and(|key_id| key_id != key_usage.key.id)
+        {
+            continue;
+        }
+        let mut order: Vec<&ModelUsage> = key_usage
+            .groups
+            .iter()
+            .filter(|group| match filters.model.as_deref() {
+                Some(model) => group.model.as_deref() == Some(model),
+                None => true,
+            })
+            .collect();
+        if order.is_empty() {
             continue;
         }
         let info = data.channels.get(&key_usage.key.channel_id);
@@ -352,13 +591,16 @@ fn build_page(data: StatsData, error: Option<String>) -> StatsPage {
         let key_label = key_label(&key_usage.key);
         let key_deleted = key_usage.key.deleted_at.is_some();
 
-        let mut order: Vec<&ModelUsage> = key_usage.groups.iter().collect();
         order.sort_by(|left, right| sort_key(&left.model).cmp(&sort_key(&right.model)));
 
+        // The key's total is the shared fold of the same per-group costs the
+        // rows below show, so the two can never disagree; only the surviving
+        // groups of the filter take part in it.
         let mut key_sums = Sums::default();
         for group in order {
             let cost = usage::group_cost(group, prices);
             key_sums.add_group(group);
+            key_sums.add_cost(cost);
             rows.push(StatsRow {
                 key_label: key_label.clone(),
                 key_deleted,
@@ -377,9 +619,6 @@ fn build_page(data: StatsData, error: Option<String>) -> StatsPage {
             });
         }
 
-        // The key's total is the shared fold of the same per-group costs the
-        // rows above show, so the two can never disagree.
-        key_sums.add_cost(usage::month_cost(&key_usage.groups, prices));
         rows.push(StatsRow {
             key_label,
             key_deleted,
@@ -393,14 +632,17 @@ fn build_page(data: StatsData, error: Option<String>) -> StatsPage {
         grand.add_sums(&key_sums);
     }
 
+    page.key_options = key_options(&data.keys, filters.key_id);
+    page.model_options = model_options(&data.models, filters.model.as_deref());
+    page.charts = charts(&data);
     page.grand = grand.display();
     page.rows = rows;
     page
 }
 
-/// GET /admin/ui/stats: the usage table for one month. Query deserialization
-/// cannot fail with a single string field, but the rejection path is kept for
-/// robustness.
+/// GET /admin/ui/stats: the usage table and the charts for one month, under
+/// the key and model filters of the URL. Query deserialization cannot fail
+/// with string fields, but the rejection path is kept for robustness.
 pub async fn page(
     State(state): State<AppState>,
     _auth: UiAuth,
@@ -411,10 +653,11 @@ pub async fn page(
         Err(rejection) => (StatsQuery::default(), Some(rejection.body_text())),
     };
     let (month, month_error) = resolve_month(&query);
-    let error = rejection.or(month_error);
-    match load(&state, &month).await {
-        Ok(data) => build_page(data, error),
-        Err(message) => page_shell(&month, Some(message)),
+    let (filters, filter_error) = resolve_filters(&query);
+    let error = rejection.or(month_error).or(filter_error);
+    match load(&state, &month, &filters).await {
+        Ok(data) => build_page(data, &filters, error),
+        Err(message) => page_shell(&month, &filters, Some(message)),
     }
 }
 
@@ -437,6 +680,22 @@ mod tests {
             cached_output_tokens: 0,
             cache_write_input_tokens: 0,
             requests,
+        }
+    }
+
+    /// One day-level row as the day aggregate hands it over. The cache
+    /// dimensions stay at zero unless a test sets them.
+    fn day_row(day: &str, model: &str, prompt: i64, completion: i64) -> DayUsage {
+        DayUsage {
+            day: day.to_string(),
+            key_id: 1,
+            model: Some(model.to_string()),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_input_tokens: 0,
+            cached_output_tokens: 0,
+            cache_write_input_tokens: 0,
+            requests: 1,
         }
     }
 
@@ -490,12 +749,33 @@ mod tests {
         }
     }
 
+    /// Loaded data for one month, without day rows or model names: the table
+    /// tests do not need the charts.
+    fn stats_data(
+        month: Month,
+        keys: Vec<KeyUsage>,
+        channels: HashMap<i64, ChannelInfo>,
+    ) -> StatsData {
+        StatsData {
+            month,
+            keys,
+            channels,
+            days: Vec::new(),
+            models: Vec::new(),
+        }
+    }
+
+    fn november() -> Month {
+        Month::from_parts(2026, 11).unwrap()
+    }
+
     #[test]
     fn a_missing_or_blank_month_resolves_to_the_current_month() {
         let current = Month::current();
         assert_eq!(resolve_month(&StatsQuery::default()).0, current);
         let query = StatsQuery {
             month: Some("   ".to_string()),
+            ..StatsQuery::default()
         };
         assert_eq!(resolve_month(&query).0, current);
         assert!(resolve_month(&StatsQuery::default()).1.is_none());
@@ -505,6 +785,7 @@ mod tests {
     fn a_parseable_month_is_used_verbatim_and_a_bad_one_falls_back() {
         let query = StatsQuery {
             month: Some("2026-01".to_string()),
+            ..StatsQuery::default()
         };
         let (month, error) = resolve_month(&query);
         assert_eq!(month, Month::from_parts(2026, 1).unwrap());
@@ -512,6 +793,7 @@ mod tests {
 
         let query = StatsQuery {
             month: Some("January".to_string()),
+            ..StatsQuery::default()
         };
         let (month, error) = resolve_month(&query);
         assert_eq!(month, Month::current());
@@ -521,14 +803,77 @@ mod tests {
     }
 
     #[test]
-    fn month_links_carry_the_adjacent_labels() {
+    fn view_links_carry_the_month_and_only_the_filters_that_are_set() {
         let january = Month::from_parts(2026, 1).unwrap();
-        assert_eq!(month_url(&january), "/admin/ui/stats?month=2026-01");
         assert_eq!(
-            month_url(&january.previous()),
+            view_url(&january, &Filters::default()),
+            "/admin/ui/stats?month=2026-01"
+        );
+        assert_eq!(
+            view_url(&january.previous(), &Filters::default()),
             "/admin/ui/stats?month=2025-12"
         );
-        assert_eq!(month_url(&january.next()), "/admin/ui/stats?month=2026-02");
+        assert_eq!(
+            view_url(&january.next(), &Filters::default()),
+            "/admin/ui/stats?month=2026-02"
+        );
+
+        let both = Filters {
+            key_id: Some(3),
+            model: Some("gpt-4o".to_string()),
+        };
+        assert_eq!(
+            view_url(&january, &both),
+            "/admin/ui/stats?month=2026-01&key_id=3&model=gpt-4o"
+        );
+        // Whitespace inside a model name survives as a URL-encoded value
+        // rather than splitting the query string.
+        let spaced = Filters {
+            key_id: None,
+            model: Some("claude 3.5".to_string()),
+        };
+        assert_eq!(
+            view_url(&january, &spaced),
+            "/admin/ui/stats?month=2026-01&model=claude+3.5"
+        );
+    }
+
+    #[test]
+    fn filters_read_blank_values_as_no_filter_and_report_a_bad_key_id() {
+        let (filters, error) = resolve_filters(&StatsQuery::default());
+        assert_eq!(filters, Filters::default());
+        assert!(error.is_none());
+
+        let query = StatsQuery {
+            key_id: Some("  ".to_string()),
+            model: Some("   ".to_string()),
+            ..StatsQuery::default()
+        };
+        let (filters, error) = resolve_filters(&query);
+        assert_eq!(filters, Filters::default());
+        assert!(!filters.is_set());
+        assert!(error.is_none());
+
+        let query = StatsQuery {
+            key_id: Some(" 7 ".to_string()),
+            model: Some(" gpt-4o ".to_string()),
+            ..StatsQuery::default()
+        };
+        let (filters, error) = resolve_filters(&query);
+        assert_eq!(filters.key_id, Some(7));
+        assert_eq!(filters.model.as_deref(), Some("gpt-4o"));
+        assert!(filters.is_set());
+        assert!(error.is_none());
+
+        let query = StatsQuery {
+            key_id: Some("abc".to_string()),
+            ..StatsQuery::default()
+        };
+        let (filters, error) = resolve_filters(&query);
+        assert_eq!(filters.key_id, None, "an unparsable id filters nothing");
+        let error = error.expect("the offending value is reported");
+        assert!(error.contains("abc"), "{error}");
+        assert!(error.contains("row id"), "{error}");
     }
 
     #[test]
@@ -548,28 +893,33 @@ mod tests {
 
     #[test]
     fn a_page_builds_one_row_per_model_plus_a_key_total() {
-        let data = StatsData {
-            month: Month::from_parts(2026, 11).unwrap(),
-            keys: vec![KeyUsage {
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
                 key: stored_key(None),
                 groups: vec![
                     usage("gpt-4o", 1000, 200, 2),
                     usage("gpt-5-mini", 500, 100, 1),
                 ],
             }],
-            channels: HashMap::from([(7, channel_info_limitable())]),
-        };
-        let page = build_page(data, None);
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        let page = build_page(data, &Filters::default(), None);
         assert_eq!(page.rows.len(), 3, "two models plus the total line");
         assert_eq!(page.section, "stats");
         assert_eq!(page.month_label, "2026-11");
         assert_eq!(page.month_value, "2026-11");
         assert_eq!(
             page.is_current_month,
-            Month::from_parts(2026, 11).unwrap() == Month::current()
+            Month::from_parts(2026, 11).unwrap() == Month::current(),
+            "the flag follows the month the page renders"
         );
         assert!(page.prev_url.ends_with("month=2026-10"));
         assert!(page.next_url.ends_with("month=2026-12"));
+        assert!(
+            page.charts.is_none(),
+            "a month with no day rows draws no chart"
+        );
 
         // gpt-4o is priced (4500 micro-USD for 1000 prompt and 200
         // completion tokens with no cache report), the other model is not in
@@ -610,15 +960,15 @@ mod tests {
         let mut group = usage("claude", 1300, 200, 1);
         group.cached_input_tokens = 250;
         group.cache_write_input_tokens = 50;
-        let data = StatsData {
-            month: Month::from_parts(2026, 11).unwrap(),
-            keys: vec![KeyUsage {
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
                 key: stored_key(None),
                 groups: vec![group],
             }],
-            channels: HashMap::from([(7, channel_info_write_priced())]),
-        };
-        let page = build_page(data, None);
+            HashMap::from([(7, channel_info_write_priced())]),
+        );
+        let page = build_page(data, &Filters::default(), None);
         let row = &page.rows[0];
         assert_eq!(row.model_label, "claude");
         assert_eq!(row.sums.cache_write_input_tokens, "50");
@@ -638,33 +988,37 @@ mod tests {
 
     #[test]
     fn a_key_without_usage_in_the_month_is_omitted_entirely() {
-        let data = StatsData {
-            month: Month::from_parts(2026, 11).unwrap(),
-            keys: vec![KeyUsage {
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
                 key: stored_key(None),
                 groups: Vec::new(),
             }],
-            channels: HashMap::from([(7, channel_info_limitable())]),
-        };
-        let page = build_page(data, None);
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        let page = build_page(data, &Filters::default(), None);
         assert!(page.rows.is_empty());
         assert_eq!(page.grand.cost, "$0.00");
         assert!(page.empty_message.contains("2026-11"));
+        assert!(
+            !page.empty_message.contains("filters"),
+            "an unfiltered empty month keeps the plain wording"
+        );
     }
 
     #[test]
     fn a_limited_key_on_an_unlimitable_channel_gets_the_warning_badge() {
         let mut unlimitable = channel_info_limitable();
         unlimitable.limitable = false;
-        let data = StatsData {
-            month: Month::from_parts(2026, 11).unwrap(),
-            keys: vec![KeyUsage {
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
                 key: stored_key(Some(50_000_000)),
                 groups: vec![usage("gpt-4o", 1000, 200, 1)],
             }],
-            channels: HashMap::from([(7, unlimitable)]),
-        };
-        let page = build_page(data, None);
+            HashMap::from([(7, unlimitable)]),
+        );
+        let page = build_page(data, &Filters::default(), None);
         let total = page.rows.last().unwrap();
         assert!(total.is_total);
         assert!(total.limit_inactive, "the total line carries the warning");
@@ -673,29 +1027,29 @@ mod tests {
         // unpriced the channel is.
         let mut unlimitable = channel_info_limitable();
         unlimitable.limitable = false;
-        let data = StatsData {
-            month: Month::from_parts(2026, 11).unwrap(),
-            keys: vec![KeyUsage {
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
                 key: stored_key(None),
                 groups: vec![usage("gpt-4o", 1000, 200, 1)],
             }],
-            channels: HashMap::from([(7, unlimitable)]),
-        };
-        let page = build_page(data, None);
+            HashMap::from([(7, unlimitable)]),
+        );
+        let page = build_page(data, &Filters::default(), None);
         assert!(!page.rows.last().unwrap().limit_inactive);
     }
 
     #[test]
     fn a_key_bound_to_a_channel_that_vanished_costs_nothing_and_warns() {
-        let data = StatsData {
-            month: Month::from_parts(2026, 11).unwrap(),
-            keys: vec![KeyUsage {
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
                 key: stored_key(Some(50_000_000)),
                 groups: vec![usage("gpt-4o", 1000, 200, 1)],
             }],
-            channels: HashMap::new(),
-        };
-        let page = build_page(data, None);
+            HashMap::new(),
+        );
+        let page = build_page(data, &Filters::default(), None);
         let total = page.rows.last().unwrap();
         assert_eq!(total.sums.cost, "$0.00");
         assert!(total.limit_inactive);
@@ -705,35 +1059,317 @@ mod tests {
     fn a_deleted_key_keeps_its_rows_and_is_marked() {
         let mut key = stored_key(None);
         key.deleted_at = Some("2026-11-02 00:00:00".to_string());
-        let data = StatsData {
-            month: Month::from_parts(2026, 11).unwrap(),
-            keys: vec![KeyUsage {
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
                 key,
                 groups: vec![usage("gpt-4o", 1000, 200, 1)],
             }],
-            channels: HashMap::from([(7, channel_info_limitable())]),
-        };
-        let page = build_page(data, None);
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        let page = build_page(data, &Filters::default(), None);
         assert!(page.rows.iter().all(|row| row.key_deleted));
         assert_eq!(page.rows.len(), 2);
     }
 
     #[test]
+    fn a_key_filter_keeps_only_that_keys_blocks_and_totals() {
+        let mut second = stored_key(None);
+        second.id = 2;
+        second.display_prefix = "hyd-2b2b2b2b".to_string();
+        let keys = || {
+            vec![
+                KeyUsage {
+                    key: stored_key(None),
+                    groups: vec![usage("gpt-4o", 1000, 200, 1)],
+                },
+                KeyUsage {
+                    key: second.clone(),
+                    groups: vec![usage("gpt-4o", 10, 1, 1)],
+                },
+            ]
+        };
+        let data = stats_data(
+            november(),
+            keys(),
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        let page = build_page(
+            data,
+            &Filters {
+                key_id: Some(2),
+                model: None,
+            },
+            None,
+        );
+        assert_eq!(page.rows.len(), 2, "one model line and one total");
+        assert_eq!(page.rows[0].key_label, "hyd-2b2b2b2b");
+        assert_eq!(page.rows[1].key_label, "hyd-2b2b2b2b");
+        assert_eq!(
+            page.grand.prompt_tokens, "10",
+            "the totals follow the filter"
+        );
+        assert_eq!(
+            page.grand.cost, "$0.000035",
+            "10 prompt tokens at 2.50 and 1 completion at 10.00 per 1M"
+        );
+
+        // A key id no row carries selects nothing, and the empty state says
+        // the filters are the reason.
+        let data = stats_data(
+            november(),
+            keys(),
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        let page = build_page(
+            data,
+            &Filters {
+                key_id: Some(9),
+                model: None,
+            },
+            None,
+        );
+        assert!(page.rows.is_empty());
+        assert_eq!(page.grand.cost, "$0.00");
+        assert!(page
+            .empty_message
+            .contains("No usage matches the current filters"));
+    }
+
+    #[test]
+    fn a_model_filter_keeps_one_model_line_per_key() {
+        let groups = || {
+            vec![
+                usage("gpt-4o", 1000, 200, 1),
+                usage("gpt-5-mini", 100, 50, 1),
+            ]
+        };
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
+                key: stored_key(None),
+                groups: groups(),
+            }],
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        let page = build_page(
+            data,
+            &Filters {
+                key_id: None,
+                model: Some("gpt-5-mini".to_string()),
+            },
+            None,
+        );
+        assert_eq!(
+            page.rows.len(),
+            2,
+            "the surviving model line plus the key total"
+        );
+        assert_eq!(page.rows[0].model_label, "gpt-5-mini");
+        assert_eq!(
+            page.rows[0].sums.cost, "$0.00",
+            "an unpriced model stays zero"
+        );
+        assert_eq!(
+            page.rows[1].sums.prompt_tokens, "100",
+            "the total is filtered"
+        );
+        assert_eq!(page.grand.prompt_tokens, "100");
+
+        // A model nothing logged empties the table and changes the wording.
+        let data = stats_data(
+            november(),
+            vec![KeyUsage {
+                key: stored_key(None),
+                groups: groups(),
+            }],
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        let page = build_page(
+            data,
+            &Filters {
+                key_id: None,
+                model: Some("nope".to_string()),
+            },
+            None,
+        );
+        assert!(page.rows.is_empty());
+        assert!(page
+            .empty_message
+            .contains("No usage matches the current filters"));
+    }
+
+    #[test]
+    fn the_key_select_lists_every_key_of_the_page_with_the_selected_one_marked() {
+        let mut deleted = stored_key(None);
+        deleted.id = 2;
+        deleted.display_prefix = "hyd-9a9a9a9a".to_string();
+        deleted.deleted_at = Some("2026-11-03 00:00:00".to_string());
+        let keys = vec![
+            KeyUsage {
+                key: stored_key(None),
+                groups: Vec::new(),
+            },
+            KeyUsage {
+                key: deleted,
+                groups: Vec::new(),
+            },
+        ];
+
+        let options = key_options(&keys, Some(2));
+        let labels: Vec<&str> = options.iter().map(|option| option.label.as_str()).collect();
+        assert_eq!(labels, vec!["All keys", "hyd-4f9dEg2x", "hyd-9a9a9a9a"]);
+        assert!(!options[0].selected);
+        assert!(!options[1].selected);
+        assert!(
+            options[2].selected,
+            "a soft-deleted key stays selectable and keeps its usage rows"
+        );
+
+        let options = key_options(&keys, None);
+        assert!(options[0].selected);
+        assert_eq!(options.len(), 3);
+    }
+
+    #[test]
+    fn the_model_select_keeps_a_selected_model_the_month_has_no_rows_for() {
+        let models = vec!["gpt-4o".to_string(), "claude-3".to_string()];
+        let options = model_options(&models, Some("gpt-5-mini"));
+        let labels: Vec<&str> = options.iter().map(|option| option.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec!["All models", "claude-3", "gpt-4o", "gpt-5-mini"],
+            "the list stays sorted and keeps the filter that is in force"
+        );
+        assert!(options[3].selected);
+        assert!(!options[0].selected);
+
+        let options = model_options(&models, None);
+        assert_eq!(options.len(), 3);
+        assert!(
+            options[0].selected,
+            "no filter means All models is selected"
+        );
+
+        let options = model_options(&models, Some("gpt-4o"));
+        assert!(options[2].selected);
+        assert_eq!(
+            options.iter().filter(|option| option.selected).count(),
+            1,
+            "exactly one option is ever selected"
+        );
+    }
+
+    #[test]
+    fn the_charts_render_for_a_month_with_day_rows_and_price_a_day_like_the_table() {
+        // The same usage as a month group and as one day group: 1000 prompt
+        // tokens with 400 of them cached and 200 completions, which the
+        // pinned formula prices at 4000 micro-USD.
+        let mut group = usage("gpt-4o", 1000, 200, 1);
+        group.cached_input_tokens = 400;
+        let mut day = day_row("2026-11-02", "gpt-4o", 1000, 200);
+        day.cached_input_tokens = 400;
+        let mut data = stats_data(
+            november(),
+            vec![KeyUsage {
+                key: stored_key(None),
+                groups: vec![group],
+            }],
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        data.days = vec![day];
+        data.models = vec!["gpt-4o".to_string()];
+
+        let page = build_page(data, &Filters::default(), None);
+        let plot = page.charts.expect("day rows draw both charts");
+        assert!(plot.tokens_svg.starts_with("<svg "), "{}", plot.tokens_svg);
+        assert!(plot.tokens_svg.contains("aria-label=\"Tokens per day\""));
+        assert_eq!(
+            plot.tokens_svg
+                .matches("Day 2: 1,200 tokens (1,000 in, 200 out) in 1 requests")
+                .count(),
+            1,
+            "the token bar carries the day's figures"
+        );
+        assert!(plot.cost_svg.contains("aria-label=\"Cost per day\""));
+        assert!(
+            plot.cost_svg.contains("Day 2: $0.004"),
+            "the cached share is priced at the cached rate, not at the input rate: {}",
+            plot.cost_svg
+        );
+        assert_eq!(
+            page.grand.cost, "$0.004",
+            "the chart and the table price the same rows the same way"
+        );
+    }
+
+    #[test]
+    fn the_charts_stay_absent_when_the_filtered_month_has_no_day_rows() {
+        let mut data = stats_data(
+            november(),
+            vec![KeyUsage {
+                key: stored_key(None),
+                groups: vec![usage("gpt-4o", 1000, 200, 1)],
+            }],
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        data.models = vec!["gpt-4o".to_string()];
+        let page = build_page(data, &Filters::default(), None);
+        assert!(page.charts.is_none());
+        assert_eq!(page.rows.len(), 2, "the table still renders");
+    }
+
+    #[test]
     fn the_failure_shell_keeps_the_navigation_and_drops_the_empty_message() {
-        let month = Month::from_parts(2026, 11).unwrap();
-        let page = page_shell(&month, Some("internal server error".to_string()));
+        let month = november();
+        let page = page_shell(
+            &month,
+            &Filters::default(),
+            Some("internal server error".into()),
+        );
         assert!(page.rows.is_empty());
         assert_eq!(page.error.as_deref(), Some("internal server error"));
         assert!(page.empty_message.is_empty());
+        assert!(page.charts.is_none());
         assert_eq!(page.prev_url, "/admin/ui/stats?month=2026-10");
         assert_eq!(page.next_url, "/admin/ui/stats?month=2026-12");
+        assert_eq!(
+            page.key_options.len(),
+            1,
+            "the key select keeps its default"
+        );
+        assert!(page.key_options[0].selected);
     }
 
     #[test]
     fn the_current_month_is_flagged_and_linked() {
-        let page = page_shell(&Month::current(), None);
+        let page = page_shell(&Month::current(), &Filters::default(), None);
         assert!(page.is_current_month);
-        assert_eq!(page.current_url, month_url(&Month::current()));
+        assert_eq!(
+            page.current_url,
+            view_url(&Month::current(), &Filters::default())
+        );
         assert!(!page.empty_message.is_empty());
+    }
+
+    #[test]
+    fn the_navigation_links_of_a_filtered_view_keep_the_filters() {
+        let month = november();
+        let filters = Filters {
+            key_id: Some(4),
+            model: Some("gpt-4o".to_string()),
+        };
+        let page = page_shell(&month, &filters, None);
+        assert_eq!(
+            page.prev_url,
+            "/admin/ui/stats?month=2026-10&key_id=4&model=gpt-4o"
+        );
+        assert_eq!(
+            page.next_url,
+            "/admin/ui/stats?month=2026-12&key_id=4&model=gpt-4o"
+        );
+        assert!(page
+            .empty_message
+            .contains("No usage matches the current filters"));
     }
 }
