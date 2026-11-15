@@ -947,4 +947,34 @@ async fn pg_stats_page_renders_priced_range_rows() {
             && html.contains("name=\"to\" value=\"2026-01-31\""),
         "the range the page rendered is the one the URL named: {html}"
     );
+
+    // The Requests page reads the same range out of the status aggregates on
+    // the PG schema, which count the January request alone.
+    let response = within(
+        router(app_state(&db)).oneshot(
+            Request::builder()
+                .uri("/admin/ui/stats/requests?from=2026-01-01&to=2026-01-31")
+                .header("authorization", auth_header())
+                .body(Body::empty())
+                .unwrap(),
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+
+    assert!(html.contains("Requests per day"), "{html}");
+    assert!(
+        html.contains("Day 5: 1 requests (1 200)"),
+        "one January request only: {html}"
+    );
+    assert!(
+        html.contains("<td class=\"mono\">200</td>"),
+        "the status code table names the logged code: {html}"
+    );
+    assert!(html.contains("2026-01-01 to 2026-01-31"), "{html}");
 }

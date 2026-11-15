@@ -1,13 +1,14 @@
-//! Integration tests for the admin UI stats page: the auth gate, date-range
+//! Integration tests for the admin UI stats pages: the auth gate, date-range
 //! selection with its shortcuts, per key and per model grouping with summed
 //! tokens and priced cost, the inactive-limit warning, the omission of keys
 //! without usage, soft-deleted keys, rows whose upstream reported no usage,
-//! the filters and charts, the per-status-code chart and table and the empty
+//! the filters and charts of the Tokens page, the per-status-code chart and
+//! table of the Requests page, the split between the two pages and the empty
 //! and malformed range states.
 //!
 //! Rows are seeded through the database layer with explicit timestamps, and
-//! the page itself is driven through the real router, so the tests pin the
-//! rendered table rather than any internal helper.
+//! the pages themselves are driven through the real router, so the tests pin
+//! the rendered markup rather than any internal helper.
 
 mod common;
 
@@ -89,6 +90,18 @@ fn filter_bar(html: &str) -> &str {
         .split_once("</form>")
         .expect("the filter bar is closed");
     bar
+}
+
+/// One entry of the top navigation, from its href through its closing tag, so
+/// an assertion about its label or its active state cannot be satisfied by a
+/// different entry of the same list.
+fn nav_entry<'a>(html: &'a str, href: &str) -> &'a str {
+    let needle = format!("href=\"{href}\"");
+    let at = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("the nav must link {href}: {html}"));
+    let end = html[at..].find("</a>").expect("the nav entry is closed");
+    &html[at..at + end + "</a>".len()]
 }
 
 /// The chart panel, which is the part of the page after the table panel. A
@@ -327,24 +340,38 @@ async fn log_with_status(
 // --- Auth gate and navigation --------------------------------------------
 
 #[tokio::test]
-async fn stats_page_without_a_session_redirects_to_the_login_page() {
+async fn both_stats_pages_without_a_session_redirect_to_the_login_page() {
     let db = test_pool().await;
-    let (status, body) = send(&db, "/admin/ui/stats", None).await;
-    assert_eq!(status, StatusCode::SEE_OTHER);
-    assert!(body.is_empty());
+    for uri in ["/admin/ui/stats", "/admin/ui/stats/requests"] {
+        let (status, body) = send(&db, uri, None).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{uri}");
+        assert!(body.is_empty());
+    }
 }
 
 #[tokio::test]
-async fn stats_page_renders_the_active_nav_entry_and_the_footnote() {
+async fn the_tokens_page_renders_its_nav_entry_and_the_footnote() {
     let db = test_pool().await;
     let (status, html) = get_page(&db, "/admin/ui/stats").await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Token usage"), "{html}");
-    assert!(html.contains("href=\"/admin/ui/stats\""), "{html}");
-    assert!(html.contains(">Stat</a>"), "{html}");
+    let entry = nav_entry(&html, "/admin/ui/stats");
     assert!(
-        html.contains("class=\"active\""),
-        "the Stat entry is active"
+        entry.contains(">Tokens</a>"),
+        "the entry is labeled: {entry}"
+    );
+    assert!(
+        entry.contains("class=\"active\""),
+        "the Tokens entry is the active one: {entry}"
+    );
+    let requests = nav_entry(&html, "/admin/ui/stats/requests");
+    assert!(
+        requests.contains(">Requests</a>"),
+        "the Requests entry is next to it: {requests}"
+    );
+    assert!(
+        !requests.contains("class=\"active\""),
+        "exactly one entry is active: {requests}"
     );
     assert!(
         html.contains("Requests without reported usage are not counted"),
@@ -353,10 +380,41 @@ async fn stats_page_renders_the_active_nav_entry_and_the_footnote() {
     assert!(html.contains("From (UTC)") && html.contains("To (UTC)"));
 }
 
+#[tokio::test]
+async fn the_requests_page_renders_its_own_nav_entry_and_none_of_the_usage_content() {
+    let db = test_pool().await;
+    let (status, html) = get_page(&db, "/admin/ui/stats/requests").await;
+    assert_eq!(status, StatusCode::OK);
+    let entry = nav_entry(&html, "/admin/ui/stats/requests");
+    assert!(
+        entry.contains(">Requests</a>"),
+        "the entry is labeled: {entry}"
+    );
+    assert!(
+        entry.contains("class=\"active\""),
+        "the Requests entry is the active one: {entry}"
+    );
+    let tokens = nav_entry(&html, "/admin/ui/stats");
+    assert!(tokens.contains(">Tokens</a>"), "{tokens}");
+    assert!(
+        !tokens.contains("class=\"active\""),
+        "exactly one entry is active: {tokens}"
+    );
+    assert!(
+        !html.contains("Token usage") && !html.contains("Input tokens"),
+        "the usage table and its heading stay on the Tokens page: {html}"
+    );
+    assert!(html.contains("From (UTC)") && html.contains("To (UTC)"));
+    assert!(
+        filter_bar(&html).contains("name=\"status_class\""),
+        "the status class filter belongs to this page: {html}"
+    );
+}
+
 // --- Date range selection -------------------------------------------------
 
 #[tokio::test]
-async fn the_filter_bar_offers_two_day_pickers_and_three_shortcuts() {
+async fn the_tokens_filter_bar_offers_two_day_pickers_three_shortcuts_and_no_status_filter() {
     let db = test_pool().await;
     let (status, html) = get_page(&db, "/admin/ui/stats").await;
     assert_eq!(status, StatusCode::OK);
@@ -393,10 +451,65 @@ async fn the_filter_bar_offers_two_day_pickers_and_three_shortcuts() {
             "the {label} shortcut must submit preset={value}: {bar}"
         );
     }
+    assert!(
+        !bar.contains("name=\"status_class\""),
+        "the status class filter is not a filter of this page: {bar}"
+    );
 
-    // Reading order: the two day fields, the shortcuts, the three filters.
-    // The submit button is not in this list, because it leads the markup
-    // although it reads last on screen; the test below pins that.
+    // Reading order: the two day fields, the shortcuts, the key and model
+    // filters. The submit button is not in this list, because it leads the
+    // markup although it reads last on screen; the test below pins that.
+    let order = [
+        "stats-from",
+        "stats-to",
+        "preset\" value=\"today\"",
+        "preset\" value=\"week\"",
+        "preset\" value=\"month\"",
+        "stats-key",
+        "stats-model",
+    ];
+    let mut previous = 0;
+    for needle in order {
+        let at = bar
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} must be in the bar: {bar}"));
+        assert!(at >= previous, "{needle} is out of the bar's order: {bar}");
+        previous = at;
+    }
+}
+
+#[tokio::test]
+async fn the_requests_filter_bar_is_the_same_bar_plus_the_status_class_filter() {
+    let db = test_pool().await;
+    let (status, html) = get_page(&db, "/admin/ui/stats/requests").await;
+    assert_eq!(status, StatusCode::OK);
+    let bar = filter_bar(&html);
+    assert!(
+        bar.contains("action=\"/admin/ui/stats/requests\""),
+        "the bar submits to its own page: {bar}"
+    );
+    assert!(
+        bar.contains("id=\"stats-from\" name=\"from\" value=\"")
+            && bar.contains("id=\"stats-to\" name=\"to\" value=\""),
+        "both day pickers are here: {bar}"
+    );
+    for (value, label) in [
+        ("today", "Today"),
+        ("week", "Current week"),
+        ("month", "Current month"),
+    ] {
+        assert!(
+            bar.contains(&format!(
+                "<button type=\"submit\" name=\"preset\" value=\"{value}\">{label}</button>"
+            )),
+            "the {label} shortcut must submit preset={value}: {bar}"
+        );
+    }
+    assert!(
+        select_markup(&html, "stats-status").contains(">All statuses</option>"),
+        "the class filter is offered: {html}"
+    );
+
     let order = [
         "stats-from",
         "stats-to",
@@ -430,36 +543,39 @@ fn first_submit_button(bar: &str) -> &str {
 #[tokio::test]
 async fn enter_in_a_day_picker_applies_the_typed_range() {
     let db = test_pool().await;
-    let (status, html) = get_page(&db, "/admin/ui/stats").await;
-    assert_eq!(status, StatusCode::OK);
-    let bar = filter_bar(&html);
+    for uri in ["/admin/ui/stats", "/admin/ui/stats/requests"] {
+        let (status, html) = get_page(&db, uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let bar = filter_bar(&html);
 
-    let apply = first_submit_button(bar);
-    assert!(
-        apply.contains(">Apply"),
-        "the first submit button of the form is Apply, so Enter applies the typed range: {bar}"
-    );
-    assert!(
-        !apply.contains("name=") && !apply.contains("value="),
-        "Apply submits no parameter of its own, so Enter cannot fire a shortcut: {apply}"
-    );
-    assert!(
-        !bar.contains("<script") && !bar.contains("onkeydown") && !bar.contains("onsubmit"),
-        "the bar needs no script for Enter to apply the range: {bar}"
-    );
+        let apply = first_submit_button(bar);
+        assert!(
+            apply.contains(">Apply"),
+            "the first submit button of the form is Apply, so Enter applies the typed range: {bar}"
+        );
+        assert!(
+            !apply.contains("name=") && !apply.contains("value="),
+            "Apply submits no parameter of its own, so Enter cannot fire a shortcut: {apply}"
+        );
+        assert!(
+            !bar.contains("<script") && !bar.contains("onkeydown") && !bar.contains("onsubmit"),
+            "the bar needs no script for Enter to apply the range: {bar}"
+        );
 
-    // The wrapper of the moved button leads the markup, and the sheet orders
-    // it back to the end of the line, so the controls read exactly as before.
-    let apply_field = bar
-        .find("filter-field--apply")
-        .expect("the apply field is marked for ordering");
-    let from_field = bar
-        .find("id=\"stats-from\"")
-        .expect("the From picker is in the bar");
-    assert!(
-        apply_field < from_field,
-        "the apply field leads the bar's markup: {bar}"
-    );
+        // The wrapper of the moved button leads the markup, and the sheet
+        // orders it back to the end of the line, so the controls read exactly
+        // as before.
+        let apply_field = bar
+            .find("filter-field--apply")
+            .expect("the apply field is marked for ordering");
+        let from_field = bar
+            .find("id=\"stats-from\"")
+            .expect("the From picker is in the bar");
+        assert!(
+            apply_field < from_field,
+            "the apply field leads the bar's markup: {bar}"
+        );
+    }
 
     let (status, css) = send(&db, "/admin/ui/static/admin.css", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -474,27 +590,32 @@ async fn enter_in_a_day_picker_applies_the_typed_range() {
 }
 
 #[tokio::test]
-async fn stats_page_defaults_to_the_current_month_to_date() {
+async fn both_pages_default_to_the_current_month_to_date() {
     let db = test_pool().await;
-    let (status, html) = get_page(&db, "/admin/ui/stats").await;
-    assert_eq!(status, StatusCode::OK);
     let month = current_month_label();
     let today = today_label();
-    let bar = filter_bar(&html);
-    assert!(
-        bar.contains(&format!("name=\"from\" value=\"{month}-01\"")),
-        "an empty from is the first day of the current month: {bar}"
-    );
-    assert!(
-        bar.contains(&format!("name=\"to\" value=\"{today}\"")),
-        "an empty to is today: {bar}"
-    );
-    assert!(
-        html.contains(&format!(
-            "Token usage <span class=\"text-muted\">{month}-01 to {today}"
-        )),
-        "the heading names the days the view covers: {html}"
-    );
+    for (uri, heading) in [
+        ("/admin/ui/stats", "Token usage"),
+        ("/admin/ui/stats/requests", "Requests"),
+    ] {
+        let (status, html) = get_page(&db, uri).await;
+        assert_eq!(status, StatusCode::OK);
+        let bar = filter_bar(&html);
+        assert!(
+            bar.contains(&format!("name=\"from\" value=\"{month}-01\"")),
+            "an empty from is the first day of the current month on {uri}: {bar}"
+        );
+        assert!(
+            bar.contains(&format!("name=\"to\" value=\"{today}\"")),
+            "an empty to is today on {uri}: {bar}"
+        );
+        assert!(
+            html.contains(&format!(
+                "{heading} <span class=\"text-muted\">{month}-01 to {today}"
+            )),
+            "the heading of {uri} names the days the view covers: {html}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -537,6 +658,80 @@ async fn the_selected_range_drives_the_rows_and_leaves_other_days_out() {
         "no rows for a range without usage"
     );
     assert!(!empty.contains("<svg"), "no data means no chart: {empty}");
+}
+#[tokio::test]
+async fn the_requests_page_reads_the_same_range_as_the_tokens_page() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, prefix) = seed_key(&db, channel_id, "ranged", None).await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(10),
+        Some(1),
+        "2026-01-05 10:00:00",
+    )
+    .await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(500),
+        Some(10),
+        Some(1),
+        "2026-02-12 10:00:00",
+    )
+    .await;
+
+    let (status, january) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-01-01&to=2026-01-31",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(january.contains("2026-01-01 to 2026-01-31"), "{january}");
+    let charts = chart_panel(&january);
+    assert!(
+        charts.contains("Day 5: 1 requests (1 200)"),
+        "the range picks the January request alone: {charts}"
+    );
+    assert!(
+        !charts.contains("Day 12:"),
+        "the February request stays outside the range: {charts}"
+    );
+    assert_eq!(
+        status_code_rows(&january),
+        vec![[
+            "200".to_string(),
+            "2xx".to_string(),
+            "1".to_string(),
+            "100.0%".to_string()
+        ]],
+        "{january}"
+    );
+
+    // The key select of this page lists the keys of the range like the other
+    // page does.
+    assert!(
+        select_markup(&january, "stats-key").contains(&prefix),
+        "the key filter is offered here too: {january}"
+    );
+
+    // The shortcuts fill the day pickers of this page as well.
+    let (_, shortcut) = get_page(&db, "/admin/ui/stats/requests?preset=today").await;
+    let today = today_label();
+    assert!(
+        filter_bar(&shortcut).contains(&format!("name=\"from\" value=\"{today}\"")),
+        "the shortcut fills the day fields: {shortcut}"
+    );
+    assert!(
+        filter_bar(&shortcut).contains(&format!("name=\"to\" value=\"{today}\"")),
+        "{shortcut}"
+    );
 }
 
 #[tokio::test]
@@ -1211,7 +1406,11 @@ async fn the_requests_chart_stacks_every_exact_status_code_of_the_range() {
     )
     .await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Requests per day"), "{html}");
     let charts = chart_panel(&html);
@@ -1232,7 +1431,7 @@ async fn the_requests_chart_stacks_every_exact_status_code_of_the_range() {
 }
 
 #[tokio::test]
-async fn the_status_filter_narrows_the_requests_chart_alone() {
+async fn the_status_filter_narrows_the_whole_requests_page() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (key_id, _) = seed_key(&db, channel_id, "narrowed", None).await;
@@ -1251,7 +1450,7 @@ async fn the_status_filter_narrows_the_requests_chart_alone() {
 
     let (status, html) = get_page(
         &db,
-        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=5xx",
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30&status_class=5xx",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1260,28 +1459,12 @@ async fn the_status_filter_narrows_the_requests_chart_alone() {
         charts.contains("Day 1: 1 requests (1 500)"),
         "the requests chart follows the filter: {charts}"
     );
-    // Both requests of the day stay in the token and cost bars, and in the
-    // table: 1100 prompt and 210 completion tokens priced at 4350
-    // micro-USD.
-    assert!(
-        charts.contains("Day 1: 1,310 tokens (1,100 in, 210 out) in 2 requests"),
-        "the token bars ignore the status filter: {charts}"
-    );
-    assert!(
-        charts.contains("Day 1: $0.00435"),
-        "the cost bars ignore the status filter: {charts}"
-    );
-    let table = table_rows(&html);
-    assert!(
-        table.contains(">1,100<"),
-        "the table counts both requests: {table}"
-    );
-    assert!(table.contains(">$0.00435<"), "{table}");
     assert!(
         option_is_selected(&html, "5xx"),
         "the filter in force is visible: {html}"
     );
-    // The status code table follows the same filter.
+    // The status code table of the same page follows the same filter, so the
+    // page never shows two different selections.
     assert_eq!(
         status_code_rows(&html),
         vec![[
@@ -1293,14 +1476,19 @@ async fn the_status_filter_narrows_the_requests_chart_alone() {
         "{html}"
     );
 
-    // Without the filter the requests chart holds the whole day.
-    let (_, unfiltered) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
+    // Without the filter both requests of the day are back, chart and table
+    // alike.
+    let (_, unfiltered) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30",
+    )
+    .await;
     assert!(chart_panel(&unfiltered).contains("Day 1: 2 requests (1 200, 1 500)"));
-    assert!(table_rows(&unfiltered).contains(">$0.00435<"));
+    assert_eq!(status_code_rows(&unfiltered).len(), 2, "{unfiltered}");
 }
 
 #[tokio::test]
-async fn the_status_filter_leaves_the_token_and_cost_figures_alone() {
+async fn the_tokens_page_has_no_status_filter_to_honour() {
     let db = test_pool().await;
     let channel_id = seed_priced_channel(&db).await;
     let (key_id, _) = seed_key(&db, channel_id, "linked", None).await;
@@ -1308,38 +1496,32 @@ async fn the_status_filter_leaves_the_token_and_cost_figures_alone() {
 
     let (status, html) = get_page(
         &db,
-        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=4xx",
+        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=errors",
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    assert!(option_is_selected(&html, "4xx"), "{html}");
+    assert!(
+        !filter_bar(&html).contains("status_class"),
+        "the bar of this page carries no status filter: {html}"
+    );
+    assert!(
+        !html.contains("aria-label=\"Requests per day\"") && !html.contains("Status codes"),
+        "the requests chart and the status code table live on the other page: {html}"
+    );
+    assert!(
+        !html.contains("is not one of 2xx, 4xx, 5xx, other"),
+        "a parameter this page does not read is not reported as a bad filter: {html}"
+    );
     assert!(
         filter_bar(&html).contains("name=\"from\" value=\"2026-06-01\""),
-        "the range survives the filter: {html}"
+        "the range survives the unused parameter: {html}"
     );
-    let control = select_markup(&html, "stats-status");
-    assert!(
-        control.contains("<option value=\"other\">"),
-        "every class stays offered, so the filter can be widened: {html}"
-    );
-    assert!(
-        !control.contains("<option value=\"\" selected>"),
-        "the filter in force is not hidden behind All statuses: {html}"
-    );
-
-    // A range without a 4xx response drops the requests chart alone: the
-    // token and cost bars and the table keep the request.
-    assert!(
-        !html.contains("aria-label=\"Requests per day\""),
-        "the requests chart is left out when the filter selects nothing: {html}"
-    );
+    // Nothing on this page is narrowed by it, so the request it names stays
+    // in the table and in both charts.
     assert!(html.contains("aria-label=\"Tokens per day\""), "{html}");
     assert!(html.contains("aria-label=\"Cost per day\""), "{html}");
-    assert!(table_rows(&html).contains(">$0.004<"), "{html}");
-    assert!(
-        !html.contains("Status codes"),
-        "and so is the status code table: {html}"
-    );
+    let table = table_rows(&html);
+    assert!(table.contains(">$0.004<"), "{table}");
 }
 
 #[tokio::test]
@@ -1359,7 +1541,11 @@ async fn a_request_that_never_reached_an_upstream_is_listed_without_a_code() {
     )
     .await;
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let charts = chart_panel(&html);
     assert!(
@@ -1383,7 +1569,7 @@ async fn a_request_that_never_reached_an_upstream_is_listed_without_a_code() {
 
     let (_, other) = get_page(
         &db,
-        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=other",
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30&status_class=other",
     )
     .await;
     assert!(
@@ -1393,16 +1579,20 @@ async fn a_request_that_never_reached_an_upstream_is_listed_without_a_code() {
 
     let (_, success) = get_page(
         &db,
-        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=2xx",
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30&status_class=2xx",
     )
     .await;
     assert!(
         !success.contains("aria-label=\"Requests per day\""),
-        "{success}"
+        "a class the request does not belong to draws no bar: {success}"
     );
     assert!(
-        table_rows(&success).contains(">$0.00<"),
-        "the table still counts the failed request: {success}"
+        !success.contains("<table"),
+        "and no status code table either: {success}"
+    );
+    assert!(
+        success.contains("No requests match the current filters"),
+        "the page says why it is empty: {success}"
     );
 }
 
@@ -1434,7 +1624,11 @@ async fn the_status_code_table_lists_every_code_of_the_period_with_its_share() {
         .await;
     }
 
-    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-30").await;
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(html.contains("Status codes"), "{html}");
     let rows = status_code_rows(&html);
@@ -1481,7 +1675,11 @@ async fn the_status_code_table_lists_every_code_of_the_period_with_its_share() {
     assert!(charts.contains("Day 3: 1 requests (1 n/a)"), "{charts}");
 
     // A range without requests renders no status code panel at all.
-    let (_, empty) = get_page(&db, "/admin/ui/stats?from=2026-04-01&to=2026-04-30").await;
+    let (_, empty) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-04-01&to=2026-04-30",
+    )
+    .await;
     assert!(!empty.contains("Status codes"), "{empty}");
 }
 
@@ -1527,7 +1725,7 @@ async fn the_status_code_table_follows_the_key_model_and_status_filters() {
 
     let (status, html) = get_page(
         &db,
-        &format!("/admin/ui/stats?from=2026-06-01&to=2026-06-30&key_id={first_id}"),
+        &format!("/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30&key_id={first_id}"),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1544,7 +1742,7 @@ async fn the_status_code_table_follows_the_key_model_and_status_filters() {
     // The model filter narrows the codes and the total the shares divide by.
     let (_, model) = get_page(
         &db,
-        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&model=gpt-5-mini",
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30&model=gpt-5-mini",
     )
     .await;
     assert_eq!(
@@ -1561,7 +1759,7 @@ async fn the_status_code_table_follows_the_key_model_and_status_filters() {
     // The class filter keeps the codes of that class alone.
     let (_, class) = get_page(
         &db,
-        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=4xx",
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30&status_class=4xx",
     )
     .await;
     assert_eq!(
@@ -1586,7 +1784,7 @@ async fn an_unknown_status_class_shows_a_banner_and_filters_nothing() {
     // `errors` is a bucket of the log listing, not a class of the chart.
     let (status, html) = get_page(
         &db,
-        "/admin/ui/stats?from=2026-06-01&to=2026-06-30&status_class=errors",
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30&status_class=errors",
     )
     .await;
     assert_eq!(status, StatusCode::OK);

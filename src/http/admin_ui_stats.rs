@@ -1,14 +1,21 @@
-//! Admin UI stats page: token usage and cost per client key over a selected
-//! date range, grouped by model.
+//! Admin UI stats pages: the Tokens page, token usage and cost per client
+//! key over a selected date range grouped by model, and the Requests page,
+//! the request counts of the same range per day and per response status
+//! code.
 //!
-//! Every sum the page shows comes out of the same day-level aggregate
-//! ([`crate::db::request_logs::day_usage`]) and the same pinned cost formula
-//! the monthly-limit enforcement uses ([`crate::usage::group_cost`]), so the
-//! table, the charts and the status code table can never disagree about the
-//! same request: the table folds the day rows per key and model, the charts
-//! plot the rows themselves. No second aggregate query and no second pricing
-//! path exists, so a range that runs over a whole calendar month prices what
-//! the gate prices for that month.
+//! Every figure either page shows comes out of the same day-level aggregates,
+//! [`crate::db::request_logs::day_usage`] for the tokens and the cost and
+//! [`crate::db::request_logs::day_status_code_usage`] with
+//! [`crate::db::request_logs::status_code_totals`] for the requests, and out
+//! of the same pinned cost formula the monthly-limit enforcement uses
+//! ([`crate::usage::group_cost`]), so a table, a chart and the status code
+//! table can never disagree about the same request: the table folds the day
+//! rows per key and model, the charts plot the rows themselves. No second
+//! aggregate query and no second pricing path exists, so a range that runs
+//! over a whole calendar month prices what the gate prices for that month.
+//! Each page runs the queries its own content needs: the Tokens page never
+//! asks for the status aggregates, the Requests page never asks for the usage
+//! rows or the price tables.
 //!
 //! Cost comes from the price table of the channel the key is bound to,
 //! exactly as enforcement prices it: a model the channel does not price
@@ -35,32 +42,39 @@
 //! default range behind a banner instead of failing the page.
 //!
 //! Three shortcut buttons sit between the date fields and the filters,
-//! Today, Current week and Current month. Each is a submit button carrying a
-//! `preset` value, resolved to concrete dates at render time (the same
-//! pattern the logs page presets follow), so a shared shortcut stays
-//! relative to the moment it is opened and the fields always show the days a
-//! view really covers.
+//! Today, Current week and Current month, on both pages alike. Each is a
+//! submit button carrying a `preset` value, resolved to concrete dates at
+//! render time (the same pattern the logs page presets follow), so a shared
+//! shortcut stays relative to the moment it is opened and the fields always
+//! show the days a view really covers.
 //!
-//! Three filters narrow the view, a key, a model and a status class, read
-//! from the same query string and applied to the day rows in their own
-//! query, so the table, the charts and the status table all read the same
-//! rows. The status class applies to the requests chart and to the status
-//! code table, which are both request-based: the usage table, the token bars
-//! and the cost bars are token-based and keep their meaning under it. The
-//! model list of the select stays range-scoped and unfiltered, so the
-//! control always offers every model of the range.
+//! The filters narrow the view, a key and a model on both pages and a status
+//! class on the Requests page, read from the same query string and applied to
+//! the rows in their own query, so every figure of a page reads the same
+//! rows. The status class narrows the whole Requests page, its chart and its
+//! status code table alike, because everything that page counts is a
+//! request. The model list of the select stays range-scoped and unfiltered,
+//! so the control always offers every model of the range.
 //!
-//! Under the table sit three charts of the same filtered range, tokens per
-//! day, cost per day and requests per day, drawn server-side by
+//! The Tokens page holds the usage table and, under it, two charts of the
+//! same filtered range, tokens per day and cost per day, drawn server-side by
 //! [`crate::http::stats_chart`] as plain SVG and injected with askama's
 //! `|safe` filter. The cost of a day is the sum of [`crate::usage::group_cost`]
 //! over that day's groups, priced from the key's channel exactly like the
-//! table, so the bars and the table add up to the same money. The requests
-//! chart stacks the exact response status codes and is left out when the
-//! status filter selects no row at all; a view with no day rows renders no
-//! chart at all and keeps the table's empty state instead.
+//! table, so the bars and the table add up to the same money. A view with no
+//! day rows renders no chart at all and keeps the table's empty state
+//! instead.
 //!
-//! Under the charts sits the status code table of the same filters: one line
+//! The Requests page holds the requests chart, stacking one segment per
+//! exact response status code of the range, and under it the status code
+//! table: one line per exact code of the range with its class, its request
+//! count and its share of the requests the filters select, the busiest code
+//! first. Both are left out when the filters select no request, and the page
+//! then shows its own empty state instead.
+//!
+//! There is no mutating route here, so the CSRF guard has nothing to reject;
+//! the module is merged into the `/admin/ui` nest like the other read-only
+//! pages.
 //! per exact code of the range with its class, its request count and its
 //! share of the requests the filters select, the busiest code first. Like the
 //! requests chart it is left out entirely when the filters select no request.
@@ -286,7 +300,8 @@ fn non_blank(raw: Option<&str>) -> Option<&str> {
 /// The key, model and status class filters of one view, after parsing. Every
 /// one is absent when its parameter is missing or blank; the key is also
 /// absent when the value is not a row id and the class when it names no
-/// bucket.
+/// bucket. The Tokens page reads the first two and the Requests page all
+/// three.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Filters {
     key_id: Option<i64>,
@@ -330,17 +345,13 @@ pub struct DisplaySums {
     pub cost: String,
 }
 
-/// The charts of the view, already rendered as SVG. Present only when the
-/// filtered range has rows to plot.
-pub struct Charts {
+/// The charts of the Tokens page, already rendered as SVG. Present only when
+/// the filtered range has rows to plot.
+pub struct TokenCharts {
     /// Tokens per day, input and output stacked.
     pub tokens_svg: String,
     /// Cost per day, priced from each key's channel.
     pub cost_svg: String,
-    /// Requests per day, one segment per exact status code. Absent when the
-    /// status filter selects no row, because an empty plot says less than
-    /// none.
-    pub status_svg: Option<String>,
 }
 
 /// One line of the status code table: one exact code of the filtered period
@@ -358,9 +369,11 @@ pub struct StatusCodeRow {
     pub share: String,
 }
 
+/// The Tokens page: the usage table and the token and cost charts of one date
+/// range, under the key and model filters of the URL.
 #[derive(Template, WebTemplate)]
-#[template(path = "stats.html")]
-pub struct StatsPage {
+#[template(path = "tokens.html")]
+pub struct TokensPage {
     pub version: &'static str,
     pub section: &'static str,
     /// The rendered range, `2026-11-01 to 2026-11-15`.
@@ -378,6 +391,32 @@ pub struct StatsPage {
     pub key_options: Vec<SelectOption>,
     /// The Model select: `All models` plus every model logged in the range.
     pub model_options: Vec<SelectOption>,
+    /// Absent when the filtered range has nothing to plot.
+    pub charts: Option<TokenCharts>,
+    pub empty_message: String,
+    pub error: Option<String>,
+}
+
+/// The Requests page: the requests chart and the status code table of one
+/// date range, under the key, model and status class filters of the URL.
+#[derive(Template, WebTemplate)]
+#[template(path = "requests.html")]
+pub struct RequestsPage {
+    pub version: &'static str,
+    pub section: &'static str,
+    /// The rendered range, `2026-11-01 to 2026-11-15`.
+    pub range_label: String,
+    /// The first day of the range, as the `from` input value.
+    pub from_value: String,
+    /// The last day of the range, as the `to` input value.
+    pub to_value: String,
+    /// The shortcut buttons of the filter bar.
+    pub preset_buttons: Vec<PresetButton>,
+    /// The Key select: `All keys` plus every stored key, soft-deleted ones
+    /// included.
+    pub key_options: Vec<SelectOption>,
+    /// The Model select: `All models` plus every model logged in the range.
+    pub model_options: Vec<SelectOption>,
     /// The Status select: `All statuses` plus the four classes the requests
     /// chart stacks.
     pub status_options: Vec<SelectOption>,
@@ -385,8 +424,9 @@ pub struct StatsPage {
     /// the filters select no request, which is when the template leaves the
     /// whole panel out.
     pub status_codes: Vec<StatusCodeRow>,
-    /// Absent when the filtered range has nothing to plot.
-    pub charts: Option<Charts>,
+    /// Requests per day, one segment per exact status code. Absent when the
+    /// filters select no request, because an empty plot says less than none.
+    pub status_svg: Option<String>,
     pub empty_message: String,
     pub error: Option<String>,
 }
@@ -472,8 +512,8 @@ struct ChannelInfo {
     limitable: bool,
 }
 
-/// Everything the page needs out of the database.
-struct StatsData {
+/// Everything the Tokens page needs out of the database.
+struct TokensData {
     range: DateRange,
     /// Every stored key, soft-deleted ones included: they fill the key select
     /// and name the channel a row's cost comes from.
@@ -483,6 +523,17 @@ struct StatsData {
     /// the table folds them per key and model, the charts plot them as they
     /// are.
     days: Vec<DayUsage>,
+    /// The distinct models logged in the range, for the Model select.
+    models: Vec<String>,
+}
+
+/// Everything the Requests page needs out of the database: the request
+/// aggregates of the range and the lists the two selects offer.
+struct RequestsData {
+    range: DateRange,
+    /// Every stored key, soft-deleted ones included: they fill the key
+    /// select.
+    keys: Vec<ApiKey>,
     /// Day-level request counts per exact status code of the filtered range,
     /// for the requests chart.
     status_code_days: Vec<DayStatusCodeUsage>,
@@ -568,7 +619,11 @@ fn resolve_range(query: &StatsQuery) -> (DateRange, Option<String>) {
 /// or status class yields the banner text and no filter (the same lenient
 /// reading the range parameters get), and the model name is trimmed so a
 /// stray space cannot hide every row.
-fn resolve_filters(query: &StatsQuery) -> (Filters, Option<String>) {
+///
+/// `with_status_class` is false on the Tokens page, which carries no status
+/// filter: the parameter is then not read at all, so neither a class nor a
+/// banner about one can come out of it.
+fn resolve_filters(query: &StatsQuery, with_status_class: bool) -> (Filters, Option<String>) {
     let model = non_blank(query.model.as_deref()).map(str::to_string);
     let raw_key = non_blank(query.key_id.as_deref());
     let (key_id, key_error) = match raw_key {
@@ -583,7 +638,7 @@ fn resolve_filters(query: &StatsQuery) -> (Filters, Option<String>) {
             ),
         },
     };
-    let raw_class = non_blank(query.status_class.as_deref());
+    let raw_class = non_blank(query.status_class.as_deref()).filter(|_| with_status_class);
     let (status_class, class_error) = match raw_class {
         None => (None, None),
         Some(value) => match StatusBucket::parse(value) {
@@ -659,17 +714,19 @@ async fn channel_info(db: &Db) -> sqlx::Result<HashMap<i64, ChannelInfo>> {
         .collect())
 }
 
-/// Loads the key list, the channel price tables, the day rows the table and
-/// the charts are both built from, the day rows per exact status code, the
-/// status code totals of the range and the model names of the range.
+/// Loads the key list, the channel price tables, the day rows the Tokens
+/// page reads and the model names of the range.
 ///
-/// Every usage query carries the range and the key and model filters, and the
-/// status queries carry the status class filter on top, so one set of day
-/// rows answers the table, the charts and the status table alike. The model
-/// list of the select stays range-scoped and unfiltered on purpose, so the
-/// control always offers every model of the range rather than only the
-/// surviving one.
-async fn load(state: &AppState, range: &DateRange, filters: &Filters) -> Result<StatsData, String> {
+/// The usage query carries the range and the key and model filters, so those
+/// rows answer the table and both charts alike. No status aggregate is asked
+/// for, because nothing on this page counts requests by their status. The
+/// model list stays range-scoped and unfiltered, so the select always offers
+/// every model of the range rather than only the surviving one.
+async fn load_tokens(
+    state: &AppState,
+    range: &DateRange,
+    filters: &Filters,
+) -> Result<TokensData, String> {
     // The bounds the aggregates compare against: the first instant of the
     // range and the first instant after its last day.
     let start = range.start();
@@ -689,7 +746,39 @@ async fn load(state: &AppState, range: &DateRange, filters: &Filters) -> Result<
     )
     .await
     .map_err(|error| internal_error(&error))?;
-    let status_days = request_logs::day_status_code_usage(
+    let models = request_logs::distinct_models(&state.db, &start, &end)
+        .await
+        .map_err(|error| internal_error(&error))?;
+    Ok(TokensData {
+        range: *range,
+        keys,
+        channels,
+        days,
+        models,
+    })
+}
+
+/// Loads the key list, the day rows per exact status code, the status code
+/// totals of the range and the model names of the range, which is everything
+/// the Requests page reads.
+///
+/// Both status queries carry the range and the key, model and status class
+/// filters, so the chart and the table are built from the same selection.
+/// The model list of the select stays range-scoped and unfiltered on
+/// purpose, so the control always offers every model of the range rather
+/// than only the surviving one. Neither cost nor token data is asked for,
+/// because nothing on this page counts them.
+async fn load_requests(
+    state: &AppState,
+    range: &DateRange,
+    filters: &Filters,
+) -> Result<RequestsData, String> {
+    let start = range.start();
+    let end = range.end();
+    let keys = keys::list(&state.db)
+        .await
+        .map_err(|error| internal_error(&error))?;
+    let status_code_days = request_logs::day_status_code_usage(
         &state.db,
         &start,
         &end,
@@ -712,12 +801,10 @@ async fn load(state: &AppState, range: &DateRange, filters: &Filters) -> Result<
     let models = request_logs::distinct_models(&state.db, &start, &end)
         .await
         .map_err(|error| internal_error(&error))?;
-    Ok(StatsData {
+    Ok(RequestsData {
         range: *range,
         keys,
-        channels,
-        days,
-        status_code_days: status_days,
+        status_code_days,
         status_code_totals,
         models,
     })
@@ -832,8 +919,10 @@ fn class_label(class: StatusBucket) -> &'static str {
 }
 
 /// The page with its filter widgets and empty table in place; the rows, the
-/// grand totals and the charts are filled in by [`build_page`].
-fn page_shell(range: &DateRange, filters: &Filters, error: Option<String>) -> StatsPage {
+/// The Tokens page with its filter widgets and empty table in place; the
+/// rows, the grand totals and the charts are filled in by
+/// [`build_tokens_page`].
+fn tokens_shell(range: &DateRange, filters: &Filters, error: Option<String>) -> TokensPage {
     let from = day_text(range.from);
     let to = day_text(range.to);
     let empty_message = if error.is_some() {
@@ -846,9 +935,9 @@ fn page_shell(range: &DateRange, filters: &Filters, error: Option<String>) -> St
              clients call /v1/chat/completions."
         )
     };
-    StatsPage {
+    TokensPage {
         version: env!("CARGO_PKG_VERSION"),
-        section: "stats",
+        section: "tokens",
         range_label: range.label(),
         from_value: from,
         to_value: to,
@@ -857,9 +946,39 @@ fn page_shell(range: &DateRange, filters: &Filters, error: Option<String>) -> St
         grand: Sums::default().display(),
         key_options: key_options(&[], filters.key_id),
         model_options: model_options(&[], filters.model.as_deref()),
+        charts: None,
+        empty_message,
+        error,
+    }
+}
+
+/// The Requests page with its filter widgets in place; the chart and the
+/// status code table are filled in by [`build_requests_page`].
+fn requests_shell(range: &DateRange, filters: &Filters, error: Option<String>) -> RequestsPage {
+    let from = day_text(range.from);
+    let to = day_text(range.to);
+    let empty_message = if error.is_some() {
+        String::new()
+    } else if filters.is_set() {
+        format!("No requests match the current filters between {from} and {to}.")
+    } else {
+        format!(
+            "No requests logged between {from} and {to}. The chart and the code \
+             breakdown fill in as clients call the API."
+        )
+    };
+    RequestsPage {
+        version: env!("CARGO_PKG_VERSION"),
+        section: "requests",
+        range_label: range.label(),
+        from_value: from,
+        to_value: to,
+        preset_buttons: preset_buttons(),
+        key_options: key_options(&[], filters.key_id),
+        model_options: model_options(&[], filters.model.as_deref()),
         status_options: status_options(filters.status_class),
         status_codes: Vec::new(),
-        charts: None,
+        status_svg: None,
         empty_message,
         error,
     }
@@ -879,14 +998,13 @@ fn day_group(day: &DayUsage) -> ModelUsage {
     }
 }
 
-/// The charts of one view: the daily token bars, the daily cost bars built by
-/// pricing every day group from the price table of the key that spent it, and
-/// the daily requests bars stacked by exact status code. A key whose channel
-/// is missing or prices nothing contributes zero, exactly as it does in the
-/// table. `None` when the filtered range has no day rows at all, which is
-/// when the page shows its empty state instead of an empty plot; the requests
-/// chart is dropped on its own when the status filter leaves it no row.
-fn charts(data: &StatsData) -> Option<Charts> {
+/// The charts of the Tokens page: the daily token bars and the daily cost
+/// bars, built by pricing every day group from the price table of the key
+/// that spent it. A key whose channel is missing or prices nothing
+/// contributes zero, exactly as it does in the table. `None` when the
+/// filtered range has no day rows at all, which is when the page shows its
+/// empty state instead of an empty plot.
+fn tokens_charts(data: &TokensData) -> Option<TokenCharts> {
     if data.days.is_empty() {
         return None;
     }
@@ -911,24 +1029,23 @@ fn charts(data: &StatsData) -> Option<Charts> {
             (day.day.clone(), usage::group_cost(&day_group(day), prices))
         })
         .collect();
-    let status_svg = (!data.status_code_days.is_empty())
-        .then(|| stats_chart::daily_status_code_bars(&data.status_code_days));
-    Some(Charts {
+    Some(TokenCharts {
         tokens_svg: stats_chart::daily_token_bars(&data.days),
         cost_svg: stats_chart::daily_cost_bars(&costs),
-        status_svg,
     })
 }
 
 /// Renders the table: the model lines of every key that saw usage in the
-/// range, each followed by the key's total line, plus the grand total.
+/// Renders the Tokens page: the model lines of every key that saw usage in
+/// the range, each followed by the key's total line, plus the grand total and
+/// the two charts.
 ///
 /// The rows are folded out of the same day rows the charts plot, and those
 /// rows already carry the range, key and model filters, so the table and the
 /// charts can never disagree about a request. A key left with no group
 /// disappears whole, exactly like a key with no usage in the range at all.
-fn build_page(data: StatsData, filters: &Filters, error: Option<String>) -> StatsPage {
-    let mut page = page_shell(&data.range, filters, error);
+fn build_tokens_page(data: TokensData, filters: &Filters, error: Option<String>) -> TokensPage {
+    let mut page = tokens_shell(&data.range, filters, error);
     let mut grand = Sums::default();
     let mut rows: Vec<StatsRow> = Vec::new();
 
@@ -986,11 +1103,35 @@ fn build_page(data: StatsData, filters: &Filters, error: Option<String>) -> Stat
 
     page.key_options = key_options(&data.keys, filters.key_id);
     page.model_options = model_options(&data.models, filters.model.as_deref());
-    page.status_options = status_options(filters.status_class);
-    page.status_codes = status_code_rows(&data.status_code_totals);
-    page.charts = charts(&data);
+    page.charts = tokens_charts(&data);
     page.grand = grand.display();
     page.rows = rows;
+    page
+}
+
+/// Renders the Requests page: the daily requests chart stacked by exact
+/// status code and the status code table of the same selection.
+///
+/// Both read the rows the two status queries already filtered, so the chart
+/// and the table can never disagree about a request, and the model select
+/// keeps offering every model logged in the range rather than only the
+/// surviving one. A filter that selects no request leaves both out and the
+/// page falls back to its empty state.
+fn build_requests_page(
+    data: RequestsData,
+    filters: &Filters,
+    error: Option<String>,
+) -> RequestsPage {
+    let mut page = requests_shell(&data.range, filters, error);
+    page.key_options = key_options(&data.keys, filters.key_id);
+    page.model_options = model_options(&data.models, filters.model.as_deref());
+    page.status_options = status_options(filters.status_class);
+    page.status_codes = status_code_rows(&data.status_code_totals);
+    page.status_svg = (!data.status_code_days.is_empty())
+        .then(|| stats_chart::daily_status_code_bars(&data.status_code_days));
+    if page.status_svg.is_some() || !page.status_codes.is_empty() {
+        page.empty_message.clear();
+    }
     page
 }
 
@@ -1029,33 +1170,63 @@ fn add_day(group: &mut ModelUsage, day: &DayUsage) {
 }
 
 /// GET /admin/ui/stats: the usage table, the charts and the status code
-/// table for one date range, under the key, model and status filters of the
-/// URL. Query deserialization cannot fail with string fields, but the
-/// rejection path is kept for robustness.
-pub async fn page(
-    State(state): State<AppState>,
-    _auth: UiAuth,
+/// Reads the view state of one request out of its query string: the date
+/// range, the filters and the banner text of a value the page cannot use.
+///
+/// Query deserialization cannot fail with string fields, but the rejection
+/// path is kept for robustness, and a rejected query then renders the default
+/// range and no filter behind the banner. `with_status_class` tells the
+/// resolution which page is being rendered, and the Tokens page passes false
+/// because it has no status filter to read a class from.
+fn resolve_view(
     query: Result<Query<StatsQuery>, QueryRejection>,
-) -> StatsPage {
+    with_status_class: bool,
+) -> (DateRange, Filters, Option<String>) {
     let (query, rejection) = match query {
         Ok(Query(query)) => (query, None),
         Err(rejection) => (StatsQuery::default(), Some(rejection.body_text())),
     };
     let (range, range_error) = resolve_range(&query);
-    let (filters, filter_error) = resolve_filters(&query);
-    let error = rejection.or(range_error).or(filter_error);
-    match load(&state, &range, &filters).await {
-        Ok(data) => build_page(data, &filters, error),
-        Err(message) => page_shell(&range, &filters, Some(message)),
+    let (filters, filter_error) = resolve_filters(&query, with_status_class);
+    (range, filters, rejection.or(range_error).or(filter_error))
+}
+
+/// GET /admin/ui/stats: the usage table and the token and cost charts for one
+/// date range, under the key and model filters of the URL.
+pub async fn tokens_page(
+    State(state): State<AppState>,
+    _auth: UiAuth,
+    query: Result<Query<StatsQuery>, QueryRejection>,
+) -> TokensPage {
+    let (range, filters, error) = resolve_view(query, false);
+    match load_tokens(&state, &range, &filters).await {
+        Ok(data) => build_tokens_page(data, &filters, error),
+        Err(message) => tokens_shell(&range, &filters, Some(message)),
     }
 }
 
-/// Read-only route for the `/admin/ui` nest; nothing here mutates, so the
-/// CSRF guard layered over the nest has nothing to reject.
-pub fn router() -> Router<AppState> {
-    Router::new().route("/stats", get(page))
+/// GET /admin/ui/stats/requests: the requests chart and the status code table
+/// for one date range, under the key, model and status class filters of the
+/// URL, which narrow the whole page.
+pub async fn requests_page(
+    State(state): State<AppState>,
+    _auth: UiAuth,
+    query: Result<Query<StatsQuery>, QueryRejection>,
+) -> RequestsPage {
+    let (range, filters, error) = resolve_view(query, true);
+    match load_requests(&state, &range, &filters).await {
+        Ok(data) => build_requests_page(data, &filters, error),
+        Err(message) => requests_shell(&range, &filters, Some(message)),
+    }
 }
 
+/// Read-only routes for the `/admin/ui` nest; nothing here mutates, so the
+/// CSRF guard layered over the nest has nothing to reject.
+pub fn router() -> Router<AppState> {
+    Router::new()
+        .route("/stats", get(tokens_page))
+        .route("/stats/requests", get(requests_page))
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,24 +1323,37 @@ mod tests {
 
     /// Loaded data for one range: the day rows the table and the charts read,
     /// one stored key bound to the priced channel and nothing else.
-    fn stats_data(days: Vec<DayUsage>, channels: HashMap<i64, ChannelInfo>) -> StatsData {
-        stats_data_for(vec![stored_key(None)], days, channels)
+    fn tokens_data(days: Vec<DayUsage>, channels: HashMap<i64, ChannelInfo>) -> TokensData {
+        tokens_data_for(vec![stored_key(None)], days, channels)
     }
 
     /// The same with an explicit key list, for the tests that need a second
     /// key or a key carrying a limit.
-    fn stats_data_for(
+    fn tokens_data_for(
         keys: Vec<ApiKey>,
         days: Vec<DayUsage>,
         channels: HashMap<i64, ChannelInfo>,
-    ) -> StatsData {
-        StatsData {
+    ) -> TokensData {
+        TokensData {
             range: november(),
             keys,
             channels,
             days,
-            status_code_days: Vec::new(),
-            status_code_totals: Vec::new(),
+            models: Vec::new(),
+        }
+    }
+
+    /// Loaded data for the Requests page: the request aggregates of the range
+    /// and the key list the filter offers.
+    fn requests_data(
+        status_code_days: Vec<DayStatusCodeUsage>,
+        status_code_totals: Vec<StatusCodeTotal>,
+    ) -> RequestsData {
+        RequestsData {
+            range: november(),
+            keys: vec![stored_key(None)],
+            status_code_days,
+            status_code_totals,
             models: Vec::new(),
         }
     }
@@ -1421,7 +1605,7 @@ mod tests {
 
     #[test]
     fn filters_read_blank_values_as_no_filter_and_report_a_bad_key_id() {
-        let (filters, error) = resolve_filters(&StatsQuery::default());
+        let (filters, error) = resolve_filters(&StatsQuery::default(), true);
         assert_eq!(filters, Filters::default());
         assert!(error.is_none());
 
@@ -1430,7 +1614,7 @@ mod tests {
             model: Some("   ".to_string()),
             ..StatsQuery::default()
         };
-        let (filters, error) = resolve_filters(&query);
+        let (filters, error) = resolve_filters(&query, true);
         assert_eq!(filters, Filters::default());
         assert!(!filters.is_set());
         assert!(error.is_none());
@@ -1440,7 +1624,7 @@ mod tests {
             model: Some(" gpt-4o ".to_string()),
             ..StatsQuery::default()
         };
-        let (filters, error) = resolve_filters(&query);
+        let (filters, error) = resolve_filters(&query, true);
         assert_eq!(filters.key_id, Some(7));
         assert_eq!(filters.model.as_deref(), Some("gpt-4o"));
         assert!(filters.is_set());
@@ -1450,7 +1634,7 @@ mod tests {
             key_id: Some("abc".to_string()),
             ..StatsQuery::default()
         };
-        let (filters, error) = resolve_filters(&query);
+        let (filters, error) = resolve_filters(&query, true);
         assert_eq!(filters.key_id, None, "an unparsable id filters nothing");
         let error = error.expect("the offending value is reported");
         assert!(error.contains("abc"), "{error}");
@@ -1463,7 +1647,7 @@ mod tests {
             status_class: Some("  5xx  ".to_string()),
             ..StatsQuery::default()
         };
-        let (filters, error) = resolve_filters(&query);
+        let (filters, error) = resolve_filters(&query, true);
         assert_eq!(filters.status_class, Some(StatusBucket::Server5xx));
         assert!(filters.is_set());
         assert!(error.is_none());
@@ -1472,7 +1656,7 @@ mod tests {
             status_class: Some("errors".to_string()),
             ..StatsQuery::default()
         };
-        let (filters, error) = resolve_filters(&query);
+        let (filters, error) = resolve_filters(&query, true);
         assert_eq!(
             filters.status_class, None,
             "the log listing's errors bucket is not a class of the chart"
@@ -1486,9 +1670,19 @@ mod tests {
             status_class: Some("   ".to_string()),
             ..StatsQuery::default()
         };
-        let (filters, error) = resolve_filters(&query);
+        let (filters, error) = resolve_filters(&query, true);
         assert_eq!(filters, Filters::default());
         assert!(error.is_none());
+
+        // The page without a status filter reads no class at all, so the
+        // same value is neither a filter nor a banner there.
+        let query = StatsQuery {
+            status_class: Some("errors".to_string()),
+            ..StatsQuery::default()
+        };
+        let (filters, error) = resolve_filters(&query, false);
+        assert_eq!(filters, Filters::default());
+        assert!(error.is_none(), "an unread parameter is not reported");
     }
 
     #[test]
@@ -1562,16 +1756,16 @@ mod tests {
 
     #[test]
     fn a_page_builds_one_row_per_model_plus_a_key_total() {
-        let data = stats_data(
+        let data = tokens_data(
             vec![
                 day_row("2026-11-02", "gpt-4o", 1000, 200),
                 day_row("2026-11-03", "gpt-5-mini", 500, 100),
             ],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        let page = build_page(data, &Filters::default(), None);
+        let page = build_tokens_page(data, &Filters::default(), None);
         assert_eq!(page.rows.len(), 3, "two models plus the total line");
-        assert_eq!(page.section, "stats");
+        assert_eq!(page.section, "tokens");
         assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
         assert_eq!(page.from_value, "2026-11-01");
         assert_eq!(page.to_value, "2026-11-30");
@@ -1619,8 +1813,8 @@ mod tests {
         let mut day = day_row("2026-11-02", "claude", 1300, 200);
         day.cached_input_tokens = 250;
         day.cache_write_input_tokens = 50;
-        let data = stats_data(vec![day], HashMap::from([(7, channel_info_write_priced())]));
-        let page = build_page(data, &Filters::default(), None);
+        let data = tokens_data(vec![day], HashMap::from([(7, channel_info_write_priced())]));
+        let page = build_tokens_page(data, &Filters::default(), None);
         let row = &page.rows[0];
         assert_eq!(row.model_label, "claude");
         assert_eq!(row.sums.cache_write_input_tokens, "50");
@@ -1643,7 +1837,7 @@ mod tests {
         let mut second = stored_key(None);
         second.id = 2;
         second.display_prefix = "hyd-2b2b2b2b".to_string();
-        let data = stats_data_for(
+        let data = tokens_data_for(
             vec![stored_key(None), second],
             vec![
                 day_row("2026-11-02", "gpt-4o", 1000, 200),
@@ -1651,7 +1845,7 @@ mod tests {
             ],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        let page = build_page(data, &Filters::default(), None);
+        let page = build_tokens_page(data, &Filters::default(), None);
         assert_eq!(page.rows.len(), 4, "one model line and one total per key");
         assert_eq!(page.rows[0].key_label, "hyd-4f9dEg2x");
         assert_eq!(page.rows[0].sums.cost, "$0.0045");
@@ -1669,8 +1863,8 @@ mod tests {
 
     #[test]
     fn a_key_without_usage_in_the_range_is_omitted_entirely() {
-        let data = stats_data(Vec::new(), HashMap::from([(7, channel_info_limitable())]));
-        let page = build_page(data, &Filters::default(), None);
+        let data = tokens_data(Vec::new(), HashMap::from([(7, channel_info_limitable())]));
+        let page = build_tokens_page(data, &Filters::default(), None);
         assert!(page.rows.is_empty());
         assert_eq!(page.grand.cost, "$0.00");
         assert!(page.empty_message.contains("2026-11-01"));
@@ -1687,8 +1881,8 @@ mod tests {
 
     #[test]
     fn an_empty_view_under_filters_says_the_filters_are_the_reason() {
-        let data = stats_data(Vec::new(), HashMap::from([(7, channel_info_limitable())]));
-        let page = build_page(
+        let data = tokens_data(Vec::new(), HashMap::from([(7, channel_info_limitable())]));
+        let page = build_tokens_page(
             data,
             &Filters {
                 key_id: Some(9),
@@ -1706,12 +1900,12 @@ mod tests {
     fn a_limited_key_on_an_unlimitable_channel_gets_the_warning_badge() {
         let mut unlimitable = channel_info_limitable();
         unlimitable.limitable = false;
-        let data = stats_data_for(
+        let data = tokens_data_for(
             vec![stored_key(Some(50_000_000))],
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, unlimitable)]),
         );
-        let page = build_page(data, &Filters::default(), None);
+        let page = build_tokens_page(data, &Filters::default(), None);
         let total = page.rows.last().unwrap();
         assert!(total.is_total);
         assert!(total.limit_inactive, "the total line carries the warning");
@@ -1720,23 +1914,23 @@ mod tests {
         // unpriced the channel is.
         let mut unlimitable = channel_info_limitable();
         unlimitable.limitable = false;
-        let data = stats_data_for(
+        let data = tokens_data_for(
             vec![stored_key(None)],
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, unlimitable)]),
         );
-        let page = build_page(data, &Filters::default(), None);
+        let page = build_tokens_page(data, &Filters::default(), None);
         assert!(!page.rows.last().unwrap().limit_inactive);
     }
 
     #[test]
     fn a_key_bound_to_a_channel_that_vanished_costs_nothing_and_warns() {
-        let data = stats_data_for(
+        let data = tokens_data_for(
             vec![stored_key(Some(50_000_000))],
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::new(),
         );
-        let page = build_page(data, &Filters::default(), None);
+        let page = build_tokens_page(data, &Filters::default(), None);
         let total = page.rows.last().unwrap();
         assert_eq!(total.sums.cost, "$0.00");
         assert!(total.limit_inactive);
@@ -1746,12 +1940,12 @@ mod tests {
     fn a_deleted_key_keeps_its_rows_and_is_marked() {
         let mut key = stored_key(None);
         key.deleted_at = Some("2026-11-02 00:00:00".to_string());
-        let data = stats_data_for(
+        let data = tokens_data_for(
             vec![key],
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        let page = build_page(data, &Filters::default(), None);
+        let page = build_tokens_page(data, &Filters::default(), None);
         assert!(page.rows.iter().all(|row| row.key_deleted));
         assert_eq!(page.rows.len(), 2);
     }
@@ -1814,10 +2008,10 @@ mod tests {
         // which the pinned formula prices at 4000 micro-USD.
         let mut day = day_row("2026-11-02", "gpt-4o", 1000, 200);
         day.cached_input_tokens = 400;
-        let mut data = stats_data(vec![day], HashMap::from([(7, channel_info_limitable())]));
+        let mut data = tokens_data(vec![day], HashMap::from([(7, channel_info_limitable())]));
         data.models = vec!["gpt-4o".to_string()];
 
-        let page = build_page(data, &Filters::default(), None);
+        let page = build_tokens_page(data, &Filters::default(), None);
         let plot = page.charts.expect("day rows draw both charts");
         assert!(plot.tokens_svg.starts_with("<svg "), "{}", plot.tokens_svg);
         assert!(plot.tokens_svg.contains("aria-label=\"Tokens per day\""));
@@ -1842,40 +2036,62 @@ mod tests {
     }
 
     #[test]
-    fn the_requests_chart_renders_with_status_rows_and_is_dropped_without_them() {
-        let mut data = stats_data(
+    fn the_tokens_page_carries_no_status_content() {
+        let data = tokens_data(
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
             HashMap::from([(7, channel_info_limitable())]),
         );
-        data.status_code_days = vec![DayStatusCodeUsage {
-            day: "2026-11-02".to_string(),
-            status: Some(500),
-            status_class: StatusBucket::Server5xx,
-            requests: 2,
-        }];
-        data.status_code_totals = vec![
-            StatusCodeTotal {
+        let page = build_tokens_page(
+            data,
+            &Filters {
+                status_class: Some(StatusBucket::Server5xx),
+                ..Filters::default()
+            },
+            None,
+        );
+        let plot = page
+            .charts
+            .expect("the day rows draw the token and cost charts");
+        assert!(plot.tokens_svg.contains("aria-label=\"Tokens per day\""));
+        assert!(plot.cost_svg.contains("aria-label=\"Cost per day\""));
+        assert_eq!(page.section, "tokens");
+        assert!(
+            !page.model_options.is_empty(),
+            "the page keeps its own selects"
+        );
+    }
+
+    #[test]
+    fn the_requests_page_renders_the_chart_and_the_table_of_the_same_rows() {
+        let data = requests_data(
+            vec![DayStatusCodeUsage {
+                day: "2026-11-02".to_string(),
                 status: Some(500),
                 status_class: StatusBucket::Server5xx,
                 requests: 2,
-            },
-            StatusCodeTotal {
-                status: None,
-                status_class: StatusBucket::Other,
-                requests: 1,
-            },
-        ];
-        let page = build_page(data, &Filters::default(), None);
-        let status = page
-            .charts
-            .as_ref()
-            .and_then(|plot| plot.status_svg.as_ref())
-            .expect("status rows draw the requests chart");
-        assert!(
-            status.contains("aria-label=\"Requests per day\""),
-            "{status}"
+            }],
+            vec![
+                StatusCodeTotal {
+                    status: Some(500),
+                    status_class: StatusBucket::Server5xx,
+                    requests: 2,
+                },
+                StatusCodeTotal {
+                    status: None,
+                    status_class: StatusBucket::Other,
+                    requests: 1,
+                },
+            ],
         );
-        assert!(status.contains("Day 2: 2 requests (2 500)"), "{status}");
+        let page = build_requests_page(data, &Filters::default(), None);
+        assert_eq!(page.section, "requests");
+        assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
+        let svg = page
+            .status_svg
+            .as_ref()
+            .expect("status rows draw the requests chart");
+        assert!(svg.contains("aria-label=\"Requests per day\""), "{svg}");
+        assert!(svg.contains("Day 2: 2 requests (2 500)"), "{svg}");
         // The table of the same view lists both codes, most requests first.
         assert_eq!(page.status_codes.len(), 2);
         assert_eq!(page.status_codes[0].code, "500");
@@ -1883,32 +2099,34 @@ mod tests {
         assert_eq!(page.status_codes[1].code, "n/a");
         assert_eq!(page.status_codes[1].class, "other");
         assert_eq!(page.status_codes[1].share, "33.3%");
-
-        // A status filter that selects nothing leaves the status rows empty,
-        // which drops that chart alone and keeps the token and cost bars of
-        // the same view, with no status code table either.
-        let mut data = stats_data(
-            vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
-            HashMap::from([(7, channel_info_limitable())]),
+        assert!(
+            page.empty_message.is_empty(),
+            "a page with content shows no empty state"
         );
-        data.status_code_days = Vec::new();
-        let page = build_page(
-            data,
+        assert_eq!(page.status_options.len(), 5);
+    }
+
+    #[test]
+    fn a_requests_page_without_a_matching_request_drops_both_panels() {
+        // A status filter that selects nothing leaves the status rows empty,
+        // which drops the chart and the table, and the page says so.
+        let page = build_requests_page(
+            requests_data(Vec::new(), Vec::new()),
             &Filters {
                 status_class: Some(StatusBucket::Client4xx),
                 ..Filters::default()
             },
             None,
         );
+        assert!(page.status_svg.is_none());
         assert!(page.status_codes.is_empty());
-        let plot = page
-            .charts
-            .expect("the token and cost rows still draw their charts");
-        assert!(plot.status_svg.is_none());
-        assert!(plot.tokens_svg.contains("aria-label=\"Tokens per day\""));
-        assert!(plot.cost_svg.contains("aria-label=\"Cost per day\""));
+        assert!(
+            page.empty_message
+                .contains("No requests match the current filters"),
+            "{}",
+            page.empty_message
+        );
     }
-
     #[test]
     fn the_status_code_table_labels_each_code_with_its_class_and_share() {
         let totals = vec![
@@ -1954,7 +2172,7 @@ mod tests {
 
     #[test]
     fn the_filter_widgets_show_the_range_and_the_shortcut_buttons() {
-        let page = page_shell(&november(), &Filters::default(), None);
+        let page = tokens_shell(&november(), &Filters::default(), None);
         assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
         assert_eq!(page.from_value, "2026-11-01");
         assert_eq!(page.to_value, "2026-11-30");
@@ -1967,7 +2185,7 @@ mod tests {
         assert!(page.empty_message.contains("2026-11-01"));
         assert!(!page.empty_message.contains("filters"));
 
-        let filtered = page_shell(
+        let filtered = tokens_shell(
             &november(),
             &Filters {
                 key_id: Some(4),
@@ -1982,8 +2200,44 @@ mod tests {
     }
 
     #[test]
+    fn the_requests_shell_offers_the_same_range_under_its_own_empty_state() {
+        let page = requests_shell(&november(), &Filters::default(), None);
+        assert_eq!(page.section, "requests");
+        assert_eq!(page.range_label, "2026-11-01 to 2026-11-30");
+        assert_eq!(page.from_value, "2026-11-01");
+        assert_eq!(page.to_value, "2026-11-30");
+        assert_eq!(page.preset_buttons.len(), 3);
+        assert!(
+            page.empty_message.contains("No requests logged"),
+            "{}",
+            page.empty_message
+        );
+        assert!(page.status_svg.is_none());
+        assert!(page.status_codes.is_empty());
+
+        let filtered = requests_shell(
+            &november(),
+            &Filters {
+                status_class: Some(StatusBucket::Server5xx),
+                ..Filters::default()
+            },
+            None,
+        );
+        assert!(filtered
+            .empty_message
+            .contains("No requests match the current filters"));
+        assert!(
+            filtered
+                .status_options
+                .iter()
+                .any(|option| option.selected && option.value == "5xx"),
+            "the class in force stays selected"
+        );
+    }
+
+    #[test]
     fn the_failure_shell_keeps_the_filter_widgets_and_drops_the_empty_message() {
-        let page = page_shell(
+        let page = tokens_shell(
             &november(),
             &Filters::default(),
             Some("internal server error".into()),
@@ -1998,6 +2252,16 @@ mod tests {
             1,
             "the key select keeps its default"
         );
+        assert!(page.key_options[0].selected);
+
+        let page = requests_shell(
+            &november(),
+            &Filters::default(),
+            Some("internal server error".into()),
+        );
+        assert_eq!(page.error.as_deref(), Some("internal server error"));
+        assert!(page.empty_message.is_empty());
+        assert!(page.status_svg.is_none());
         assert!(page.key_options[0].selected);
         assert!(page.status_options[0].selected);
         assert_eq!(page.status_options.len(), 5);

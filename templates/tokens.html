@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Stat{% endblock %}
+{% block title %}Tokens{% endblock %}
 
 {% block content %}
 <section class="panel">
@@ -42,14 +42,6 @@
       <label for="stats-model">Model</label>
       <select id="stats-model" name="model">
         {% for option in model_options %}
-        <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
-        {% endfor %}
-      </select>
-    </div>
-    <div class="filter-field">
-      <label for="stats-status">Status</label>
-      <select id="stats-status" name="status_class">
-        {% for option in status_options %}
         <option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>
         {% endfor %}
       </select>
@@ -135,56 +127,16 @@
       <h3 class="chart-title">Cost per day</h3>
       {{ plot.cost_svg|safe }}
     </div>
-    {% if let Some(status_svg) = plot.status_svg %}
-    <div class="chart-block">
-      <h3 class="chart-title">Requests per day</h3>
-      {{ status_svg|safe }}
-    </div>
-    {% endif %}
   </div>
   <p class="table-meta">
     Bars cover the selected range under the current filters, one bar per day that
     has usage. Token bars stack input tokens at the bottom and output tokens on
     top; heights are relative to the busiest day of the series. Cost is priced the
     same way the table prices it, so the daily bars add up to the same money.
-    Request bars stack the exact response status codes of the range, in the colors
-    the legend names, and follow the status filter, while the token and cost bars
-    and the table keep counting every request of the range.
+    The request counts and the response codes behind them are on the Requests
+    page.
   </p>
 </section>
 {% endif %}
 
-{% if !status_codes.is_empty() %}
-<section class="panel">
-  <div class="panel-head">
-    <h2>Status codes <span class="text-muted">{{ range_label }}</span></h2>
-  </div>
-  <table class="data-table stats-table">
-    <thead>
-      <tr>
-        <th>Status code</th>
-        <th>Class</th>
-        <th>Requests</th>
-        <th>Share</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for row in status_codes %}
-      <tr>
-        <td class="mono">{{ row.code }}</td>
-        <td>{{ row.class }}</td>
-        <td class="mono">{{ row.requests }}</td>
-        <td class="mono">{{ row.share }}</td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  <p class="table-meta">
-    Every exact status code the current filters select, the busiest code first,
-    with the class it belongs to and its share of the requests those filters
-    count. A request that never reached an upstream carries no code and is listed
-    as n/a.
-  </p>
-</section>
-{% endif %}
 {% endblock %}

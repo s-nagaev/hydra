@@ -20,7 +20,9 @@
         <a href="/admin/ui/logs"
           {%- if section == "logs" %} class="active"{% endif %}>Logs</a>
         <a href="/admin/ui/stats"
-          {%- if section == "stats" %} class="active"{% endif %}>Stat</a>
+          {%- if section == "tokens" %} class="active"{% endif %}>Tokens</a>
+        <a href="/admin/ui/stats/requests"
+          {%- if section == "requests" %} class="active"{% endif %}>Requests</a>
       </nav>
       <a class="api-link" href="/swagger-ui">API</a>
       <form class="logout-form" method="post" action="/admin/ui/logout">
