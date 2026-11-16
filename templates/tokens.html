@@ -120,21 +120,23 @@
   </div>
   <div class="chart-grid">
     <div class="chart-block">
-      <h3 class="chart-title">Tokens per day</h3>
+      <h3 class="chart-title">Tokens per {% match granularity %}{% when Granularity::Hourly %}hour{% when Granularity::Daily %}day{% endmatch %}</h3>
       {{ plot.tokens_svg|safe }}
     </div>
     <div class="chart-block">
-      <h3 class="chart-title">Cost per day</h3>
+      <h3 class="chart-title">Cost per {% match granularity %}{% when Granularity::Hourly %}hour{% when Granularity::Daily %}day{% endmatch %}</h3>
       {{ plot.cost_svg|safe }}
     </div>
   </div>
   <p class="table-meta">
-    Bars cover the selected range under the current filters, one bar per day that
-    has usage. Token bars stack input tokens at the bottom and output tokens on
-    top; heights are relative to the busiest day of the series. Cost is priced the
-    same way the table prices it, so the daily bars add up to the same money.
-    The request counts and the response codes behind them are on the Requests
-    page.
+    Bars cover the selected range under the current filters, one bar per
+    {%- match granularity %}{% when Granularity::Hourly %} hour{% when Granularity::Daily %} day{% endmatch %}
+    that has usage. Token bars stack input tokens at the bottom and output
+    tokens on top; heights are relative to the busiest
+    {%- match granularity %}{% when Granularity::Hourly %} hour{% when Granularity::Daily %} day{% endmatch %}
+    of the series. Cost is priced the same way the table prices it, so the
+    bars add up to the same money. The request counts and the response codes
+    behind them are on the Requests page.
   </p>
 </section>
 {% endif %}

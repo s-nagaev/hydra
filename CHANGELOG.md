@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Hourly charts on the stats pages: a range of one or two days, the Today shortcut included, plots one bar per hour of usage, cost and requests, labelled with the clock hour, while a longer range keeps one bar per day. The chart headings name the bucket they span.
+- A mean response time chart on the Requests page: one bar per hour of a short range and one per day of a longer one, showing the average duration of the requests the current filters select.
+
 ## 1.2.0 (2026-11-15)
 
 ### Added

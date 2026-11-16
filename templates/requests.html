@@ -64,19 +64,45 @@
 {% if let Some(status_svg) = status_svg %}
 <section class="panel">
   <div class="panel-head">
-    <h2>Requests per day <span class="text-muted">{{ range_label }}</span></h2>
+    <h2>Requests per {% match granularity %}{% when Granularity::Hourly %}hour{% when Granularity::Daily %}day{% endmatch %} <span class="text-muted">{{ range_label }}</span></h2>
   </div>
   <div class="chart-grid">
     <div class="chart-block">
-      <h3 class="chart-title">Requests per day</h3>
+      <h3 class="chart-title">Requests per {% match granularity %}{% when Granularity::Hourly %}hour{% when Granularity::Daily %}day{% endmatch %}</h3>
       {{ status_svg|safe }}
     </div>
   </div>
   <p class="table-meta">
-    Bars cover the selected range under the current filters, one bar per day that
-    has requests, stacked by the exact response status codes in the colors the
-    legend names. Heights are relative to the busiest day of the series, and the
-    status filter of the page narrows the bars like it narrows the table below.
+    Bars cover the selected range under the current filters, one bar per
+    {%- match granularity %}{% when Granularity::Hourly %} hour{% when Granularity::Daily %} day{% endmatch %}
+    that has requests, stacked by the exact response status codes in the colors
+    the legend names. Heights are relative to the busiest
+    {%- match granularity %}{% when Granularity::Hourly %} hour{% when Granularity::Daily %} day{% endmatch %}
+    of the series, and the status filter of the page narrows the bars like it
+    narrows the table below.
+  </p>
+</section>
+{% endif %}
+
+{% if let Some(latency_svg) = latency_svg %}
+<section class="panel">
+  <div class="panel-head">
+    <h2>Mean response time <span class="text-muted">{{ range_label }}</span></h2>
+  </div>
+  <div class="chart-grid">
+    <div class="chart-block">
+      <h3 class="chart-title">Mean response time per {% match granularity %}{% when Granularity::Hourly %}hour{% when Granularity::Daily %}day{% endmatch %}</h3>
+      {{ latency_svg|safe }}
+    </div>
+  </div>
+  <p class="table-meta">
+    One bar per
+    {%- match granularity %}{% when Granularity::Hourly %} hour{% when Granularity::Daily %} day{% endmatch %}
+    of the mean duration of the requests the current filters select, measured
+    from the moment the request was accepted to the last byte of the response.
+    A request that never reached an upstream is timed too and stays in the
+    mean, and a range of several days folds the hours of each day into that
+    day's mean.
   </p>
 </section>
 {% endif %}

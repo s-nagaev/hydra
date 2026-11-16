@@ -242,10 +242,6 @@ pub(crate) fn theme_from_headers(headers: &HeaderMap) -> ChartTheme {
 }
 
 /// The bucket one bar of a chart spans, chosen from the selected day range.
-// Idle until the stats page handlers pick a granularity in the next change,
-// which is the only caller this type and the hourly and latency builders
-// below have.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Granularity {
     /// One bar per hour: the range covers one or two days, where a bar per
@@ -621,7 +617,6 @@ pub(crate) fn daily_token_bars(rows: &[DayUsage], theme: ChartTheme) -> String {
 /// Renders the tokens-per-hour chart of a one or two day range: the hourly
 /// twin of [`daily_token_bars`], one stacked bar per hour of the range, with
 /// the hour (and, on a two day range, the day) under it on the axis.
-#[allow(dead_code)]
 pub(crate) fn hourly_token_bars(
     rows: &[HourUsage],
     from: Date,
@@ -657,7 +652,6 @@ pub(crate) fn daily_cost_bars(costs: &[(String, i64)], theme: ChartTheme) -> Str
 
 /// Renders the cost-per-hour chart of a one or two day range: the same
 /// caller-priced series as [`daily_cost_bars`], bucketed by hour.
-#[allow(dead_code)]
 pub(crate) fn hourly_cost_bars(
     costs: &[(String, i64)],
     from: Date,
@@ -690,7 +684,6 @@ pub(crate) fn daily_status_code_bars(rows: &[DayStatusCodeUsage], theme: ChartTh
 /// Renders the requests-per-hour chart of a one or two day range: the hourly
 /// twin of [`daily_status_code_bars`], one segment per exact status code of
 /// an hour.
-#[allow(dead_code)]
 pub(crate) fn hourly_status_code_bars(
     rows: &[HourStatusCodeUsage],
     from: Date,
@@ -710,7 +703,6 @@ pub(crate) fn hourly_status_code_bars(
 /// per hour, and a longer one folds the hours of a day into that day's mean,
 /// weighted by the timed requests each hour covers, on the same daily grid
 /// the other daily charts use. An empty series renders a placeholder note.
-#[allow(dead_code)]
 pub(crate) fn latency_bars(
     rows: &[HourLatency],
     from: Date,
