@@ -1,26 +1,37 @@
 //! Server-side SVG bar charts for the admin stats page.
 //!
-//! The stats page renders three charts, tokens per day, cost per day and
-//! requests per day, as plain `<svg>` markup generated here: no JavaScript,
-//! no charting crate and no template logic beyond the `|safe` filter that
-//! injects the returned string. Heights are normalized to the largest daily
-//! total in the series, every bar carries a `<title>` so the browser shows a
-//! native tooltip without any script, and all three share the same viewport,
-//! gutters, day slots and day labels.
+//! The stats page renders four charts, tokens, cost, requests and request
+//! latency, as plain `<svg>` markup generated here: no JavaScript, no
+//! charting crate and no template logic beyond the `|safe` filter that
+//! injects the returned string. Heights are normalized to the largest bucket
+//! of the series, every bar carries a `<title>` so the browser shows a native
+//! tooltip without any script, and all of them share the same viewport,
+//! gutters and bar geometry.
 //!
-//! The token chart consumes [`DayUsage`] rows exactly as the SQL aggregate
-//! hands them over and buckets them with [`aggregate_daily`]. The cost chart
-//! takes a pre-summed `(day, micro-USD)` series instead of the same rows,
-//! because a price is a function of the price table of the key's channel
-//! ([`crate::usage::group_cost`]), which no usage row carries: the caller
-//! prices its own query groups and sums them per day, so no cost is ever
-//! derived from a row priced with another channel's rates. The status chart
-//! consumes [`DayStatusCodeUsage`] rows and stacks one segment per exact
-//! response status, with a legend that maps the palette colors to the codes.
+//! [`Granularity`] picks the x-axis from the selected day range: one or two
+//! days are drawn hour by hour, three days and more day by day, the fixed
+//! 1 through 31 grid the daily charts have always used. The axis is the one
+//! place that knows how many slots a chart has, which of them carry a label
+//! and how a bucket is placed and named in a tooltip, so both granularities
+//! share every drawing rule.
 //!
-//! Rows whose day label does not parse to a day of the month are skipped,
-//! and a series that maps to no bar at all renders a placeholder note inside
-//! a valid, empty chart rather than an error.
+//! The token chart consumes [`DayUsage`] or [`HourUsage`] rows exactly as the
+//! SQL aggregate hands them over and buckets them with [`aggregate_daily`].
+//! The cost chart takes a pre-summed `(bucket, micro-USD)` series instead of
+//! the same rows, because a price is a function of the price table of the
+//! key's channel ([`crate::usage::group_cost`]), which no usage row carries:
+//! the caller prices its own query groups and sums them per bucket, so no
+//! cost is ever derived from a row priced with another channel's rates. The
+//! status chart consumes [`DayStatusCodeUsage`] or [`HourStatusCodeUsage`]
+//! rows and stacks one segment per exact response status, with a legend that
+//! maps the palette colors to the codes. The latency chart consumes
+//! [`HourLatency`] rows and plots the mean `duration_ms` of a bucket, on a
+//! daily range the mean of every timed request of a day: the hours of a day
+//! fold into it weighted by the timed requests each hour covers.
+//!
+//! A bucket whose label names no slot of the axis is skipped, and a series
+//! that maps to no bar at all renders a placeholder note inside a valid,
+//! empty chart rather than an error.
 //!
 //! Colors travel as [`ChartTheme`] rather than through CSS: the SVG is built
 //! here, so the palette of the theme the page is showing is chosen on the
@@ -32,35 +43,46 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use axum::http::HeaderMap;
+use time::{Date, Duration};
 
-/// The aggregate row the SQL layer defines, reused here so both branches of
+/// The aggregate rows the SQL layer defines, reused here so both branches of
 /// the stats page read one shape instead of two identical copies.
-pub(crate) use crate::db::request_logs::{DayStatusCodeUsage, DayUsage, StatusBucket};
+pub(crate) use crate::db::request_logs::{
+    DayStatusCodeUsage, DayUsage, HourLatency, HourStatusCodeUsage, HourUsage, StatusBucket,
+};
 
 /// Viewport width in user units; the root element scales it to the card.
 const VIEW_W: f64 = 720.0;
 /// Viewport height in user units.
 const VIEW_H: f64 = 260.0;
-/// Left gutter before the first day slot; every value label sits above the
-/// plot, so this is spacing rather than a place for text.
+/// Left gutter before the first slot; every value label sits above the plot,
+/// so this is spacing rather than a place for text.
 const PAD_LEFT: f64 = 20.0;
 /// Right gutter.
 const PAD_RIGHT: f64 = 12.0;
 /// Top gutter: the axis label sits here, above the tallest bar.
 const PAD_TOP: f64 = 20.0;
-/// Bottom gutter under the day labels.
+/// Bottom gutter under the bucket labels.
 const PAD_BOTTOM: f64 = 30.0;
 /// Horizontal extent of the plotting area.
 const PLOT_W: f64 = VIEW_W - PAD_LEFT - PAD_RIGHT;
 /// Vertical extent of the plotting area.
 const PLOT_H: f64 = VIEW_H - PAD_TOP - PAD_BOTTOM;
-/// Day slots on the x-axis: a fixed 1 through 31 so the axis is stable
-/// across months independent of the data.
+/// Day slots on the x-axis of a daily chart: a fixed 1 through 31 so the axis
+/// is stable across months independent of the data.
 const DAY_SLOTS: u32 = 31;
-/// Width of one day slot.
-const SLOT_W: f64 = PLOT_W / DAY_SLOTS as f64;
-/// Width of the bar inside a slot.
-const BAR_W: f64 = SLOT_W * 0.62;
+/// Hour slots of one day on an hourly axis.
+const HOUR_SLOTS: u32 = 24;
+/// The longest range an hourly chart covers: one or two days.
+const HOURLY_MAX_DAYS: u32 = 2;
+/// Width of the bar inside a slot, as a fraction of that slot.
+const BAR_FRACTION: f64 = 0.62;
+/// The three letter month names an hourly label of a two day range carries,
+/// in calendar order. The stored bucket labels are numeric, so the chart
+/// abbreviates the month itself instead of formatting a date.
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 /// Y coordinate of the baseline every bar grows from.
 const BASE_Y: f64 = PAD_TOP + PLOT_H;
 
@@ -166,7 +188,8 @@ impl ChartTheme {
 /// The colors one theme paints the charts in, named after the custom
 /// properties of `assets/admin.css` they mirror.
 struct Palette {
-    /// `--accent`: input-token segments, and the fourth status slot.
+    /// `--accent`: input-token segments, the latency bars and the fourth
+    /// status slot.
     accent: &'static str,
     /// `--text-muted`: output-token segments, axis labels, the empty note and
     /// the sixth status slot.
@@ -218,24 +241,250 @@ pub(crate) fn theme_from_headers(headers: &HeaderMap) -> ChartTheme {
     ChartTheme::Light
 }
 
-/// Accessible name of the tokens chart.
-const TOKENS_LABEL: &str = "Tokens per day";
-/// Accessible name of the cost chart.
-const COST_LABEL: &str = "Cost per day";
-/// Accessible name of the requests chart.
-const STATUS_LABEL: &str = "Requests per day";
+/// The bucket one bar of a chart spans, chosen from the selected day range.
+// Idle until the stats page handlers pick a granularity in the next change,
+// which is the only caller this type and the hourly and latency builders
+// below have.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Granularity {
+    /// One bar per hour: the range covers one or two days, where a bar per
+    /// day would hide the shape of the day an admin is looking at.
+    Hourly,
+    /// One bar per day: the range covers three days or more, where a bar per
+    /// hour would be too thin to read.
+    Daily,
+}
+
+impl Granularity {
+    /// The granularity of an inclusive range of UTC days.
+    ///
+    /// The bounds are the days the `from` and `to` parameters name, so one
+    /// day is a one day range and two consecutive days are a two day one; a
+    /// range that names no day at all (`to` before `from`) falls back to the
+    /// daily axis, the layout that renders any series.
+    pub(crate) fn from_range(from: Date, to: Date) -> Self {
+        let days = (to - from).whole_days().saturating_add(1);
+        if (1..=i64::from(HOURLY_MAX_DAYS)).contains(&days) {
+            Granularity::Hourly
+        } else {
+            Granularity::Daily
+        }
+    }
+}
+
+/// The x-axis of one chart: how many slots it has, which of them carry a
+/// label, and where and how a slot is drawn and named.
+///
+/// One axis serves every chart, so a bucket can never be placed or titled by
+/// two different rules. The daily axis is the fixed 1 through 31 grid the
+/// charts have always used, independent of the selected range; the hourly
+/// axis is one slot per hour of the one or two days a range covers, in clock
+/// order from the first hour of its first day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Axis {
+    /// One slot per day of the month, the first day in the first slot.
+    Daily,
+    /// One slot per hour, starting at the first hour of `from`.
+    Hourly { from: Date, days: u32 },
+}
+
+impl Axis {
+    /// The daily axis, one slot per day of the month.
+    fn daily() -> Self {
+        Axis::Daily
+    }
+
+    /// The hourly axis of the days `from` through `to`, clamped to
+    /// [`HOURLY_MAX_DAYS`] days: a caller passes the range of an hourly
+    /// chart, which [`Granularity::from_range`] has already sized.
+    fn hourly(from: Date, to: Date) -> Self {
+        let days = (to - from)
+            .whole_days()
+            .saturating_add(1)
+            .clamp(1, i64::from(HOURLY_MAX_DAYS));
+        Axis::Hourly {
+            from,
+            days: days as u32,
+        }
+    }
+
+    /// The number of slots bars are placed in.
+    fn slots(self) -> u32 {
+        match self {
+            Axis::Daily => DAY_SLOTS,
+            Axis::Hourly { days, .. } => days * HOUR_SLOTS,
+        }
+    }
+
+    /// The period one slot spans, as a chart heading names it.
+    fn period(self) -> &'static str {
+        match self {
+            Axis::Daily => "day",
+            Axis::Hourly { .. } => "hour",
+        }
+    }
+
+    /// The width of one slot.
+    fn slot_w(self) -> f64 {
+        PLOT_W / f64::from(self.slots())
+    }
+
+    /// The width of the bar drawn inside a slot.
+    fn bar_w(self) -> f64 {
+        self.slot_w() * BAR_FRACTION
+    }
+
+    /// Left edge of the bar of a slot.
+    fn bar_x(self, slot: u32) -> f64 {
+        PAD_LEFT + f64::from(slot) * self.slot_w() + (self.slot_w() - self.bar_w()) / 2.0
+    }
+
+    /// Horizontal center of a slot, where its axis label sits.
+    fn slot_center(self, slot: u32) -> f64 {
+        PAD_LEFT + f64::from(slot) * self.slot_w() + self.slot_w() / 2.0
+    }
+
+    /// Whether a slot carries an axis label. Both axes stay sparse: the first
+    /// day and every fifth one of the month, and every third hour of a one
+    /// day range or every sixth hour of a two day one, which keeps the labels
+    /// of the widest axis (48 slots) about as far apart as the daily ones.
+    fn labelled(self, slot: u32) -> bool {
+        match self {
+            Axis::Daily => slot == 0 || (slot + 1).is_multiple_of(5),
+            Axis::Hourly { days: 1, .. } => slot.is_multiple_of(3),
+            Axis::Hourly { .. } => slot.is_multiple_of(6),
+        }
+    }
+
+    /// The text under a slot: the day of the month on the daily axis, the
+    /// clock hour on a one day range, and the day with the hour on a two day
+    /// one, where an hour alone would name two different buckets.
+    fn label(self, slot: u32) -> String {
+        match self {
+            Axis::Daily => (slot + 1).to_string(),
+            Axis::Hourly { days: 1, .. } => hour_text(slot),
+            Axis::Hourly { from, .. } => {
+                let day = shift_day(from, i64::from(slot / HOUR_SLOTS));
+                format!(
+                    "{} {} {}",
+                    MONTHS[month_index(day)],
+                    day.day(),
+                    hour_text(slot)
+                )
+            }
+        }
+    }
+
+    /// How a slot names itself in a tooltip: `Day 4` on the daily axis, the
+    /// bucket's own label on the hourly one.
+    fn name(self, slot: u32) -> String {
+        match self {
+            Axis::Daily => format!("Day {}", slot + 1),
+            Axis::Hourly { .. } => self.label(slot),
+        }
+    }
+
+    /// The slot a bucket label names, `None` when the axis carries no such
+    /// slot: an unparsable label, a day the month does not have, and a bucket
+    /// outside the range of an hourly axis are all skipped the same way.
+    fn slot_of(self, bucket: &str) -> Option<u32> {
+        match self {
+            Axis::Daily => day_slot(bucket),
+            Axis::Hourly { from, days } => {
+                let (day, hour) = hour_parts(bucket)?;
+                let offset = (day - from).whole_days();
+                if !(0..i64::from(days)).contains(&offset) {
+                    return None;
+                }
+                Some(offset as u32 * HOUR_SLOTS + u32::from(hour))
+            }
+        }
+    }
+}
+
+/// The slot of the day of the month a bucket label names, `None` when the
+/// label carries no parsable day of the month in 1 through 31. The day is the
+/// last `-` separated part of the label, so a `YYYY-MM-DD` label and a bare
+/// day both read as the day they name.
+fn day_slot(label: &str) -> Option<u32> {
+    let day = label.split(' ').next()?;
+    let number: u32 = day.rsplit('-').next()?.parse().ok()?;
+    // The check is written as a subtraction so that a day of a month the
+    // label names as `00` is rejected instead of underflowing.
+    number.checked_sub(1).filter(|slot| *slot < DAY_SLOTS)
+}
+
+/// The day and the hour a `YYYY-MM-DD HH` bucket label names, `None` for
+/// anything else.
+fn hour_parts(label: &str) -> Option<(Date, u8)> {
+    let (day, time) = label.split_once(' ')?;
+    let day = parse_day(day)?;
+    let hour: u8 = time.get(..2)?.parse().ok()?;
+    (hour < HOUR_SLOTS as u8).then_some((day, hour))
+}
+
+/// Reads the `YYYY-MM-DD` day of a bucket label; `None` for anything else,
+/// including a day its month does not have (`2026-02-30`) and a year, month
+/// or day of the wrong width.
+fn parse_day(raw: &str) -> Option<Date> {
+    let (year, rest) = raw.split_once('-')?;
+    let (month, day) = rest.split_once('-')?;
+    if !digits(year, 4) || !digits(month, 2) || !digits(day, 2) {
+        return None;
+    }
+    let month = time::Month::try_from(month.parse::<u8>().ok()?).ok()?;
+    Date::from_calendar_date(year.parse().ok()?, month, day.parse::<u8>().ok()?).ok()
+}
+
+/// Exactly `width` ASCII digits.
+fn digits(text: &str, width: usize) -> bool {
+    text.len() == width && text.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The clock label of an hourly slot, `14:00`.
+fn hour_text(slot: u32) -> String {
+    format!("{:02}:00", slot % HOUR_SLOTS)
+}
+
+/// The index of a day's month in [`MONTHS`].
+fn month_index(day: Date) -> usize {
+    usize::from(u8::from(day.month())) - 1
+}
+
+/// The day `offset` days after `day`. No axis asks for a day the calendar
+/// cannot hold, and a date outside it stays where it is rather than panicking.
+fn shift_day(day: Date, offset: i64) -> Date {
+    day.checked_add(Duration::days(offset)).unwrap_or(day)
+}
+
+/// The measure of the tokens chart, and of the other charts; the axis adds
+/// the period its bars span.
+const TOKENS_NAME: &str = "Tokens";
+/// The measure of the cost chart.
+const COST_NAME: &str = "Cost";
+/// The measure of the requests chart.
+const REQUESTS_NAME: &str = "Requests";
+/// The measure of the latency chart.
+const LATENCY_NAME: &str = "Latency";
 /// Note rendered when a series maps to no bar.
 const EMPTY_NOTE: &str = "No usage in this period";
 /// Class of the legend group of a chart, which is also what tells the legend
 /// rects apart from the bar rects.
 const LEGEND_OPEN: &str = "<g class=\"chart-legend\">";
 
+/// The accessible name of one chart: its measure and the period its bars
+/// span, `Tokens per day` or `Tokens per hour`.
+fn chart_label(name: &str, axis: Axis) -> String {
+    format!("{name} per {}", axis.period())
+}
+
 /// Which pair of values a chart plots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChartKind {
     /// Input and output tokens as two stacked segments of one bar.
     Stacked,
-    /// One bar per day from a caller-priced cost series.
+    /// One bar per bucket from a caller-priced cost series.
     Single,
 }
 
@@ -249,11 +498,11 @@ impl ChartKind {
     }
 }
 
-/// One day of a chart series, already summed across keys and models.
+/// One slot of a chart series, already summed across keys and models.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DayBar {
-    /// Day of the month, 1 through 31.
-    day: u32,
+struct Bar {
+    /// Index of the slot on the axis the series was bucketed into.
+    slot: u32,
     /// Bottom segment: input tokens, or the micro-USD cost.
     input: i64,
     /// Top segment: output tokens; zero for the cost chart.
@@ -262,20 +511,31 @@ struct DayBar {
     requests: i64,
 }
 
-impl DayBar {
+impl Bar {
     /// Height driver of the bar, saturating so no input can overflow.
     fn total(&self) -> i64 {
         self.input.saturating_add(self.output)
     }
 }
 
-/// One day of the requests chart: the request count of every exact response
-/// status the day logged.
+/// One slot of the latency series: the mean duration of a bucket.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LatencyBar {
+    /// Index of the slot on the axis the series was bucketed into.
+    slot: u32,
+    /// Mean `duration_ms` of the bucket.
+    avg_ms: f64,
+    /// Timed requests the mean covers.
+    requests: i64,
+}
+
+/// One slot of the requests chart: the request count of every exact response
+/// status the bucket logged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StatusCodeBar {
-    /// Day of the month, 1 through 31.
-    day: u32,
-    /// One `(status, request count)` pair per code of the day, in the
+    /// Index of the slot on the axis the series was bucketed into.
+    slot: u32,
+    /// One `(status, request count)` pair per code of the bucket, in the
     /// canonical code order the segments stack in.
     counts: Vec<(Option<i64>, i64)>,
 }
@@ -292,7 +552,7 @@ impl StatusCodeBar {
 /// The canonical order of a status across the whole chart: exact codes
 /// ascending, then the requests that carry no status at all. Ordering the
 /// codes here rather than trusting the row order is what keeps the segments,
-/// the legend and the colors of one month identical whatever order the
+/// the legend and the colors of one bucket identical whatever order the
 /// backend returns the rows in, and it puts the `n/a` segment last.
 fn code_order(status: Option<i64>) -> (u8, i64) {
     match status {
@@ -348,11 +608,34 @@ pub(crate) fn aggregate_daily(rows: &[DayUsage]) -> Vec<(String, i64, i64, i64)>
 /// stay empty slots so the axis keeps a fixed 1 through 31 extent. An empty
 /// result or a series of unparsable day labels renders a placeholder note.
 pub(crate) fn daily_token_bars(rows: &[DayUsage], theme: ChartTheme) -> String {
-    let bars = token_series(rows);
-    if bars.is_empty() {
-        return placeholder_chart(TOKENS_LABEL, theme);
-    }
-    render_chart(TOKENS_LABEL, &bars, ChartKind::Stacked, theme)
+    let axis = Axis::daily();
+    bar_chart(
+        chart_label(TOKENS_NAME, axis),
+        ChartKind::Stacked,
+        axis,
+        token_series(rows, axis),
+        theme,
+    )
+}
+
+/// Renders the tokens-per-hour chart of a one or two day range: the hourly
+/// twin of [`daily_token_bars`], one stacked bar per hour of the range, with
+/// the hour (and, on a two day range, the day) under it on the axis.
+#[allow(dead_code)]
+pub(crate) fn hourly_token_bars(
+    rows: &[HourUsage],
+    from: Date,
+    to: Date,
+    theme: ChartTheme,
+) -> String {
+    let axis = Axis::hourly(from, to);
+    bar_chart(
+        chart_label(TOKENS_NAME, axis),
+        ChartKind::Stacked,
+        axis,
+        hour_token_series(rows, axis),
+        theme,
+    )
 }
 
 /// Renders the cost-per-day chart: one bar per day, already priced by the
@@ -362,49 +645,33 @@ pub(crate) fn daily_token_bars(rows: &[DayUsage], theme: ChartTheme) -> String {
 /// caller can hand over one entry per query group instead of pre-bucketing.
 /// See the module docs for why cost does not travel as [`DayUsage`].
 pub(crate) fn daily_cost_bars(costs: &[(String, i64)], theme: ChartTheme) -> String {
-    let bars = cost_series(costs);
-    if bars.is_empty() {
-        return placeholder_chart(COST_LABEL, theme);
-    }
-    render_chart(COST_LABEL, &bars, ChartKind::Single, theme)
+    let axis = Axis::daily();
+    bar_chart(
+        chart_label(COST_NAME, axis),
+        ChartKind::Single,
+        axis,
+        cost_series(costs, axis),
+        theme,
+    )
 }
 
-/// Buckets the token rows into the fixed day slots.
-fn token_series(rows: &[DayUsage]) -> Vec<DayBar> {
-    let mut slots: BTreeMap<u32, DayBar> = BTreeMap::new();
-    for (day, prompt, completion, requests) in aggregate_daily(rows) {
-        let Some(number) = day_number(&day) else {
-            continue;
-        };
-        let bar = slots.entry(number).or_insert(DayBar {
-            day: number,
-            input: 0,
-            output: 0,
-            requests: 0,
-        });
-        bar.input = bar.input.saturating_add(prompt);
-        bar.output = bar.output.saturating_add(completion);
-        bar.requests = bar.requests.saturating_add(requests);
-    }
-    slots.into_values().collect()
-}
-
-/// Buckets the caller-priced costs into the fixed day slots.
-fn cost_series(costs: &[(String, i64)]) -> Vec<DayBar> {
-    let mut slots: BTreeMap<u32, DayBar> = BTreeMap::new();
-    for (day, micro_usd) in costs {
-        let Some(number) = day_number(day) else {
-            continue;
-        };
-        let bar = slots.entry(number).or_insert(DayBar {
-            day: number,
-            input: 0,
-            output: 0,
-            requests: 0,
-        });
-        bar.input = bar.input.saturating_add(*micro_usd);
-    }
-    slots.into_values().collect()
+/// Renders the cost-per-hour chart of a one or two day range: the same
+/// caller-priced series as [`daily_cost_bars`], bucketed by hour.
+#[allow(dead_code)]
+pub(crate) fn hourly_cost_bars(
+    costs: &[(String, i64)],
+    from: Date,
+    to: Date,
+    theme: ChartTheme,
+) -> String {
+    let axis = Axis::hourly(from, to);
+    bar_chart(
+        chart_label(COST_NAME, axis),
+        ChartKind::Single,
+        axis,
+        cost_series(costs, axis),
+        theme,
+    )
 }
 
 /// Renders the requests-per-day chart: one bar per day that has data, a
@@ -414,37 +681,215 @@ fn cost_series(costs: &[(String, i64)]) -> Vec<DayBar> {
 /// The codes are the ones the SQL aggregate groups by, so the bar segments
 /// and the tooltip figures always agree, and the class filter that narrows
 /// the aggregate narrows what the chart shows. An empty series renders a
-/// placeholder note, exactly like the other two charts.
+/// placeholder note, exactly like the other charts.
 pub(crate) fn daily_status_code_bars(rows: &[DayStatusCodeUsage], theme: ChartTheme) -> String {
-    let bars = status_code_series(rows);
-    if bars.is_empty() {
-        return placeholder_chart(STATUS_LABEL, theme);
-    }
-    let palette = code_palette(&bars, theme);
-    render_status_code_chart(&bars, &palette, theme)
+    let axis = Axis::daily();
+    status_code_chart(status_code_series(rows, axis), axis, theme)
 }
 
-/// Buckets the per-code rows into the fixed day slots, folding the codes of
-/// one day into one bar.
-fn status_code_series(rows: &[DayStatusCodeUsage]) -> Vec<StatusCodeBar> {
-    let mut slots: BTreeMap<u32, Vec<(Option<i64>, i64)>> = BTreeMap::new();
+/// Renders the requests-per-hour chart of a one or two day range: the hourly
+/// twin of [`daily_status_code_bars`], one segment per exact status code of
+/// an hour.
+#[allow(dead_code)]
+pub(crate) fn hourly_status_code_bars(
+    rows: &[HourStatusCodeUsage],
+    from: Date,
+    to: Date,
+    theme: ChartTheme,
+) -> String {
+    let axis = Axis::hourly(from, to);
+    status_code_chart(hour_status_code_series(rows, axis), axis, theme)
+}
+
+/// Renders the latency chart of a range: one bar per bucket, the mean
+/// `duration_ms` of the bucket scaled to the largest mean of the series, in
+/// the palette of `theme`.
+///
+/// The series comes from the hourly aggregate, and the granularity of the
+/// range decides how its hours are read: a one or two day range plots one bar
+/// per hour, and a longer one folds the hours of a day into that day's mean,
+/// weighted by the timed requests each hour covers, on the same daily grid
+/// the other daily charts use. An empty series renders a placeholder note.
+#[allow(dead_code)]
+pub(crate) fn latency_bars(
+    rows: &[HourLatency],
+    from: Date,
+    to: Date,
+    theme: ChartTheme,
+) -> String {
+    let axis = match Granularity::from_range(from, to) {
+        Granularity::Hourly => Axis::hourly(from, to),
+        Granularity::Daily => Axis::daily(),
+    };
+    let bars = latency_series(rows, axis);
+    if bars.is_empty() {
+        return placeholder_chart(&chart_label(LATENCY_NAME, axis), theme);
+    }
+    render_latency_chart(&bars, axis, theme)
+}
+
+/// Buckets the token rows of a daily range into the slots of `axis`.
+fn token_series(rows: &[DayUsage], axis: Axis) -> Vec<Bar> {
+    let mut slots: BTreeMap<u32, Bar> = BTreeMap::new();
+    for (day, prompt, completion, requests) in aggregate_daily(rows) {
+        add_bucket(&mut slots, axis, &day, prompt, completion, requests);
+    }
+    slots.into_values().collect()
+}
+
+/// Buckets the hourly token rows into the slots of `axis`. The rows arrive
+/// one per hour, key and model, so the sums of one bucket are the sums of
+/// every group it holds.
+fn hour_token_series(rows: &[HourUsage], axis: Axis) -> Vec<Bar> {
+    let mut slots: BTreeMap<u32, Bar> = BTreeMap::new();
     for row in rows {
-        let Some(number) = day_number(&row.day) else {
+        add_bucket(
+            &mut slots,
+            axis,
+            &row.hour,
+            row.prompt_tokens,
+            row.completion_tokens,
+            row.requests,
+        );
+    }
+    slots.into_values().collect()
+}
+
+/// Buckets the caller-priced costs into the slots of `axis`.
+fn cost_series(costs: &[(String, i64)], axis: Axis) -> Vec<Bar> {
+    let mut slots: BTreeMap<u32, Bar> = BTreeMap::new();
+    for (bucket, micro_usd) in costs {
+        add_bucket(&mut slots, axis, bucket, *micro_usd, 0, 0);
+    }
+    slots.into_values().collect()
+}
+
+/// Folds one bucket of values into its slot, summing over every row that
+/// lands there. A label the axis does not carry contributes nothing.
+fn add_bucket(
+    slots: &mut BTreeMap<u32, Bar>,
+    axis: Axis,
+    label: &str,
+    input: i64,
+    output: i64,
+    requests: i64,
+) {
+    let Some(slot) = axis.slot_of(label) else {
+        return;
+    };
+    let bar = slots.entry(slot).or_insert(Bar {
+        slot,
+        input: 0,
+        output: 0,
+        requests: 0,
+    });
+    bar.input = bar.input.saturating_add(input);
+    bar.output = bar.output.saturating_add(output);
+    bar.requests = bar.requests.saturating_add(requests);
+}
+
+/// Folds the hourly latency rows into the slots of `axis`.
+///
+/// Every row contributes its mean weighted by the timed requests it covers,
+/// so a folded day reads as the mean of every timed request of that day
+/// rather than as the mean of its hours' means.
+fn latency_series(rows: &[HourLatency], axis: Axis) -> Vec<LatencyBar> {
+    let mut sums: BTreeMap<u32, (f64, i64)> = BTreeMap::new();
+    for row in rows {
+        let Some(slot) = axis.slot_of(&row.hour) else {
             continue;
         };
-        let counts = slots.entry(number).or_default();
-        match counts.iter_mut().find(|(code, _)| *code == row.status) {
-            Some((_, count)) => *count = count.saturating_add(row.requests),
-            None => counts.push((row.status, row.requests)),
+        let entry = sums.entry(slot).or_insert((0.0, 0));
+        entry.0 += row.avg_duration_ms * row.requests as f64;
+        entry.1 = entry.1.saturating_add(row.requests);
+    }
+    sums.into_iter()
+        .map(|(slot, (weighted, requests))| LatencyBar {
+            slot,
+            avg_ms: mean_ms(weighted, requests),
+            requests,
+        })
+        .collect()
+}
+
+/// The mean duration of a slot from the weighted sum of its rows. Every row
+/// carries a duration, so a bucket holds at least one timed request; the
+/// guard keeps a bucket without one at zero instead of a `NaN` coordinate.
+fn mean_ms(weighted: f64, requests: i64) -> f64 {
+    if requests > 0 {
+        weighted / requests as f64
+    } else {
+        0.0
+    }
+}
+
+/// Buckets the daily per-code rows into the slots of `axis`.
+fn status_code_series(rows: &[DayStatusCodeUsage], axis: Axis) -> Vec<StatusCodeBar> {
+    fold_status_codes(
+        axis,
+        rows.iter()
+            .map(|row| (row.day.as_str(), row.status, row.requests)),
+    )
+}
+
+/// Buckets the hourly per-code rows into the slots of `axis`.
+fn hour_status_code_series(rows: &[HourStatusCodeUsage], axis: Axis) -> Vec<StatusCodeBar> {
+    fold_status_codes(
+        axis,
+        rows.iter()
+            .map(|row| (row.hour.as_str(), row.status, row.requests)),
+    )
+}
+
+/// Folds `(bucket label, status, requests)` triples into one bar per slot,
+/// the codes of a bar in canonical order.
+fn fold_status_codes<'a>(
+    axis: Axis,
+    rows: impl Iterator<Item = (&'a str, Option<i64>, i64)>,
+) -> Vec<StatusCodeBar> {
+    let mut slots: BTreeMap<u32, Vec<(Option<i64>, i64)>> = BTreeMap::new();
+    for (label, status, requests) in rows {
+        let Some(slot) = axis.slot_of(label) else {
+            continue;
+        };
+        let counts = slots.entry(slot).or_default();
+        match counts.iter_mut().find(|(code, _)| *code == status) {
+            Some((_, count)) => *count = count.saturating_add(requests),
+            None => counts.push((status, requests)),
         }
     }
     slots
         .into_iter()
-        .map(|(day, mut counts)| {
+        .map(|(slot, mut counts)| {
             counts.sort_by_key(|(code, _)| code_order(*code));
-            StatusCodeBar { day, counts }
+            StatusCodeBar { slot, counts }
         })
         .collect()
+}
+
+/// Renders a chart from its already bucketed series: the placeholder note
+/// when the series maps to no bar at all, the chart itself otherwise.
+fn bar_chart(
+    label: String,
+    kind: ChartKind,
+    axis: Axis,
+    bars: Vec<Bar>,
+    theme: ChartTheme,
+) -> String {
+    if bars.is_empty() {
+        return placeholder_chart(&label, theme);
+    }
+    render_chart(&label, &bars, kind, axis, theme)
+}
+
+/// Renders the requests chart of a series: the placeholder note when no bar
+/// has data, the stacked chart with its code legend otherwise.
+fn status_code_chart(bars: Vec<StatusCodeBar>, axis: Axis, theme: ChartTheme) -> String {
+    if bars.is_empty() {
+        return placeholder_chart(&chart_label(REQUESTS_NAME, axis), theme);
+    }
+    let palette = code_palette(&bars, theme);
+    render_status_code_chart(&bars, &palette, axis, theme)
 }
 
 /// Every code the series carries in canonical order, each with its color: the
@@ -479,22 +924,21 @@ fn code_fill(
         .unwrap_or(muted)
 }
 
-/// Day of the month a `YYYY-MM-DD` (or bare day) label names, `None` when
-/// the label does not parse or falls outside 1 through 31.
-fn day_number(day: &str) -> Option<u32> {
-    let number: u32 = day.rsplit('-').next()?.parse().ok()?;
-    (1..=DAY_SLOTS).contains(&number).then_some(number)
-}
-
 /// One complete chart: frame, axes, bars, closing tag.
-fn render_chart(label: &str, bars: &[DayBar], kind: ChartKind, theme: ChartTheme) -> String {
-    let max = bars.iter().map(DayBar::total).max().unwrap_or(0);
+fn render_chart(
+    label: &str,
+    bars: &[Bar],
+    kind: ChartKind,
+    axis: Axis,
+    theme: ChartTheme,
+) -> String {
+    let max = bars.iter().map(Bar::total).max().unwrap_or(0);
     let scale = if max > 0 { PLOT_H / max as f64 } else { 0.0 };
     let mut svg = String::new();
     push_open(&mut svg, label);
-    push_axes(&mut svg, &kind.max_label(max), theme);
+    push_axes(&mut svg, &kind.max_label(max), axis, theme);
     for bar in bars {
-        push_bar(&mut svg, bar, kind, scale, theme);
+        push_bar(&mut svg, bar, kind, axis, scale, theme);
     }
     push_close(&mut svg);
     svg
@@ -502,25 +946,41 @@ fn render_chart(label: &str, bars: &[DayBar], kind: ChartKind, theme: ChartTheme
 
 /// One complete requests chart: frame, axes, stacked bars, legend, closing
 /// tag. The legend goes into the free top gutter, so it takes no room from
-/// the plot and the chart keeps the height of the other two.
+/// the plot and the chart keeps the height of the other charts.
 fn render_status_code_chart(
     bars: &[StatusCodeBar],
     palette: &[(Option<i64>, &'static str)],
+    axis: Axis,
     theme: ChartTheme,
 ) -> String {
     let max = bars.iter().map(StatusCodeBar::total).max().unwrap_or(0);
     let scale = if max > 0 { PLOT_H / max as f64 } else { 0.0 };
     let mut svg = String::new();
-    push_open(&mut svg, STATUS_LABEL);
+    push_open(&mut svg, &chart_label(REQUESTS_NAME, axis));
     push_axes(
         &mut svg,
         &format!("max {} requests", compact_count(max)),
+        axis,
         theme,
     );
     for bar in bars {
-        push_status_code_bar(&mut svg, bar, palette, scale, theme);
+        push_status_code_bar(&mut svg, bar, palette, axis, scale, theme);
     }
     push_code_legend(&mut svg, palette, theme);
+    push_close(&mut svg);
+    svg
+}
+
+/// One complete latency chart: frame, axes, one bar per bucket, closing tag.
+fn render_latency_chart(bars: &[LatencyBar], axis: Axis, theme: ChartTheme) -> String {
+    let max = bars.iter().map(|bar| bar.avg_ms).fold(0.0_f64, f64::max);
+    let scale = if max > 0.0 { PLOT_H / max } else { 0.0 };
+    let mut svg = String::new();
+    push_open(&mut svg, &chart_label(LATENCY_NAME, axis));
+    push_axes(&mut svg, &format!("max {}", ms_text(max)), axis, theme);
+    for bar in bars {
+        push_latency_bar(&mut svg, bar, axis, scale, theme);
+    }
     push_close(&mut svg);
     svg
 }
@@ -559,8 +1019,8 @@ fn push_close(svg: &mut String) {
 }
 
 /// Draws the top gridline, the baseline, the largest value and the sparse
-/// day labels, in the rules and the muted color of `theme`.
-fn push_axes(svg: &mut String, max_label: &str, theme: ChartTheme) {
+/// bucket labels, in the rules and the muted color of `theme`.
+fn push_axes(svg: &mut String, max_label: &str, axis: Axis, theme: ChartTheme) {
     let palette = theme.palette();
     let right = PAD_LEFT + PLOT_W;
     let _ = write!(
@@ -577,17 +1037,18 @@ fn push_axes(svg: &mut String, max_label: &str, theme: ChartTheme) {
         PAD_TOP - 6.0,
         palette.muted,
     );
-    for day in 1..=DAY_SLOTS {
-        if !labelled(day) {
+    for slot in 0..axis.slots() {
+        if !axis.labelled(slot) {
             continue;
         }
         let _ = write!(
             svg,
             "<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"11\" \
-             fill=\"{}\">{day}</text>",
-            slot_center(day),
+             fill=\"{}\">{}</text>",
+            axis.slot_center(slot),
             BASE_Y + 18.0,
             palette.muted,
+            axis.label(slot),
         );
     }
 }
@@ -605,24 +1066,32 @@ fn push_baseline(svg: &mut String, theme: ChartTheme) {
 
 /// One bar plus its hover tooltip, positioned and normalized by `scale`.
 ///
-/// A day whose total is zero keeps its title but draws no rectangle, so the
+/// A slot whose total is zero keeps its title but draws no rectangle, so the
 /// chart never invents a height that carries no usage.
-fn push_bar(svg: &mut String, bar: &DayBar, kind: ChartKind, scale: f64, theme: ChartTheme) {
+fn push_bar(
+    svg: &mut String,
+    bar: &Bar,
+    kind: ChartKind,
+    axis: Axis,
+    scale: f64,
+    theme: ChartTheme,
+) {
     let palette = theme.palette();
     let input_h = (bar.input as f64 * scale).min(PLOT_H);
     let output_h = (bar.output as f64 * scale).min(PLOT_H - input_h);
-    let _ = write!(svg, "<g><title>{}</title>", bar_title(bar, kind));
+    let _ = write!(svg, "<g><title>{}</title>", bar_title(bar, kind, axis));
     if input_h > 0.0 {
         let fill = match kind {
             ChartKind::Stacked => palette.accent,
             ChartKind::Single => palette.cost,
         };
-        push_rect(svg, bar.day, BASE_Y - input_h, input_h, fill);
+        push_rect(svg, axis, bar.slot, BASE_Y - input_h, input_h, fill);
     }
     if kind == ChartKind::Stacked && output_h > 0.0 {
         push_rect(
             svg,
-            bar.day,
+            axis,
+            bar.slot,
             BASE_Y - input_h - output_h,
             output_h,
             palette.muted,
@@ -631,29 +1100,54 @@ fn push_bar(svg: &mut String, bar: &DayBar, kind: ChartKind, scale: f64, theme: 
     svg.push_str("</g>");
 }
 
+/// One latency bar plus its hover tooltip, positioned and normalized by
+/// `scale`. A bucket whose mean is zero keeps its title but draws no
+/// rectangle.
+fn push_latency_bar(svg: &mut String, bar: &LatencyBar, axis: Axis, scale: f64, theme: ChartTheme) {
+    let height = (bar.avg_ms * scale).min(PLOT_H);
+    let _ = write!(svg, "<g><title>{}</title>", latency_title(bar, axis));
+    if height > 0.0 {
+        push_rect(
+            svg,
+            axis,
+            bar.slot,
+            BASE_Y - height,
+            height,
+            theme.palette().accent,
+        );
+    }
+    svg.push_str("</g>");
+}
+
 /// One segment rectangle.
-fn push_rect(svg: &mut String, day: u32, y: f64, height: f64, fill: &str) {
+fn push_rect(svg: &mut String, axis: Axis, slot: u32, y: f64, height: f64, fill: &str) {
     let _ = write!(
         svg,
-        "<rect x=\"{:.2}\" y=\"{y:.2}\" width=\"{BAR_W:.2}\" height=\"{height:.2}\" \
+        "<rect x=\"{:.2}\" y=\"{y:.2}\" width=\"{:.2}\" height=\"{height:.2}\" \
          fill=\"{fill}\"/>",
-        bar_x(day),
+        axis.bar_x(slot),
+        axis.bar_w(),
     );
 }
 
 /// One requests bar plus its hover tooltip: the code segments stacked from
 /// the baseline upwards in canonical code order, each normalized by `scale`.
 ///
-/// A segment that carries no request draws no rectangle, so a day whose codes
-/// are all zero keeps its title and stays an empty slot.
+/// A segment that carries no request draws no rectangle, so a bucket whose
+/// codes are all zero keeps its title and stays an empty slot.
 fn push_status_code_bar(
     svg: &mut String,
     bar: &StatusCodeBar,
     palette: &[(Option<i64>, &'static str)],
+    axis: Axis,
     scale: f64,
     theme: ChartTheme,
 ) {
-    let _ = write!(svg, "<g><title>{}</title>", status_code_bar_title(bar));
+    let _ = write!(
+        svg,
+        "<g><title>{}</title>",
+        status_code_bar_title(bar, axis)
+    );
     let mut top = BASE_Y;
     for (code, count) in &bar.counts {
         let height = (*count as f64 * scale).min(top - PAD_TOP);
@@ -662,7 +1156,7 @@ fn push_status_code_bar(
         }
         top -= height;
         let fill = code_fill(palette, *code, theme.palette().muted);
-        push_rect(svg, bar.day, top, height, fill);
+        push_rect(svg, axis, bar.slot, top, height, fill);
     }
     svg.push_str("</g>");
 }
@@ -705,24 +1199,24 @@ fn push_code_legend(svg: &mut String, palette: &[(Option<i64>, &'static str)], t
 }
 
 /// Tooltip text of one bar.
-fn bar_title(bar: &DayBar, kind: ChartKind) -> String {
+fn bar_title(bar: &Bar, kind: ChartKind, axis: Axis) -> String {
     match kind {
         ChartKind::Stacked => format!(
-            "Day {}: {} tokens ({} in, {} out) in {} requests",
-            bar.day,
+            "{}: {} tokens ({} in, {} out) in {} requests",
+            axis.name(bar.slot),
             group_digits(bar.total()),
             group_digits(bar.input),
             group_digits(bar.output),
             group_digits(bar.requests),
         ),
-        ChartKind::Single => format!("Day {}: {}", bar.day, format_usd(bar.input)),
+        ChartKind::Single => format!("{}: {}", axis.name(bar.slot), format_usd(bar.input)),
     }
 }
 
-/// Tooltip text of one requests bar: the day's request count and how it
+/// Tooltip text of one requests bar: the bucket's request count and how it
 /// splits across the exact codes, so a hover answers which statuses the bar
 /// holds.
-fn status_code_bar_title(bar: &StatusCodeBar) -> String {
+fn status_code_bar_title(bar: &StatusCodeBar, axis: Axis) -> String {
     let mut split = String::new();
     for (index, (code, count)) in bar.counts.iter().enumerate() {
         if index > 0 {
@@ -731,26 +1225,21 @@ fn status_code_bar_title(bar: &StatusCodeBar) -> String {
         let _ = write!(split, "{} {}", group_digits(*count), code_label(*code));
     }
     format!(
-        "Day {}: {} requests ({split})",
-        bar.day,
+        "{}: {} requests ({split})",
+        axis.name(bar.slot),
         group_digits(bar.total())
     )
 }
 
-/// Left edge of a day's bar.
-fn bar_x(day: u32) -> f64 {
-    PAD_LEFT + (day.saturating_sub(1)) as f64 * SLOT_W + (SLOT_W - BAR_W) / 2.0
-}
-
-/// Horizontal center of a day's slot, where its axis label sits.
-fn slot_center(day: u32) -> f64 {
-    PAD_LEFT + (day.saturating_sub(1)) as f64 * SLOT_W + SLOT_W / 2.0
-}
-
-/// Whether a day carries an axis label; every fifth day keeps the row of
-/// labels readable without crowding the bars.
-fn labelled(day: u32) -> bool {
-    day == 1 || day.is_multiple_of(5)
+/// Tooltip text of one latency bar: the bucket's mean duration and the timed
+/// requests it covers.
+fn latency_title(bar: &LatencyBar, axis: Axis) -> String {
+    format!(
+        "{}: {} ({} requests)",
+        axis.name(bar.slot),
+        ms_text(bar.avg_ms),
+        group_digits(bar.requests),
+    )
 }
 
 /// Decimal digits with a comma every three and a leading minus when
@@ -820,6 +1309,12 @@ fn format_usd(micro_usd: i64) -> String {
         fraction.pop();
     }
     format!("${whole}.{fraction}")
+}
+
+/// Milliseconds for a latency tooltip and its axis label: one decimal, which
+/// keeps the fractional mean of a small bucket readable.
+fn ms_text(value: f64) -> String {
+    format!("{value:.1} ms")
 }
 
 #[cfg(test)]
@@ -1394,6 +1889,365 @@ mod tests {
                 ChartTheme::Light,
                 "{value} names no dark theme"
             );
+        }
+    }
+
+    /// A UTC day of the calendar.
+    fn day(year: i32, month: u8, day: u8) -> Date {
+        Date::from_calendar_date(year, time::Month::try_from(month).expect("a month"), day)
+            .expect("a day of the calendar")
+    }
+
+    /// One hourly usage row as the SQL aggregate hands it over.
+    fn hour_row(hour: &str, prompt: i64, completion: i64, requests: i64) -> HourUsage {
+        HourUsage {
+            hour: hour.to_owned(),
+            key_id: 1,
+            model: None,
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_input_tokens: 0,
+            cached_output_tokens: 0,
+            cache_write_input_tokens: 0,
+            requests,
+        }
+    }
+
+    /// One hourly per-code row as the SQL aggregate hands it over.
+    fn hour_code_row(hour: &str, status: Option<i64>, requests: i64) -> HourStatusCodeUsage {
+        HourStatusCodeUsage {
+            hour: hour.to_owned(),
+            status,
+            status_class: StatusBucket::Other,
+            requests,
+        }
+    }
+
+    /// One hourly latency row as the SQL aggregate hands it over.
+    fn latency_row(hour: &str, avg_ms: f64, requests: i64) -> HourLatency {
+        HourLatency {
+            hour: hour.to_owned(),
+            avg_duration_ms: avg_ms,
+            requests,
+        }
+    }
+
+    #[test]
+    fn a_one_and_a_two_day_range_are_hourly_and_longer_ones_daily() {
+        let start = day(2026, 11, 16);
+        assert_eq!(
+            Granularity::from_range(start, start),
+            Granularity::Hourly,
+            "a single day is drawn hour by hour"
+        );
+        assert_eq!(
+            Granularity::from_range(start, day(2026, 11, 17)),
+            Granularity::Hourly,
+            "two days are the widest hourly range"
+        );
+        assert_eq!(
+            Granularity::from_range(start, day(2026, 11, 18)),
+            Granularity::Daily,
+            "the third day leaves the hourly range"
+        );
+        assert_eq!(
+            Granularity::from_range(start, day(2026, 12, 16)),
+            Granularity::Daily
+        );
+        assert_eq!(
+            Granularity::from_range(day(2026, 11, 30), day(2026, 12, 1)),
+            Granularity::Hourly,
+            "two days across a month boundary stay hourly"
+        );
+        assert_eq!(
+            Granularity::from_range(day(2026, 12, 1), day(2026, 11, 30)),
+            Granularity::Daily,
+            "a range that names no day falls back to the daily axis"
+        );
+    }
+
+    #[test]
+    fn a_one_day_range_labels_every_third_hour_by_the_clock() {
+        let rows = [hour_row("2026-11-08 14", 100, 50, 2)];
+        let svg = hourly_token_bars(&rows, day(2026, 11, 8), day(2026, 11, 8), ChartTheme::Light);
+        assert_eq!(count(&svg, "text-anchor=\"middle\""), 8, "{svg}");
+        assert!(svg.contains(">15:00</text>"), "{svg}");
+        assert!(
+            !svg.contains(">14:00</text>"),
+            "an unlabelled hour stays bare: {svg}"
+        );
+        assert!(
+            !svg.contains("Nov"),
+            "a single day needs no day label: {svg}"
+        );
+        assert!(svg.contains("aria-label=\"Tokens per hour\""), "{svg}");
+        assert!(
+            svg.contains("<title>14:00: 150 tokens (100 in, 50 out) in 2 requests</title>"),
+            "{svg}"
+        );
+        assert_eq!(count(&svg, "<rect"), 2);
+    }
+
+    #[test]
+    fn a_two_day_range_labels_every_sixth_hour_with_its_day() {
+        let rows = [
+            hour_row("2026-11-16 14", 10, 0, 1),
+            hour_row("2026-11-17 06", 20, 0, 1),
+        ];
+        let svg = hourly_token_bars(
+            &rows,
+            day(2026, 11, 16),
+            day(2026, 11, 17),
+            ChartTheme::Light,
+        );
+        assert_eq!(count(&svg, "text-anchor=\"middle\""), 8, "{svg}");
+        for label in ["Nov 16 12:00", "Nov 17 06:00"] {
+            assert!(
+                svg.contains(&format!(">{label}</text>")),
+                "{label} is missing from the axis: {svg}"
+            );
+        }
+        // The bucket that carries no label of its own still names itself in
+        // the tooltip, day included, because `14:00` alone is ambiguous.
+        assert!(
+            svg.contains("<title>Nov 16 14:00: 10 tokens (10 in, 0 out) in 1 requests</title>"),
+            "{svg}"
+        );
+        assert!(svg.contains(">max 20 tokens</text>"), "{svg}");
+    }
+
+    #[test]
+    fn an_hourly_bucket_outside_the_range_draws_nothing() {
+        let rows = [
+            hour_row("2026-11-16 23", 10, 0, 1),
+            hour_row("2026-11-18 00", 999, 0, 1),
+        ];
+        let svg = hourly_token_bars(
+            &rows,
+            day(2026, 11, 16),
+            day(2026, 11, 17),
+            ChartTheme::Light,
+        );
+        assert!(svg.contains("<title>Nov 16 23:00:"), "{svg}");
+        assert!(
+            !svg.contains("999"),
+            "the day after the range stays out: {svg}"
+        );
+        assert!(svg.contains(">max 10 tokens</text>"), "{svg}");
+    }
+
+    #[test]
+    fn an_hourly_series_skips_labels_the_axis_cannot_read() {
+        let rows = [
+            hour_row("bogus", 10, 0, 1),
+            hour_row("2026-11-08", 10, 0, 1),
+            hour_row("2026-11-08 25", 10, 0, 1),
+            hour_row("2026-02-30 10", 10, 0, 1),
+        ];
+        let svg = hourly_token_bars(&rows, day(2026, 11, 8), day(2026, 11, 8), ChartTheme::Light);
+        assert!(svg.contains(EMPTY_NOTE), "{svg}");
+        assert_eq!(count(&svg, "<rect"), 0, "{svg}");
+    }
+
+    #[test]
+    fn hourly_cost_bars_price_one_bar_per_hour() {
+        let costs = [
+            ("2026-11-08 10".to_owned(), 60_000),
+            ("2026-11-08 10".to_owned(), 60_000),
+            ("2026-11-08 12".to_owned(), 500_000),
+        ];
+        let svg = hourly_cost_bars(
+            &costs,
+            day(2026, 11, 8),
+            day(2026, 11, 8),
+            ChartTheme::Light,
+        );
+        assert_eq!(
+            count(&svg, "<rect"),
+            2,
+            "the two rows of ten o'clock share a bar: {svg}"
+        );
+        assert_eq!(rects(&svg, COST_FILL), 2);
+        assert!(svg.contains("<title>10:00: $0.12</title>"), "{svg}");
+        assert!(svg.contains(">max $0.50</text>"), "{svg}");
+    }
+
+    #[test]
+    fn hourly_status_code_bars_stack_the_codes_of_an_hour() {
+        let rows = [
+            hour_code_row("2026-11-16 14", Some(200), 2),
+            hour_code_row("2026-11-16 14", Some(500), 1),
+        ];
+        let svg = hourly_status_code_bars(
+            &rows,
+            day(2026, 11, 16),
+            day(2026, 11, 16),
+            ChartTheme::Light,
+        );
+        let (bars, legend) = bars_only(&svg);
+        assert_eq!(count(bars, "<rect"), 2, "{bars}");
+        assert!(
+            svg.contains("<title>14:00: 3 requests (2 200, 1 500)</title>"),
+            "{svg}"
+        );
+        assert!(svg.contains(">max 3 requests</text>"), "{svg}");
+        for label in ["200", "500"] {
+            assert!(
+                legend.contains(&format!(">{label}</text>")),
+                "{label} is missing from the legend: {legend}"
+            );
+        }
+    }
+
+    #[test]
+    fn latency_bars_plot_the_mean_of_every_hour_of_a_day() {
+        let rows = [
+            latency_row("2026-11-08 10", 20.0, 2),
+            latency_row("2026-11-08 14", 40.0, 1),
+        ];
+        let svg = latency_bars(&rows, day(2026, 11, 8), day(2026, 11, 8), ChartTheme::Light);
+        assert!(svg.contains("aria-label=\"Latency per hour\""), "{svg}");
+        assert_eq!(count(&svg, "<rect"), 2, "{svg}");
+        assert_eq!(rects(&svg, ACCENT_FILL), 2);
+        assert!(
+            svg.contains("<title>10:00: 20.0 ms (2 requests)</title>"),
+            "{svg}"
+        );
+        assert!(
+            svg.contains("<title>14:00: 40.0 ms (1 requests)</title>"),
+            "{svg}"
+        );
+        assert!(svg.contains(">max 40.0 ms</text>"), "{svg}");
+        assert!(
+            svg.contains("y=\"20.00\""),
+            "the tallest mean fills the plot: {svg}"
+        );
+    }
+
+    #[test]
+    fn a_daily_latency_range_folds_the_hours_of_a_day_weighted() {
+        let rows = [
+            latency_row("2026-11-08 10", 10.0, 1),
+            latency_row("2026-11-08 11", 30.0, 3),
+            latency_row("2026-11-09 09", 50.0, 2),
+        ];
+        let svg = latency_bars(
+            &rows,
+            day(2026, 11, 1),
+            day(2026, 11, 10),
+            ChartTheme::Light,
+        );
+        assert!(svg.contains("aria-label=\"Latency per day\""), "{svg}");
+        assert_eq!(count(&svg, "<rect"), 2, "{svg}");
+        assert!(
+            svg.contains("<title>Day 8: 25.0 ms (4 requests)</title>"),
+            "the hours fold into the mean of their timed requests: {svg}"
+        );
+        assert!(
+            svg.contains("<title>Day 9: 50.0 ms (2 requests)</title>"),
+            "{svg}"
+        );
+        assert!(svg.contains(">max 50.0 ms</text>"), "{svg}");
+    }
+
+    #[test]
+    fn an_empty_hourly_series_renders_a_placeholder_chart() {
+        let (from, to) = (day(2026, 11, 8), day(2026, 11, 9));
+        let charts = [
+            hourly_token_bars(&[], from, to, ChartTheme::Light),
+            hourly_cost_bars(&[], from, to, ChartTheme::Light),
+            hourly_status_code_bars(&[], from, to, ChartTheme::Light),
+            latency_bars(&[], from, to, ChartTheme::Light),
+        ];
+        for svg in charts {
+            assert!(svg.starts_with("<svg "), "{svg}");
+            assert!(svg.ends_with("</svg>"), "{svg}");
+            assert!(svg.contains(EMPTY_NOTE), "{svg}");
+            assert_eq!(count(&svg, "<rect"), 0, "{svg}");
+        }
+    }
+
+    #[test]
+    fn the_dark_theme_paints_the_hourly_and_latency_charts_dark() {
+        let rows = [hour_row("2026-11-08 14", 100, 50, 1)];
+        let svg = hourly_token_bars(&rows, day(2026, 11, 8), day(2026, 11, 8), ChartTheme::Dark);
+        assert_eq!(rects(&svg, DARK_ACCENT_FILL), 1, "{svg}");
+        assert_eq!(rects(&svg, DARK_MUTED_FILL), 1, "{svg}");
+        assert_eq!(
+            rects(&svg, ACCENT_FILL),
+            0,
+            "no light color in a dark chart"
+        );
+        assert_eq!(
+            count(&svg, &format!("stroke=\"{DARK_BORDER_STROKE}\"")),
+            2,
+            "both axis rules follow the theme: {svg}"
+        );
+
+        let rows = [latency_row("2026-11-08 14", 12.5, 1)];
+        let svg = latency_bars(&rows, day(2026, 11, 8), day(2026, 11, 8), ChartTheme::Dark);
+        assert_eq!(rects(&svg, DARK_ACCENT_FILL), 1, "{svg}");
+        assert_eq!(rects(&svg, ACCENT_FILL), 0, "{svg}");
+    }
+
+    /// The x coordinates and the texts of the middle-anchored axis labels of
+    /// a chart, in the order they appear.
+    fn axis_labels(svg: &str) -> Vec<(f64, String)> {
+        svg.split("<text ")
+            .skip(1)
+            .filter_map(|element| {
+                let (attributes, rest) = element.split_once('>')?;
+                if !attributes.contains("text-anchor=\"middle\"") {
+                    return None;
+                }
+                let x: f64 = attributes
+                    .split("x=\"")
+                    .nth(1)?
+                    .split('"')
+                    .next()?
+                    .parse()
+                    .ok()?;
+                Some((x, rest.split('<').next()?.to_owned()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_axis_labels_of_an_hourly_chart_fit_the_plot_without_colliding() {
+        // The widest hourly axis is the 48 slot one of a two day range, and
+        // it carries the longest labels; the one day axis is checked with it,
+        // so neither can drift into a collision unnoticed.
+        for (from, to, bucket) in [
+            (day(2026, 11, 8), day(2026, 11, 8), "2026-11-08 14"),
+            (day(2026, 11, 16), day(2026, 11, 17), "2026-11-16 14"),
+        ] {
+            let rows = [hour_row(bucket, 1, 0, 1)];
+            let svg = hourly_token_bars(&rows, from, to, ChartTheme::Light);
+            let labels = axis_labels(&svg);
+            assert_eq!(labels.len(), 8, "{svg}");
+            for (x, label) in &labels {
+                assert!(
+                    (PAD_LEFT..=PAD_LEFT + PLOT_W).contains(x),
+                    "{label} at {x} leaves the plot: {svg}"
+                );
+            }
+            // The labels are laid out with an estimated character width, the
+            // same one the legend uses, so two neighbours that share it must
+            // not overlap.
+            let widths: Vec<f64> = labels
+                .iter()
+                .map(|(_, label)| label.chars().count() as f64 * 6.0)
+                .collect();
+            for (index, pair) in labels.windows(2).enumerate() {
+                let gap = pair[1].0 - pair[0].0;
+                let needed = (widths[index] + widths[index + 1]) / 2.0;
+                assert!(
+                    gap >= needed,
+                    "{:?} and {:?} are {gap:.2} apart, {needed:.2} needed: {svg}",
+                    pair[0].1,
+                    pair[1].1
+                );
+            }
         }
     }
 }
