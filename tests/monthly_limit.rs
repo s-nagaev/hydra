@@ -267,6 +267,7 @@ async fn wait_for_row(
         status_class: None,
         from: None,
         to: None,
+        search: None,
         page: 1,
         page_size: 50,
     };

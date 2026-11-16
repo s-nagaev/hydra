@@ -531,6 +531,69 @@ async fn custom_range_filters_rows_and_echoes_the_inputs() {
 }
 
 #[tokio::test]
+async fn search_narrows_the_rows_and_keeps_the_needle_in_the_input() {
+    let db = test_pool().await;
+    let (channel_id, key_id, _) = seed_channel_and_key(&db).await;
+    insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("model-hit"),
+        Some(200),
+        None,
+        None,
+        Some(r#"{"order":"order-42","marker":"sekrit-body-marker"}"#),
+        None,
+        None,
+        "2026-11-07 10:00:00",
+    )
+    .await;
+    insert_log(
+        &db,
+        key_id,
+        channel_id,
+        Some("model-miss"),
+        Some(200),
+        None,
+        None,
+        Some(r#"{"order":"order-99"}"#),
+        None,
+        None,
+        "2026-11-07 11:00:00",
+    )
+    .await;
+
+    let (status, body) = get_page(&db, "/admin/ui/logs?q=order-42").await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = table_body(&body);
+    assert!(
+        rows.contains("model-hit"),
+        "the row whose request body holds the needle must be listed"
+    );
+    assert!(
+        !rows.contains("model-miss"),
+        "the row without the needle must be filtered out"
+    );
+    assert!(
+        !body.contains("sekrit-body-marker"),
+        "the matched body content itself never reaches the page"
+    );
+    assert_eq!(
+        input_value(&body, "log-q"),
+        "order-42",
+        "the input keeps the submitted needle"
+    );
+    assert!(
+        body.contains("q=order-42"),
+        "the needle rides along in the refresh and row links"
+    );
+    assert!(
+        body.contains("of 1"),
+        "the meta line counts the matching rows"
+    );
+}
+
+#[tokio::test]
 async fn unknown_preset_is_ignored_and_renders_everything() {
     let db = test_pool().await;
     let (channel_id, key_id, _) = seed_channel_and_key(&db).await;

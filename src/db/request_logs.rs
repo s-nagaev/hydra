@@ -207,7 +207,8 @@ const STATUS_BUCKET_SQL: &str = "CASE WHEN status BETWEEN 200 AND 299 THEN '2xx'
 /// Filters for the admin listing; every field is optional. `from` and `to`
 /// are inclusive bounds already normalized to the `YYYY-MM-DD HH:MM:SS` UTC
 /// text format the `created_at` column stores, so string comparison against
-/// the column is correct and can use the time-ordered index.
+/// the column is correct and can use the time-ordered index. `search` is a
+/// free-text needle matched against the stored bodies and the error text.
 pub struct LogFilters {
     pub key_id: Option<i64>,
     pub channel_id: Option<i64>,
@@ -215,8 +216,60 @@ pub struct LogFilters {
     pub status_class: Option<StatusClass>,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub search: Option<String>,
     pub page: u64,
     pub page_size: u64,
+}
+
+/// The escape character of the search `LIKE` predicate, so a `%` or a `_` in
+/// the needle matches itself instead of acting as a wildcard.
+const LIKE_ESCAPE: char = '\\';
+
+/// The text columns the search needle is matched against: the two captured
+/// bodies and the recorded failure. A row matches when any of them holds the
+/// needle.
+const SEARCH_COLUMNS: [&str; 3] = ["request_body", "response_body", "error"];
+
+/// The `LIKE` pattern of the search: the needle lowercased and wrapped in
+/// `%`, with the LIKE metacharacters (`%`, `_`) and the escape character
+/// itself backslash-escaped so the user's text is matched literally.
+///
+/// The pattern is a bind value, never SQL text, and the predicate compares
+/// `LOWER(column)` against it on both backends, so a needle finds the same
+/// rows on SQLite and on PostgreSQL. Full-text indexing is deliberately
+/// avoided: a tokenizer would miss the substrings users actually search for
+/// (an order id inside a JSON body) and would force a different query per
+/// backend.
+fn like_pattern(needle: &str) -> String {
+    let mut pattern = String::with_capacity(needle.len() + 2);
+    pattern.push('%');
+    for ch in needle.to_lowercase().chars() {
+        if matches!(ch, '%' | '_') || ch == LIKE_ESCAPE {
+            pattern.push(LIKE_ESCAPE);
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// Adds one `LIKE <needle> ESCAPE '\'` probe per searched column, `OR`-ed
+/// together: a row matches when any of the three holds the needle, and a
+/// NULL column matches nothing.
+fn push_search(sql: &mut Sql, needle: &str) {
+    let pattern = like_pattern(needle);
+    sql.push(" AND (");
+    for (index, column) in SEARCH_COLUMNS.iter().enumerate() {
+        if index > 0 {
+            sql.push(" OR ");
+        }
+        sql.push("LOWER(COALESCE(")
+            .push(column)
+            .push(", '')) LIKE ")
+            .bind(Arg::Text(Some(pattern.clone())))
+            .push(" ESCAPE '\\'");
+    }
+    sql.push(")");
 }
 
 /// Adds the filter conditions to a SQL body. Values always travel as bind
@@ -262,6 +315,9 @@ fn push_conditions(sql: &mut Sql, filters: &LogFilters) {
     if let Some(to) = &filters.to {
         sql.push(" AND created_at <= ")
             .bind(Arg::Text(Some(to.clone())));
+    }
+    if let Some(needle) = &filters.search {
+        push_search(sql, needle);
     }
 }
 
@@ -3380,5 +3436,266 @@ mod tests {
         .await
         .unwrap()
         .is_empty());
+    }
+
+    /// The same row with the captured bodies and the recorded error, for the
+    /// free-text search tests.
+    fn row_with_bodies(
+        model: &str,
+        request_body: Option<&str>,
+        response_body: Option<&str>,
+        error: Option<&str>,
+    ) -> NewRequestLog {
+        NewRequestLog {
+            request_body: request_body.map(str::to_string),
+            response_body: response_body.map(str::to_string),
+            error: error.map(str::to_string),
+            ..row(Some(model), Some(1), Some(1), None, None)
+        }
+    }
+
+    /// The listing filters with one free-text needle and nothing else.
+    fn search_filters(needle: Option<&str>) -> LogFilters {
+        LogFilters {
+            key_id: None,
+            channel_id: None,
+            model: None,
+            status_class: None,
+            from: None,
+            to: None,
+            search: needle.map(str::to_string),
+            page: 1,
+            page_size: 50,
+        }
+    }
+
+    /// The models of the rows the search returns, sorted, so an assertion
+    /// names the matching rows without depending on the listing order. The
+    /// page and the total the query returns must agree.
+    async fn searched_models(db: &Db, needle: &str) -> Vec<String> {
+        let (rows, total) = list(db, &search_filters(Some(needle))).await.unwrap();
+        assert_eq!(
+            total as usize,
+            rows.len(),
+            "the count and the page must select the same rows"
+        );
+        let mut models: Vec<String> = rows
+            .iter()
+            .map(|log| log.model.clone().unwrap_or_default())
+            .collect();
+        models.sort();
+        models
+    }
+
+    #[tokio::test]
+    async fn search_matches_a_needle_in_any_of_the_three_text_columns() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-columns").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("in-request", Some("order-42 confirmed"), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("in-response", None, Some(r#"{"id":"order-42"}"#), None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("in-error", None, None, Some("upstream refused order-42")),
+            "2026-11-08 12:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("elsewhere", Some("nothing of the sort"), None, None),
+            "2026-11-08 13:00:00",
+        )
+        .await;
+
+        assert_eq!(
+            searched_models(&db, "order-42").await,
+            vec![
+                "in-error".to_string(),
+                "in-request".to_string(),
+                "in-response".to_string()
+            ],
+            "a row matches when any of the three text columns holds the needle"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_is_case_insensitive() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-case").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("alpha", Some("Order-42 confirmed"), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+
+        for needle in ["order-42", "ORDER-42", "oRdEr-42"] {
+            assert_eq!(
+                searched_models(&db, needle).await,
+                vec!["alpha".to_string()],
+                "the needle {needle} must find the stored text"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_returns_nothing_when_no_row_holds_the_needle() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-absent").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("alpha", Some("order-42"), Some("done"), Some("none")),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+
+        assert!(searched_models(&db, "order-99").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_matches_percent_and_underscore_literally() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-wildcards").await;
+        for (model, body, at) in [
+            ("hundred-percent", "100% done", "10:00:00"),
+            ("hundred-other", "100x done", "11:00:00"),
+            ("underscore", "a_b", "12:00:00"),
+            ("any-char", "axb", "13:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_bodies(model, Some(body), None, None),
+                &format!("2026-11-08 {at}"),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            searched_models(&db, "100%").await,
+            vec!["hundred-percent".to_string()],
+            "a % in the needle matches a literal percent sign"
+        );
+        assert_eq!(
+            searched_models(&db, "%").await,
+            vec!["hundred-percent".to_string()],
+            "a lone % is a literal percent sign, not a wildcard over every row"
+        );
+        assert_eq!(
+            searched_models(&db, "a_b").await,
+            vec!["underscore".to_string()],
+            "a _ in the needle matches a literal underscore, not any character"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_ignores_rows_whose_text_columns_are_null() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-nulls").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("all-null", None, None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("matching", Some("needle-here"), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+
+        assert_eq!(
+            searched_models(&db, "needle-here").await,
+            vec!["matching".to_string()],
+            "a row whose text columns are all NULL matches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_without_a_needle_returns_every_row() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-absent-filter").await;
+        for (model, at) in [
+            ("alpha", "2026-11-08 10:00:00"),
+            ("beta", "2026-11-08 11:00:00"),
+            ("gamma", "2026-11-08 12:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_bodies(model, Some("body"), None, None),
+                at,
+            )
+            .await;
+        }
+
+        let (rows, total) = list(&db, &search_filters(None)).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 3, "an absent needle filters nothing");
+    }
+
+    #[tokio::test]
+    async fn search_combines_with_the_other_filters() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "search-and-first").await;
+        let (second_key, second_channel) = seed(&db, "search-and-second").await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row_with_bodies("first-match", Some("needle"), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row_with_bodies("first-other", Some("nothing"), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+        put(
+            &db,
+            second_key,
+            second_channel,
+            row_with_bodies("second-match", Some("needle"), None, None),
+            "2026-11-08 12:00:00",
+        )
+        .await;
+
+        let mut filters = search_filters(Some("needle"));
+        filters.key_id = Some(first_key);
+        let (rows, total) = list(&db, &filters).await.unwrap();
+        assert_eq!(total, 1, "the key filter still applies: {rows:?}");
+        assert_eq!(rows[0].model.as_deref(), Some("first-match"));
     }
 }

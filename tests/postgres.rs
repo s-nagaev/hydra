@@ -602,6 +602,7 @@ async fn pg_proxy_call_logs_and_lists() {
         status_class: None,
         from: None,
         to: None,
+        search: None,
         page: 1,
         page_size: 10,
     };
@@ -671,6 +672,7 @@ async fn pg_rejection_row_with_null_ids_round_trips() {
         status_class: Some(StatusClass::Client4xx),
         from: None,
         to: None,
+        search: None,
         page: 1,
         page_size: 10,
     };
@@ -685,6 +687,96 @@ async fn pg_rejection_row_with_null_ids_round_trips() {
     assert_eq!(row.channel_id, None);
     assert_eq!(row.client_ip.as_deref(), Some("203.0.113.7"));
     assert_eq!(row.request_body.as_deref(), Some(r#"{"model":"gpt-4o"}"#));
+}
+
+/// The free-text search over the real PostgreSQL schema: `LOWER` over the
+/// nullable text columns and the `LIKE <pattern> ESCAPE '\'` predicate must
+/// parse and select exactly as the SQLite unit tests pin them, so a needle
+/// finds the same rows on both backends. The needle carries a per-process
+/// marker so rows other tests inserted cannot satisfy the assertion.
+#[tokio::test]
+async fn pg_search_matches_the_text_columns_case_insensitively() {
+    let Some(db) = pg_db().await else {
+        skip_note();
+        return;
+    };
+    let marker = suffix("needle");
+    let needle = format!("invol-{marker}");
+    for (request_body, response_body, error) in [
+        (Some(format!("order {needle} confirmed")), None, None),
+        (None, Some(format!("{{\"id\":\"{needle}\"}}")), None),
+        (None, None, Some(format!("upstream refused {needle}"))),
+        (Some("nothing of the sort".to_string()), None, None),
+    ] {
+        request_logs::insert(
+            &db,
+            &request_logs::NewRequestLog {
+                api_key_id: None,
+                channel_id: None,
+                model: None,
+                status: Some(200),
+                prompt_tokens: None,
+                completion_tokens: None,
+                cached_input_tokens: None,
+                cached_output_tokens: None,
+                cache_write_input_tokens: None,
+                duration_ms: 1,
+                request_body,
+                response_body,
+                error,
+                client_ip: None,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let mut filters = LogFilters {
+        key_id: None,
+        channel_id: None,
+        model: None,
+        status_class: None,
+        from: None,
+        to: None,
+        search: Some(needle.to_uppercase()),
+        page: 1,
+        page_size: 50,
+    };
+    let (rows, total) = request_logs::list(&db, &filters).await.unwrap();
+    assert_eq!(total, 3, "one row per searched column: {rows:?}");
+
+    // A % and a _ in the needle are matched literally, not as wildcards:
+    // the needle would otherwise select every row above, whose text carries
+    // the marker.
+    filters.search = Some(format!("%{marker}_"));
+    let (rows, total) = request_logs::list(&db, &filters).await.unwrap();
+    assert_eq!(total, 0, "no row holds the literal pattern: {rows:?}");
+
+    let literal = format!("100%{marker}_done");
+    request_logs::insert(
+        &db,
+        &request_logs::NewRequestLog {
+            api_key_id: None,
+            channel_id: None,
+            model: None,
+            status: Some(200),
+            prompt_tokens: None,
+            completion_tokens: None,
+            cached_input_tokens: None,
+            cached_output_tokens: None,
+            cache_write_input_tokens: None,
+            duration_ms: 1,
+            request_body: Some(literal.clone()),
+            response_body: None,
+            error: None,
+            client_ip: None,
+        },
+    )
+    .await
+    .unwrap();
+    let (rows, total) = request_logs::list(&db, &filters).await.unwrap();
+    assert_eq!(total, 1, "the literal characters must match: {rows:?}");
+    assert_eq!(rows[0].request_body.as_deref(), Some(literal.as_str()));
 }
 
 /// The month-to-date aggregate over the real PostgreSQL schema: the range
@@ -894,6 +986,7 @@ async fn pg_monthly_limit_gate_rejects_an_over_budget_key() {
         status_class: None,
         from: None,
         to: None,
+        search: None,
         page: 1,
         page_size: 10,
     };
