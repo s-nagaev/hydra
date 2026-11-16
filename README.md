@@ -313,8 +313,10 @@ the key again; losing it means issuing a new one.
 The logs page lists every proxied request with server-side pagination
 (prev/next, page numbers, page size) and filters for key, channel, model,
 status class (2xx/4xx/5xx/errors) and time period (presets or a custom
-range); the whole view state lives in the URL, so any filtered view can be
-reloaded, shared or revisited with the browser back button. Rows show
+range), plus a Search box that matches text inside the captured request and
+response bodies and the recorded error, case-insensitively; the whole view
+state lives in the URL, so any filtered view can be reloaded, shared or
+revisited with the browser back button. Rows show
 colored status badges and a small "bodies" marker when request or response
 bodies were captured; body content itself is never rendered. Each row
 links to a drill-down page (`/admin/ui/logs/{id}`) with the full record:

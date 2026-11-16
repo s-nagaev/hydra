@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Hourly charts on the stats pages: a range of one or two days, the Today shortcut included, plots one bar per hour of usage, cost and requests, labelled with the clock hour, while a longer range keeps one bar per day. The chart headings name the bucket they span.
+- A mean response time chart on the Requests page: one bar per hour of a short range and one per day of a longer one, showing the average duration of the requests the current filters select.
+- Text search on the logs page: a Search box narrows the listing to the requests whose captured request or response body, or whose recorded error, contains the typed text, case-insensitively and with `%` and `_` matched as ordinary characters. It combines with the existing filters and pagination, and the needle rides in the URL like the rest of the view state, so a searched view stays shareable.
+
 ## 1.2.0 (2026-11-15)
 
 ### Added

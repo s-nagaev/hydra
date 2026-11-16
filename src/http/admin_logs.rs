@@ -200,6 +200,10 @@ pub(crate) fn build_filters(query: RawLogQuery) -> Result<LogFilters, LogsError>
         status_class,
         from,
         to,
+        // The free-text needle belongs to the admin UI logs page alone; the
+        // JSON listing filters by key, channel, model, class and window, so
+        // it never sets one.
+        search: None,
         page: query.page.unwrap_or(1).max(1),
         page_size: query
             .page_size

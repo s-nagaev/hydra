@@ -3,14 +3,21 @@
 //! the request counts of the same range per day and per response status
 //! code.
 //!
-//! Every figure either page shows comes out of the same day-level aggregates,
-//! [`crate::db::request_logs::day_usage`] for the tokens and the cost and
+//! Every figure either page shows comes out of the same aggregates of the
+//! range: the day-level ones, [`crate::db::request_logs::day_usage`] for the
+//! tokens and the cost and
 //! [`crate::db::request_logs::day_status_code_usage`] with
-//! [`crate::db::request_logs::status_code_totals`] for the requests, and out
-//! of the same pinned cost formula the monthly-limit enforcement uses
+//! [`crate::db::request_logs::status_code_totals`] for the requests, or,
+//! when the range covers one or two days, their hourly twins
+//! ([`crate::db::request_logs::hour_usage`],
+//! [`crate::db::request_logs::hour_status_code_usage`] and
+//! [`crate::db::request_logs::hour_latency`]), which show the shape of such a
+//! day bucket by bucket instead of one bar per day. Both granularities carry
+//! the same dimensions and the same filters, and the cost of a bucket comes
+//! out of the same pinned cost formula the monthly-limit enforcement uses
 //! ([`crate::usage::group_cost`]), so a table, a chart and the status code
-//! table can never disagree about the same request: the table folds the day
-//! rows per key and model, the charts plot the rows themselves. No second
+//! table can never disagree about the same request: the table folds the rows
+//! per key and model, the charts plot the rows themselves. No second
 //! aggregate query and no second pricing path exists, so a range that runs
 //! over a whole calendar month prices what the gate prices for that month.
 //! Each page runs the queries its own content needs: the Tokens page never
@@ -57,20 +64,23 @@
 //! so the control always offers every model of the range.
 //!
 //! The Tokens page holds the usage table and, under it, two charts of the
-//! same filtered range, tokens per day and cost per day, drawn server-side by
+//! same filtered range, tokens and cost per bucket, drawn server-side by
 //! [`crate::http::stats_chart`] as plain SVG and injected with askama's
-//! `|safe` filter. The cost of a day is the sum of [`crate::usage::group_cost`]
-//! over that day's groups, priced from the key's channel exactly like the
-//! table, so the bars and the table add up to the same money. A view with no
-//! day rows renders no chart at all and keeps the table's empty state
-//! instead.
+//! `|safe` filter. The cost of a bucket is the sum of
+//! [`crate::usage::group_cost`] over that bucket's groups, priced from the
+//! key's channel exactly like the table, so the bars and the table add up to
+//! the same money. A view with no usage rows renders no chart at all and
+//! keeps the table's empty state instead.
 //!
 //! The Requests page holds the requests chart, stacking one segment per
-//! exact response status code of the range, and under it the status code
-//! table: one line per exact code of the range with its class, its request
-//! count and its share of the requests the filters select, the busiest code
-//! first. Both are left out when the filters select no request, and the page
-//! then shows its own empty state instead.
+//! exact response status code of the range, under it the latency chart, one
+//! bar per bucket of the mean duration of the requests the filters select,
+//! and then the status code table: one line per exact code of the range with
+//! its class, its request count and its share of the requests the filters
+//! select, the busiest code first. Each panel is left out when its own query
+//! returns no row, and the page then falls back to its empty state; the
+//! latency aggregate is the one that keeps the requests that never reached an
+//! upstream, so a range of plain rejections still has a mean to show.
 //!
 //! There is no mutating route here, so the CSRF guard has nothing to reject;
 //! the module is merged into the `/admin/ui` nest like the other read-only
@@ -91,11 +101,12 @@ use time::{Date, Duration, OffsetDateTime};
 use crate::db::channels::{self, PricedChannel};
 use crate::db::keys::{self, ApiKey};
 use crate::db::request_logs::{
-    self, DayStatusCodeUsage, DayUsage, ModelUsage, StatusBucket, StatusCodeTotal,
+    self, DayStatusCodeUsage, DayUsage, HourLatency, HourStatusCodeUsage, HourUsage, ModelUsage,
+    StatusBucket, StatusCodeTotal,
 };
 use crate::db::Db;
 use crate::http::admin_ui_logs::{thousands, SelectOption};
-use crate::http::stats_chart;
+use crate::http::stats_chart::{self, Granularity};
 use crate::http::ui_auth::UiAuth;
 use crate::http::AppState;
 use crate::limits;
@@ -385,6 +396,9 @@ pub struct TokensPage {
     pub key_options: Vec<SelectOption>,
     /// The Model select: `All models` plus every model logged in the range.
     pub model_options: Vec<SelectOption>,
+    /// The bucket the charts and the headings of this view span, resolved
+    /// from the range: a one or two day range plots hours, a longer one days.
+    pub(crate) granularity: Granularity,
     /// Absent when the filtered range has nothing to plot.
     pub charts: Option<TokenCharts>,
     pub empty_message: String,
@@ -418,9 +432,17 @@ pub struct RequestsPage {
     /// the filters select no request, which is when the template leaves the
     /// whole panel out.
     pub status_codes: Vec<StatusCodeRow>,
-    /// Requests per day, one segment per exact status code. Absent when the
-    /// filters select no request, because an empty plot says less than none.
+    /// The bucket the charts and the headings of this view span, resolved
+    /// from the range: a one or two day range plots hours, a longer one days.
+    pub(crate) granularity: Granularity,
+    /// Requests per bucket, one segment per exact status code. Absent when
+    /// the filters select no request, because an empty plot says less than
+    /// none.
     pub status_svg: Option<String>,
+    /// The mean request duration per bucket, the latency chart of the range.
+    /// Absent when no request of the view was timed, which is a view the
+    /// filters select nothing from.
+    pub latency_svg: Option<String>,
     pub empty_message: String,
     pub error: Option<String>,
 }
@@ -513,12 +535,49 @@ struct TokensData {
     /// and name the channel a row's cost comes from.
     keys: Vec<ApiKey>,
     channels: HashMap<i64, ChannelInfo>,
-    /// Day-level rows of the filtered range, the only usage the page reads:
-    /// the table folds them per key and model, the charts plot them as they
-    /// are.
-    days: Vec<DayUsage>,
+    /// Usage rows of the filtered range, one per day or one per hour
+    /// whichever the range selected: the table folds them per key and model,
+    /// the charts plot them as they are.
+    usage: UsageRows,
     /// The distinct models logged in the range, for the Model select.
     models: Vec<String>,
+}
+
+/// The usage rows of one view, at the granularity its range selected: the
+/// hour rows of a one or two day range, the day rows of a longer one.
+///
+/// The two shapes carry the same key, model and token dimensions, so the
+/// table folds either one per key and model and the cost of a bucket is
+/// priced the same way; only the charts, which place a bucket on an axis,
+/// read the shape itself.
+enum UsageRows {
+    /// One row per (day, key, model), from
+    /// [`crate::db::request_logs::day_usage`].
+    Daily(Vec<DayUsage>),
+    /// One row per (hour, key, model), from
+    /// [`crate::db::request_logs::hour_usage`].
+    Hourly(Vec<HourUsage>),
+}
+
+impl UsageRows {
+    /// Whether the range has no usage row at all, which is when the page
+    /// draws no chart and keeps its empty state.
+    fn is_empty(&self) -> bool {
+        match self {
+            UsageRows::Daily(rows) => rows.is_empty(),
+            UsageRows::Hourly(rows) => rows.is_empty(),
+        }
+    }
+
+    /// The usage groups of one key, folded per model out of whichever shape
+    /// the range loaded. The rows already carry the range and the key and
+    /// model filters, so this fold narrows nothing.
+    fn key_groups(&self, key_id: i64) -> Vec<ModelUsage> {
+        match self {
+            UsageRows::Daily(rows) => key_groups(key_id, rows),
+            UsageRows::Hourly(rows) => key_groups(key_id, rows),
+        }
+    }
 }
 
 /// Everything the Requests page needs out of the database: the request
@@ -528,9 +587,13 @@ struct RequestsData {
     /// Every stored key, soft-deleted ones included: they fill the key
     /// select.
     keys: Vec<ApiKey>,
-    /// Day-level request counts per exact status code of the filtered range,
-    /// for the requests chart.
-    status_code_days: Vec<DayStatusCodeUsage>,
+    /// Request counts per exact status code of the filtered range, one row
+    /// per day or per hour, for the requests chart.
+    requests: RequestRows,
+    /// The mean duration of every hour of the filtered range, the only rows
+    /// the latency chart reads: it folds them onto the daily grid itself
+    /// when the range is a long one.
+    latency: Vec<HourLatency>,
     /// Request totals per exact status code of the filtered range, for the
     /// status code table.
     status_code_totals: Vec<StatusCodeTotal>,
@@ -538,9 +601,39 @@ struct RequestsData {
     models: Vec<String>,
 }
 
+/// The per-code request counts of one view, at the granularity its range
+/// selected: the twin of [`UsageRows`] for the requests chart.
+enum RequestRows {
+    /// One row per (day, exact status code), from
+    /// [`crate::db::request_logs::day_status_code_usage`].
+    Daily(Vec<DayStatusCodeUsage>),
+    /// One row per (hour, exact status code), from
+    /// [`crate::db::request_logs::hour_status_code_usage`].
+    Hourly(Vec<HourStatusCodeUsage>),
+}
+
+impl RequestRows {
+    /// Whether the range has no request row at all, which is when no
+    /// requests chart is drawn.
+    fn is_empty(&self) -> bool {
+        match self {
+            RequestRows::Daily(rows) => rows.is_empty(),
+            RequestRows::Hourly(rows) => rows.is_empty(),
+        }
+    }
+}
+
 fn internal_error(error: &sqlx::Error) -> String {
     tracing::error!(error = %error, "admin ui stats query failed");
     "internal server error".to_string()
+}
+
+/// The bucket the figures of one view are grouped by: a range of one or two
+/// days plots hours, a longer one days. The decision is made once per
+/// request, out of the same resolved range the queries read, so the rows, the
+/// charts and the headings of a page can never span different buckets.
+fn granularity(range: &DateRange) -> Granularity {
+    Granularity::from_range(range.from, range.to)
 }
 
 /// Resolves the range of one view out of the `preset`, `from` and `to`
@@ -708,14 +801,16 @@ async fn channel_info(db: &Db) -> sqlx::Result<HashMap<i64, ChannelInfo>> {
         .collect())
 }
 
-/// Loads the key list, the channel price tables, the day rows the Tokens
+/// Loads the key list, the channel price tables, the usage rows the Tokens
 /// page reads and the model names of the range.
 ///
 /// The usage query carries the range and the key and model filters, so those
-/// rows answer the table and both charts alike. No status aggregate is asked
-/// for, because nothing on this page counts requests by their status. The
-/// model list stays range-scoped and unfiltered, so the select always offers
-/// every model of the range rather than only the surviving one.
+/// rows answer the table and both charts alike, and its granularity follows
+/// the range: hours for one or two days, days for anything longer. No status
+/// aggregate is asked for, because nothing on this page counts requests by
+/// their status. The model list stays range-scoped and unfiltered, so the
+/// select always offers every model of the range rather than only the
+/// surviving one.
 async fn load_tokens(
     state: &AppState,
     range: &DateRange,
@@ -731,15 +826,31 @@ async fn load_tokens(
     let channels = channel_info(&state.db)
         .await
         .map_err(|error| internal_error(&error))?;
-    let days = request_logs::day_usage(
-        &state.db,
-        &start,
-        &end,
-        filters.key_id,
-        filters.model.clone(),
-    )
-    .await
-    .map_err(|error| internal_error(&error))?;
+    let usage = match granularity(range) {
+        Granularity::Hourly => UsageRows::Hourly(
+            request_logs::hour_usage(
+                &state.db,
+                &start,
+                &end,
+                filters.key_id,
+                filters.model.clone(),
+                filters.status_class,
+            )
+            .await
+            .map_err(|error| internal_error(&error))?,
+        ),
+        Granularity::Daily => UsageRows::Daily(
+            request_logs::day_usage(
+                &state.db,
+                &start,
+                &end,
+                filters.key_id,
+                filters.model.clone(),
+            )
+            .await
+            .map_err(|error| internal_error(&error))?,
+        ),
+    };
     let models = request_logs::distinct_models(&state.db, &start, &end)
         .await
         .map_err(|error| internal_error(&error))?;
@@ -747,21 +858,24 @@ async fn load_tokens(
         range: *range,
         keys,
         channels,
-        days,
+        usage,
         models,
     })
 }
 
-/// Loads the key list, the day rows per exact status code, the status code
-/// totals of the range and the model names of the range, which is everything
-/// the Requests page reads.
+/// Loads the key list, the per-code request rows, the latency rows, the
+/// status code totals of the range and the model names of the range, which is
+/// everything the Requests page reads.
 ///
-/// Both status queries carry the range and the key, model and status class
-/// filters, so the chart and the table are built from the same selection.
-/// The model list of the select stays range-scoped and unfiltered on
-/// purpose, so the control always offers every model of the range rather
-/// than only the surviving one. Neither cost nor token data is asked for,
-/// because nothing on this page counts them.
+/// The per-code query carries the range and the key, model and status class
+/// filters, so the chart is built from the selection the table reports, and
+/// its granularity follows the range exactly as the Tokens page's usage query
+/// does. The latency aggregate is the hourly one for every range, because the
+/// chart folds its hours onto the daily grid itself when the range is a long
+/// one; it takes the same filters. The model list of the select stays
+/// range-scoped and unfiltered on purpose, so the control always offers every
+/// model of the range rather than only the surviving one. Neither cost nor
+/// token data is asked for, because nothing on this page counts them.
 async fn load_requests(
     state: &AppState,
     range: &DateRange,
@@ -772,7 +886,33 @@ async fn load_requests(
     let keys = keys::list(&state.db)
         .await
         .map_err(|error| internal_error(&error))?;
-    let status_code_days = request_logs::day_status_code_usage(
+    let requests = match granularity(range) {
+        Granularity::Hourly => RequestRows::Hourly(
+            request_logs::hour_status_code_usage(
+                &state.db,
+                &start,
+                &end,
+                filters.key_id,
+                filters.model.clone(),
+                filters.status_class,
+            )
+            .await
+            .map_err(|error| internal_error(&error))?,
+        ),
+        Granularity::Daily => RequestRows::Daily(
+            request_logs::day_status_code_usage(
+                &state.db,
+                &start,
+                &end,
+                filters.key_id,
+                filters.model.clone(),
+                filters.status_class,
+            )
+            .await
+            .map_err(|error| internal_error(&error))?,
+        ),
+    };
+    let latency = request_logs::hour_latency(
         &state.db,
         &start,
         &end,
@@ -798,7 +938,8 @@ async fn load_requests(
     Ok(RequestsData {
         range: *range,
         keys,
-        status_code_days,
+        requests,
+        latency,
         status_code_totals,
         models,
     })
@@ -939,6 +1080,7 @@ fn tokens_shell(range: &DateRange, filters: &Filters, error: Option<String>) -> 
         grand: Sums::default().display(),
         key_options: key_options(&[], filters.key_id),
         model_options: model_options(&[], filters.model.as_deref()),
+        granularity: granularity(range),
         charts: None,
         empty_message,
         error,
@@ -971,7 +1113,9 @@ fn requests_shell(range: &DateRange, filters: &Filters, error: Option<String>) -
         model_options: model_options(&[], filters.model.as_deref()),
         status_options: status_options(filters.status_class),
         status_codes: Vec::new(),
+        granularity: granularity(range),
         status_svg: None,
+        latency_svg: None,
         empty_message,
         error,
     }
@@ -991,40 +1135,133 @@ fn day_group(day: &DayUsage) -> ModelUsage {
     }
 }
 
-/// The charts of the Tokens page: the daily token bars and the daily cost
-/// bars, built by pricing every day group from the price table of the key
-/// that spent it. A key whose channel is missing or prices nothing
-/// contributes zero, exactly as it does in the table. `None` when the
-/// filtered range has no day rows at all, which is when the page shows its
-/// empty state instead of an empty plot.
-fn tokens_charts(data: &TokensData, theme: stats_chart::ChartTheme) -> Option<TokenCharts> {
-    if data.days.is_empty() {
-        return None;
+/// One hour group as the shape the pricing fold reads, the hourly twin of
+/// [`day_group`]: an hour carries the same dimensions a day does, so an hour
+/// is priced by the same call.
+fn hour_group(hour: &HourUsage) -> ModelUsage {
+    ModelUsage {
+        model: hour.model.clone(),
+        prompt_tokens: hour.prompt_tokens,
+        completion_tokens: hour.completion_tokens,
+        cached_input_tokens: hour.cached_input_tokens,
+        cached_output_tokens: hour.cached_output_tokens,
+        cache_write_input_tokens: hour.cache_write_input_tokens,
+        requests: hour.requests,
     }
-    // A day group names the key, not the channel, so the key's bound channel
-    // is where its prices come from.
-    let channels: HashMap<i64, &ChannelInfo> = data
-        .keys
+}
+
+/// A usage row as the page reads it, whichever aggregate produced it: the
+/// label of its bucket, the key that spent it and the counts the cost formula
+/// prices. The day and the hour aggregates carry the same dimensions under
+/// different names, so one fold serves both granularities.
+trait UsageRow {
+    /// The label of the row's bucket: its day or its hour.
+    fn bucket(&self) -> &str;
+    /// The key the row's requests were made with; never missing in a row an
+    /// aggregate returns.
+    fn key_id(&self) -> i64;
+    /// The row's counts in the shape the pricing fold reads.
+    fn usage(&self) -> ModelUsage;
+}
+
+impl UsageRow for DayUsage {
+    fn bucket(&self) -> &str {
+        &self.day
+    }
+
+    fn key_id(&self) -> i64 {
+        self.key_id
+    }
+
+    fn usage(&self) -> ModelUsage {
+        day_group(self)
+    }
+}
+
+impl UsageRow for HourUsage {
+    fn bucket(&self) -> &str {
+        &self.hour
+    }
+
+    fn key_id(&self) -> i64 {
+        self.key_id
+    }
+
+    fn usage(&self) -> ModelUsage {
+        hour_group(self)
+    }
+}
+
+/// The price table of every key of the page, keyed by the key id: a usage row
+/// names the key and not the channel, so the key's bound channel is where its
+/// prices come from.
+fn key_channels(data: &TokensData) -> HashMap<i64, &ChannelInfo> {
+    data.keys
         .iter()
         .filter_map(|key| {
             data.channels
                 .get(&key.channel_id)
                 .map(|info| (key.id, info))
         })
-        .collect();
-    let costs: Vec<(String, i64)> = data
-        .days
-        .iter()
-        .map(|day| {
+        .collect()
+}
+
+/// One entry per bucket row: the label of the bucket and the cost of the
+/// row's groups, priced from the price table of the key that spent it. A key
+/// whose channel is missing or prices nothing contributes zero, exactly as it
+/// does in the table.
+fn cost_entries<R: UsageRow>(
+    rows: &[R],
+    channels: &HashMap<i64, &ChannelInfo>,
+) -> Vec<(String, i64)> {
+    rows.iter()
+        .map(|row| {
             let prices = channels
-                .get(&day.key_id)
+                .get(&row.key_id())
                 .and_then(|info| info.prices.as_ref());
-            (day.day.clone(), usage::group_cost(&day_group(day), prices))
+            (
+                row.bucket().to_string(),
+                usage::group_cost(&row.usage(), prices),
+            )
         })
-        .collect();
+        .collect()
+}
+
+/// The charts of the Tokens page: the token bars and the cost bars of the
+/// range, drawn at the granularity its usage rows carry, each built by
+/// pricing every bucket group from the price table of the key that spent it.
+/// A key whose channel is missing or prices nothing contributes zero, exactly
+/// as it does in the table. `None` when the filtered range has no usage row
+/// at all, which is when the page shows its empty state instead of an empty
+/// plot.
+fn tokens_charts(data: &TokensData, theme: stats_chart::ChartTheme) -> Option<TokenCharts> {
+    if data.usage.is_empty() {
+        return None;
+    }
+    // A bucket group names the key, not the channel, so the key's bound
+    // channel is where its prices come from.
+    let channels = key_channels(data);
+    let from = data.range.from;
+    let to = data.range.to;
+    let (tokens_svg, cost_svg) = match &data.usage {
+        UsageRows::Daily(rows) => {
+            let costs = cost_entries(rows, &channels);
+            (
+                stats_chart::daily_token_bars(rows, theme),
+                stats_chart::daily_cost_bars(&costs, theme),
+            )
+        }
+        UsageRows::Hourly(rows) => {
+            let costs = cost_entries(rows, &channels);
+            (
+                stats_chart::hourly_token_bars(rows, from, to, theme),
+                stats_chart::hourly_cost_bars(&costs, from, to, theme),
+            )
+        }
+    };
     Some(TokenCharts {
-        tokens_svg: stats_chart::daily_token_bars(&data.days, theme),
-        cost_svg: stats_chart::daily_cost_bars(&costs, theme),
+        tokens_svg,
+        cost_svg,
     })
 }
 
@@ -1032,10 +1269,11 @@ fn tokens_charts(data: &TokensData, theme: stats_chart::ChartTheme) -> Option<To
 /// the range, each followed by the key's total line, plus the grand total and
 /// the two charts.
 ///
-/// The rows are folded out of the same day rows the charts plot, and those
-/// rows already carry the range, key and model filters, so the table and the
-/// charts can never disagree about a request. A key left with no group
-/// disappears whole, exactly like a key with no usage in the range at all.
+/// The rows are folded out of the same usage rows the charts plot, day rows
+/// or hour rows as the range selected, and those rows already carry the
+/// range, key and model filters, so the table and the charts can never
+/// disagree about a request. A key left with no group disappears whole,
+/// exactly like a key with no usage in the range at all.
 fn build_tokens_page(
     data: TokensData,
     filters: &Filters,
@@ -1047,7 +1285,7 @@ fn build_tokens_page(
     let mut rows: Vec<StatsRow> = Vec::new();
 
     for key in &data.keys {
-        let mut groups = key_groups(key.id, &data.days);
+        let mut groups = data.usage.key_groups(key.id);
         if groups.is_empty() {
             continue;
         }
@@ -1106,14 +1344,15 @@ fn build_tokens_page(
     page
 }
 
-/// Renders the Requests page: the daily requests chart stacked by exact
-/// status code and the status code table of the same selection.
+/// Renders the Requests page: the requests chart stacked by exact status
+/// code, the latency chart and the status code table of the same selection.
 ///
-/// Both read the rows the two status queries already filtered, so the chart
-/// and the table can never disagree about a request, and the model select
-/// keeps offering every model logged in the range rather than only the
-/// surviving one. A filter that selects no request leaves both out and the
-/// page falls back to its empty state.
+/// The three read the rows the queries already filtered, so the chart and the
+/// table can never disagree about a request, and the model select keeps
+/// offering every model logged in the range rather than only the surviving
+/// one. A filter that selects no request draws no requests chart and leaves
+/// the table out; a filter that selects no timed request in addition leaves
+/// the latency chart out, and the page falls back to its empty state.
 fn build_requests_page(
     data: RequestsData,
     filters: &Filters,
@@ -1121,50 +1360,59 @@ fn build_requests_page(
     theme: stats_chart::ChartTheme,
 ) -> RequestsPage {
     let mut page = requests_shell(&data.range, filters, error);
+    let from = data.range.from;
+    let to = data.range.to;
     page.key_options = key_options(&data.keys, filters.key_id);
     page.model_options = model_options(&data.models, filters.model.as_deref());
     page.status_options = status_options(filters.status_class);
     page.status_codes = status_code_rows(&data.status_code_totals);
-    page.status_svg = (!data.status_code_days.is_empty())
-        .then(|| stats_chart::daily_status_code_bars(&data.status_code_days, theme));
-    if page.status_svg.is_some() || !page.status_codes.is_empty() {
+    page.status_svg = (!data.requests.is_empty()).then(|| match &data.requests {
+        RequestRows::Daily(rows) => stats_chart::daily_status_code_bars(rows, theme),
+        RequestRows::Hourly(rows) => stats_chart::hourly_status_code_bars(rows, from, to, theme),
+    });
+    // The latency aggregate is hourly for every range; the chart folds its
+    // hours onto the daily grid when the range is a long one.
+    page.latency_svg = (!data.latency.is_empty())
+        .then(|| stats_chart::latency_bars(&data.latency, from, to, theme));
+    if page.status_svg.is_some() || page.latency_svg.is_some() || !page.status_codes.is_empty() {
         page.empty_message.clear();
     }
     page
 }
 
-/// The usage groups of one key: the day rows of that key folded per model,
-/// which is the shape the table's rows and costs are built from. The day
-/// rows already carry the range and the key and model filters, so this fold
+/// The usage groups of one key: the bucket rows of that key folded per model,
+/// which is the shape the table's rows and costs are built from. The rows
+/// already carry the range and the key and model filters, so this fold
 /// narrows nothing.
-fn key_groups(key_id: i64, days: &[DayUsage]) -> Vec<ModelUsage> {
+fn key_groups<R: UsageRow>(key_id: i64, rows: &[R]) -> Vec<ModelUsage> {
     let mut groups: Vec<ModelUsage> = Vec::new();
-    for day in days.iter().filter(|day| day.key_id == key_id) {
-        match groups.iter_mut().find(|group| group.model == day.model) {
-            Some(group) => add_day(group, day),
-            None => groups.push(day_group(day)),
+    for row in rows.iter().filter(|row| row.key_id() == key_id) {
+        let usage = row.usage();
+        match groups.iter_mut().find(|group| group.model == usage.model) {
+            Some(group) => add_usage(group, &usage),
+            None => groups.push(usage),
         }
     }
     groups
 }
 
-/// Adds one day group's counts onto the model group of the same model, so a
-/// key's models sum what its days sum.
-fn add_day(group: &mut ModelUsage, day: &DayUsage) {
-    group.prompt_tokens = group.prompt_tokens.saturating_add(day.prompt_tokens);
+/// Adds one bucket group's counts onto the model group of the same model, so
+/// a key's models sum every bucket of the range they saw.
+fn add_usage(group: &mut ModelUsage, usage: &ModelUsage) {
+    group.prompt_tokens = group.prompt_tokens.saturating_add(usage.prompt_tokens);
     group.completion_tokens = group
         .completion_tokens
-        .saturating_add(day.completion_tokens);
+        .saturating_add(usage.completion_tokens);
     group.cached_input_tokens = group
         .cached_input_tokens
-        .saturating_add(day.cached_input_tokens);
+        .saturating_add(usage.cached_input_tokens);
     group.cached_output_tokens = group
         .cached_output_tokens
-        .saturating_add(day.cached_output_tokens);
+        .saturating_add(usage.cached_output_tokens);
     group.cache_write_input_tokens = group
         .cache_write_input_tokens
-        .saturating_add(day.cache_write_input_tokens);
-    group.requests = group.requests.saturating_add(day.requests);
+        .saturating_add(usage.cache_write_input_tokens);
+    group.requests = group.requests.saturating_add(usage.requests);
 }
 
 /// Reads the view state of one request out of its query string: the date
@@ -1248,6 +1496,11 @@ mod tests {
         span(date(2026, 11, 1), date(2026, 11, 30))
     }
 
+    /// One day of November 2026, the shortest range of the hourly tests.
+    fn one_day() -> DateRange {
+        span(date(2026, 11, 15), date(2026, 11, 15))
+    }
+
     /// One day-level row as the day aggregate hands it over, with one
     /// request and no cache counts unless a test sets them.
     fn day_row(day: &str, model: &str, prompt: i64, completion: i64) -> DayUsage {
@@ -1269,6 +1522,22 @@ mod tests {
         DayUsage {
             key_id,
             ..day_row(day, model, prompt, completion)
+        }
+    }
+
+    /// One hour-level row as the hourly aggregate hands it over, with one
+    /// request and no cache counts unless a test sets them.
+    fn hour_row(hour: &str, model: &str, prompt: i64, completion: i64) -> HourUsage {
+        HourUsage {
+            hour: hour.to_string(),
+            key_id: 1,
+            model: Some(model.to_string()),
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cached_input_tokens: 0,
+            cached_output_tokens: 0,
+            cache_write_input_tokens: 0,
+            requests: 1,
         }
     }
 
@@ -1339,7 +1608,23 @@ mod tests {
             range: november(),
             keys,
             channels,
-            days,
+            usage: UsageRows::Daily(days),
+            models: Vec::new(),
+        }
+    }
+
+    /// Loaded data for a one-day range, the shortest range that plots hours:
+    /// the hour rows the table and the charts read, one stored key bound to
+    /// the priced channel and nothing else.
+    fn hourly_tokens_data(
+        hours: Vec<HourUsage>,
+        channels: HashMap<i64, ChannelInfo>,
+    ) -> TokensData {
+        TokensData {
+            range: one_day(),
+            keys: vec![stored_key(None)],
+            channels,
+            usage: UsageRows::Hourly(hours),
             models: Vec::new(),
         }
     }
@@ -1347,13 +1632,31 @@ mod tests {
     /// Loaded data for the Requests page: the request aggregates of the range
     /// and the key list the filter offers.
     fn requests_data(
-        status_code_days: Vec<DayStatusCodeUsage>,
+        requests: RequestRows,
         status_code_totals: Vec<StatusCodeTotal>,
     ) -> RequestsData {
         RequestsData {
             range: november(),
             keys: vec![stored_key(None)],
-            status_code_days,
+            requests,
+            latency: Vec::new(),
+            status_code_totals,
+            models: Vec::new(),
+        }
+    }
+
+    /// The same for a one-day range, with the hour rows and the latency rows
+    /// the two charts of that page read.
+    fn hourly_requests_data(
+        requests: Vec<HourStatusCodeUsage>,
+        latency: Vec<HourLatency>,
+        status_code_totals: Vec<StatusCodeTotal>,
+    ) -> RequestsData {
+        RequestsData {
+            range: one_day(),
+            keys: vec![stored_key(None)],
+            requests: RequestRows::Hourly(requests),
+            latency,
             status_code_totals,
             models: Vec::new(),
         }
@@ -2083,6 +2386,110 @@ mod tests {
     }
 
     #[test]
+    fn an_hourly_range_folds_its_hours_into_the_model_groups_of_their_key() {
+        let rows = UsageRows::Hourly(vec![
+            hour_row("2026-11-15 10", "gpt-4o", 1000, 200),
+            hour_row("2026-11-15 11", "gpt-4o", 500, 100),
+            hour_row("2026-11-15 11", "gpt-5-mini", 7, 1),
+        ]);
+        assert!(!rows.is_empty());
+        let mut groups = rows.key_groups(1);
+        groups.sort_by(|left, right| sort_key(&left.model).cmp(&sort_key(&right.model)));
+        assert_eq!(groups.len(), 2, "one group per model of the key");
+        assert_eq!(groups[0].model.as_deref(), Some("gpt-4o"));
+        assert_eq!(groups[0].prompt_tokens, 1500, "the hours of the model sum");
+        assert_eq!(groups[0].completion_tokens, 300);
+        assert_eq!(groups[0].requests, 2);
+        assert_eq!(groups[1].model.as_deref(), Some("gpt-5-mini"));
+        assert!(
+            rows.key_groups(9).is_empty(),
+            "another key has no hours here"
+        );
+        assert!(UsageRows::Hourly(Vec::new()).is_empty());
+    }
+
+    #[test]
+    fn a_short_range_charts_its_hours_and_prices_an_hour_like_the_table() {
+        // 1000 prompt tokens with 400 of them cached and 200 completions in
+        // the ten o'clock hour, which the pinned formula prices at 4000
+        // micro-USD.
+        let mut hour = hour_row("2026-11-15 10", "gpt-4o", 1000, 200);
+        hour.cached_input_tokens = 400;
+        let data = hourly_tokens_data(vec![hour], HashMap::from([(7, channel_info_limitable())]));
+
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
+        assert_eq!(
+            page.granularity,
+            Granularity::Hourly,
+            "a one day range plots hours"
+        );
+        assert_eq!(page.from_value, "2026-11-15");
+        assert_eq!(page.to_value, "2026-11-15");
+        let plot = page.charts.expect("hour rows draw both charts");
+        assert!(
+            plot.tokens_svg.contains("aria-label=\"Tokens per hour\""),
+            "{}",
+            plot.tokens_svg
+        );
+        assert!(
+            plot.tokens_svg
+                .contains("10:00: 1,200 tokens (1,000 in, 200 out) in 1 requests"),
+            "the token bar carries the hour's figures: {}",
+            plot.tokens_svg
+        );
+        assert!(
+            plot.cost_svg.contains("aria-label=\"Cost per hour\""),
+            "{}",
+            plot.cost_svg
+        );
+        assert!(
+            plot.cost_svg.contains("10:00: $0.004"),
+            "the cached share is priced at the cached rate in an hour too: {}",
+            plot.cost_svg
+        );
+        assert_eq!(
+            page.grand.cost, "$0.004",
+            "the chart and the table price the same rows the same way"
+        );
+        assert_eq!(page.rows[0].sums.cost, "$0.004");
+    }
+
+    #[test]
+    fn a_long_range_keeps_the_day_charts_of_the_same_page() {
+        let data = tokens_data(
+            vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
+            HashMap::from([(7, channel_info_limitable())]),
+        );
+        let page = build_tokens_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
+        assert_eq!(
+            page.granularity,
+            Granularity::Daily,
+            "a month range keeps one bar per day"
+        );
+        let plot = page.charts.expect("day rows draw both charts");
+        assert!(
+            plot.tokens_svg.contains("aria-label=\"Tokens per day\""),
+            "{}",
+            plot.tokens_svg
+        );
+        assert!(
+            plot.cost_svg.contains("aria-label=\"Cost per day\""),
+            "{}",
+            plot.cost_svg
+        );
+    }
+
+    #[test]
     fn the_tokens_page_carries_no_status_content() {
         let data = tokens_data(
             vec![day_row("2026-11-02", "gpt-4o", 1000, 200)],
@@ -2112,12 +2519,12 @@ mod tests {
     #[test]
     fn the_requests_page_renders_the_chart_and_the_table_of_the_same_rows() {
         let data = requests_data(
-            vec![DayStatusCodeUsage {
+            RequestRows::Daily(vec![DayStatusCodeUsage {
                 day: "2026-11-02".to_string(),
                 status: Some(500),
                 status_class: StatusBucket::Server5xx,
                 requests: 2,
-            }],
+            }]),
             vec![
                 StatusCodeTotal {
                     status: Some(500),
@@ -2160,11 +2567,110 @@ mod tests {
     }
 
     #[test]
+    fn a_short_requests_range_charts_hours_and_the_latency_of_the_same_buckets() {
+        let data = hourly_requests_data(
+            vec![HourStatusCodeUsage {
+                hour: "2026-11-15 10".to_string(),
+                status: Some(500),
+                status_class: StatusBucket::Server5xx,
+                requests: 2,
+            }],
+            vec![HourLatency {
+                hour: "2026-11-15 10".to_string(),
+                avg_duration_ms: 12.0,
+                requests: 2,
+            }],
+            vec![StatusCodeTotal {
+                status: Some(500),
+                status_class: StatusBucket::Server5xx,
+                requests: 2,
+            }],
+        );
+        let page = build_requests_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
+        assert_eq!(page.granularity, Granularity::Hourly);
+        let svg = page
+            .status_svg
+            .as_ref()
+            .expect("hour rows draw the requests chart");
+        assert!(svg.contains("aria-label=\"Requests per hour\""), "{svg}");
+        assert!(svg.contains("10:00: 2 requests (2 500)"), "{svg}");
+        let latency = page
+            .latency_svg
+            .as_ref()
+            .expect("latency rows draw the latency chart");
+        assert!(
+            latency.contains("aria-label=\"Latency per hour\""),
+            "{latency}"
+        );
+        assert!(
+            latency.contains("10:00: 12.0 ms (2 requests)"),
+            "the latency bar carries the mean of its bucket: {latency}"
+        );
+        assert_eq!(page.status_codes.len(), 1);
+        assert!(
+            page.empty_message.is_empty(),
+            "a page with content shows no empty state"
+        );
+    }
+
+    #[test]
+    fn a_long_requests_range_folds_the_latency_rows_onto_its_days() {
+        let mut data = requests_data(
+            RequestRows::Daily(vec![DayStatusCodeUsage {
+                day: "2026-11-02".to_string(),
+                status: Some(200),
+                status_class: StatusBucket::Ok2xx,
+                requests: 1,
+            }]),
+            vec![StatusCodeTotal {
+                status: Some(200),
+                status_class: StatusBucket::Ok2xx,
+                requests: 1,
+            }],
+        );
+        data.latency = vec![
+            HourLatency {
+                hour: "2026-11-02 10".to_string(),
+                avg_duration_ms: 10.0,
+                requests: 1,
+            },
+            HourLatency {
+                hour: "2026-11-02 11".to_string(),
+                avg_duration_ms: 20.0,
+                requests: 3,
+            },
+        ];
+        let page = build_requests_page(
+            data,
+            &Filters::default(),
+            None,
+            stats_chart::ChartTheme::Light,
+        );
+        assert_eq!(page.granularity, Granularity::Daily);
+        let latency = page
+            .latency_svg
+            .as_ref()
+            .expect("latency rows draw the latency chart");
+        assert!(
+            latency.contains("aria-label=\"Latency per day\""),
+            "a month range plots latency per day: {latency}"
+        );
+        // The hours of the day weigh by the timed requests each covers:
+        // (10 * 1 + 20 * 3) / 4 = 17.5 ms on the second day of the month.
+        assert!(latency.contains("Day 2: 17.5 ms (4 requests)"), "{latency}");
+    }
+
+    #[test]
     fn a_requests_page_without_a_matching_request_drops_both_panels() {
         // A status filter that selects nothing leaves the status rows empty,
         // which drops the chart and the table, and the page says so.
         let page = build_requests_page(
-            requests_data(Vec::new(), Vec::new()),
+            requests_data(RequestRows::Daily(Vec::new()), Vec::new()),
             &Filters {
                 status_class: Some(StatusBucket::Client4xx),
                 ..Filters::default()

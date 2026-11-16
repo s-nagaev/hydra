@@ -51,6 +51,10 @@
       <input type="text" id="log-model" name="model" value="{{ model_value }}">
     </div>
     <div class="filter-field">
+      <label for="log-q">Search</label>
+      <input type="text" id="log-q" name="q" value="{{ search_value }}" placeholder="Bodies and errors">
+    </div>
+    <div class="filter-field">
       <label for="log-status">Status</label>
       <select id="log-status" name="status_class">
         {% for option in status_options %}

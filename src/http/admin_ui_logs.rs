@@ -56,6 +56,7 @@ pub struct LogsQuery {
     channel_id: Option<String>,
     model: Option<String>,
     status_class: Option<String>,
+    q: Option<String>,
     preset: Option<String>,
     from: Option<String>,
     to: Option<String>,
@@ -110,6 +111,7 @@ pub struct LogsPage {
     pub preset_options: Vec<SelectOption>,
     pub page_size_options: Vec<SelectOption>,
     pub model_value: String,
+    pub search_value: String,
     pub from_value: String,
     pub to_value: String,
     pub refresh_url: String,
@@ -534,6 +536,7 @@ fn push_view_state(
     push("channel_id", query.channel_id.as_deref());
     push("model", query.model.as_deref());
     push("status_class", query.status_class.as_deref());
+    push("q", query.q.as_deref());
     push("preset", query.preset.as_deref());
     push("from", query.from.as_deref());
     push("to", query.to.as_deref());
@@ -582,7 +585,7 @@ fn error_message(error: LogsError) -> String {
 async fn load(state: &AppState, query: &LogsQuery) -> Result<LogsData, String> {
     let parsed = parse_ids(query)?;
     let (from, to, _, _) = resolve_time_range(query).map_err(error_message)?;
-    let filters = build_filters(RawLogQuery {
+    let mut filters = build_filters(RawLogQuery {
         page: parsed.page,
         page_size: parsed.page_size,
         key_id: parsed.key_id,
@@ -593,6 +596,9 @@ async fn load(state: &AppState, query: &LogsQuery) -> Result<LogsData, String> {
         to,
     })
     .map_err(error_message)?;
+    // The free-text needle is a filter of this page alone, so it is added to
+    // the shared construction here instead of in the JSON endpoint's builder.
+    filters.search = trimmed(query.q.as_ref()).map(str::to_string);
 
     let (rows, total) = request_logs::list(&state.db, &filters)
         .await
@@ -800,6 +806,7 @@ fn build_page(query: &LogsQuery, data: LogsData, error: Option<String>) -> LogsP
         trimmed(query.channel_id.as_ref()).is_some(),
         trimmed(query.model.as_ref()).is_some(),
         trimmed(query.status_class.as_ref()).is_some(),
+        trimmed(query.q.as_ref()).is_some(),
         !preset_raw.is_empty(),
         trimmed(query.from.as_ref()).is_some(),
         trimmed(query.to.as_ref()).is_some(),
@@ -837,6 +844,9 @@ fn build_page(query: &LogsQuery, data: LogsData, error: Option<String>) -> LogsP
         model_value: trimmed(query.model.as_ref())
             .map(str::to_string)
             .unwrap_or_default(),
+        search_value: trimmed(query.q.as_ref())
+            .map(str::to_string)
+            .unwrap_or_default(),
         from_value,
         to_value,
         refresh_url: view_url(query, page),
@@ -862,6 +872,7 @@ fn fallback_page(key_list: &[ApiKey], channel_list: &[Channel], message: String)
         preset_options: preset_options(""),
         page_size_options: page_size_options(DEFAULT_PAGE_SIZE),
         model_value: String::new(),
+        search_value: String::new(),
         from_value: String::new(),
         to_value: String::new(),
         refresh_url: "/admin/ui/logs".to_string(),

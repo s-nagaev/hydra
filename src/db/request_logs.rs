@@ -207,7 +207,8 @@ const STATUS_BUCKET_SQL: &str = "CASE WHEN status BETWEEN 200 AND 299 THEN '2xx'
 /// Filters for the admin listing; every field is optional. `from` and `to`
 /// are inclusive bounds already normalized to the `YYYY-MM-DD HH:MM:SS` UTC
 /// text format the `created_at` column stores, so string comparison against
-/// the column is correct and can use the time-ordered index.
+/// the column is correct and can use the time-ordered index. `search` is a
+/// free-text needle matched against the stored bodies and the error text.
 pub struct LogFilters {
     pub key_id: Option<i64>,
     pub channel_id: Option<i64>,
@@ -215,8 +216,60 @@ pub struct LogFilters {
     pub status_class: Option<StatusClass>,
     pub from: Option<String>,
     pub to: Option<String>,
+    pub search: Option<String>,
     pub page: u64,
     pub page_size: u64,
+}
+
+/// The escape character of the search `LIKE` predicate, so a `%` or a `_` in
+/// the needle matches itself instead of acting as a wildcard.
+const LIKE_ESCAPE: char = '\\';
+
+/// The text columns the search needle is matched against: the two captured
+/// bodies and the recorded failure. A row matches when any of them holds the
+/// needle.
+const SEARCH_COLUMNS: [&str; 3] = ["request_body", "response_body", "error"];
+
+/// The `LIKE` pattern of the search: the needle lowercased and wrapped in
+/// `%`, with the LIKE metacharacters (`%`, `_`) and the escape character
+/// itself backslash-escaped so the user's text is matched literally.
+///
+/// The pattern is a bind value, never SQL text, and the predicate compares
+/// `LOWER(column)` against it on both backends, so a needle finds the same
+/// rows on SQLite and on PostgreSQL. Full-text indexing is deliberately
+/// avoided: a tokenizer would miss the substrings users actually search for
+/// (an order id inside a JSON body) and would force a different query per
+/// backend.
+fn like_pattern(needle: &str) -> String {
+    let mut pattern = String::with_capacity(needle.len() + 2);
+    pattern.push('%');
+    for ch in needle.to_lowercase().chars() {
+        if matches!(ch, '%' | '_') || ch == LIKE_ESCAPE {
+            pattern.push(LIKE_ESCAPE);
+        }
+        pattern.push(ch);
+    }
+    pattern.push('%');
+    pattern
+}
+
+/// Adds one `LIKE <needle> ESCAPE '\'` probe per searched column, `OR`-ed
+/// together: a row matches when any of the three holds the needle, and a
+/// NULL column matches nothing.
+fn push_search(sql: &mut Sql, needle: &str) {
+    let pattern = like_pattern(needle);
+    sql.push(" AND (");
+    for (index, column) in SEARCH_COLUMNS.iter().enumerate() {
+        if index > 0 {
+            sql.push(" OR ");
+        }
+        sql.push("LOWER(COALESCE(")
+            .push(column)
+            .push(", '')) LIKE ")
+            .bind(Arg::Text(Some(pattern.clone())))
+            .push(" ESCAPE '\\'");
+    }
+    sql.push(")");
 }
 
 /// Adds the filter conditions to a SQL body. Values always travel as bind
@@ -262,6 +315,9 @@ fn push_conditions(sql: &mut Sql, filters: &LogFilters) {
     if let Some(to) = &filters.to {
         sql.push(" AND created_at <= ")
             .bind(Arg::Text(Some(to.clone())));
+    }
+    if let Some(needle) = &filters.search {
+        push_search(sql, needle);
     }
 }
 
@@ -493,6 +549,99 @@ fn map_day_usage(row: &Row) -> sqlx::Result<DayUsage> {
     })
 }
 
+/// One (hour, key, model) group of the hourly usage aggregate, the token
+/// dimensions a bucket is priced from.
+///
+/// The token fields repeat the dimensions of [`DayUsage`], cache dimensions
+/// included, so an hour group is priced by the same
+/// [`crate::usage::group_cost`] fold the table and the monthly-limit gate
+/// use: pricing an hour from a row that dropped the cache counts would
+/// charge cached tokens at the full input rate and disagree with the day
+/// chart of the same page.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HourUsage {
+    /// The `YYYY-MM-DD HH` label of the row's hour, the label of the
+    /// grouping.
+    pub hour: String,
+    /// The key the requests were made with; never NULL in a returned row.
+    pub key_id: i64,
+    /// The logged model name; NULL for rows that carry no model.
+    pub model: Option<String>,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    /// Prompt tokens the hour's rows served from the upstream cache.
+    pub cached_input_tokens: i64,
+    /// Completion tokens the hour's rows served from the upstream cache.
+    pub cached_output_tokens: i64,
+    /// Prompt tokens the hour's rows wrote into the upstream cache, the
+    /// dimension the write price applies to.
+    pub cache_write_input_tokens: i64,
+    /// Number of logged requests in the group, whatever their status.
+    pub requests: i64,
+}
+
+/// Hourly token and request totals inside a date range, one group per hour,
+/// key and model: the hourly twin of [`day_usage`].
+///
+/// The window is the same half-open range on `created_at` (`>= start` and
+/// `< end`), which is what the `(api_key_id, created_at)` index serves, and
+/// `substr(created_at, 1, 13)` appears only as the label of the grouping,
+/// never as a filter that would defeat that index. Every token dimension the
+/// pricing path reads is summed, the cache dimensions included, so a caller
+/// that prices an hour gets the same figure the day aggregate prices. Rows
+/// without an `api_key_id` (rejections whose key never resolved) are
+/// excluded, exactly as in [`day_usage`]. A `model` filter naturally drops
+/// the NULL-model rows, while without it those rows form their own group. A
+/// NULL token count contributes nothing, so a group whose rows all lack
+/// tokens still counts its requests and sums to zero. The sums are cast to
+/// `BIGINT` because PostgreSQL's `SUM` over `BIGINT` returns `NUMERIC` while
+/// SQLite's stays an integer, and both must read back as `i64`.
+pub async fn hour_usage(
+    db: &Db,
+    range_start: &str,
+    range_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) -> sqlx::Result<Vec<HourUsage>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT substr(created_at, 1, 13) AS hour, api_key_id, model, ")
+        .push("CAST(COALESCE(SUM(prompt_tokens), 0) AS BIGINT) AS prompt_tokens, ")
+        .push("CAST(COALESCE(SUM(completion_tokens), 0) AS BIGINT) AS completion_tokens, ")
+        .push("CAST(COALESCE(SUM(cached_input_tokens), 0) AS BIGINT) AS cached_input_tokens, ")
+        .push("CAST(COALESCE(SUM(cached_output_tokens), 0) AS BIGINT) AS cached_output_tokens, ")
+        .push(
+            "CAST(COALESCE(SUM(cache_write_input_tokens), 0) AS BIGINT) AS cache_write_input_tokens, ",
+        )
+        .push("COUNT(*) AS request_count FROM request_logs ");
+    push_status_range(
+        &mut sql,
+        range_start,
+        range_end,
+        key_id,
+        model,
+        status_class,
+    );
+    sql.push(" GROUP BY substr(created_at, 1, 13), api_key_id, model")
+        .push(" ORDER BY hour, api_key_id, model");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(map_hour_usage).collect()
+}
+
+fn map_hour_usage(row: &Row) -> sqlx::Result<HourUsage> {
+    Ok(HourUsage {
+        hour: row.text("hour")?,
+        key_id: row.int("api_key_id")?,
+        model: row.opt_text("model")?,
+        prompt_tokens: row.int("prompt_tokens")?,
+        completion_tokens: row.int("completion_tokens")?,
+        cached_input_tokens: row.int("cached_input_tokens")?,
+        cached_output_tokens: row.int("cached_output_tokens")?,
+        cache_write_input_tokens: row.int("cache_write_input_tokens")?,
+        requests: row.int("request_count")?,
+    })
+}
+
 /// Request count of one (day, status class) group, as the status chart of
 /// the stats page reads it.
 #[derive(Debug, PartialEq, Eq)]
@@ -559,13 +708,13 @@ fn map_day_status_usage(row: &Row) -> sqlx::Result<DayStatusUsage> {
 }
 
 /// Adds the date range and the optional key, model and status class
-/// predicates the status aggregates share to a SQL body.
+/// predicates the status and hourly token aggregates share to a SQL body.
 ///
 /// The window is a half-open range on `created_at` (`>= start` and `< end`),
 /// which is what the `(api_key_id, created_at)` index serves, and the rows
 /// without an `api_key_id` (rejections whose key never resolved) are
-/// excluded, so every status
-/// aggregate counts the same requests the token aggregates count. The class
+/// excluded, so every aggregate that sums usage counts the same requests the
+/// token aggregates count. The class
 /// predicate compares the bucket expression the queries group by, so
 /// filtering and grouping can never disagree.
 fn push_status_range(
@@ -576,7 +725,37 @@ fn push_status_range(
     model: Option<String>,
     status_class: Option<StatusBucket>,
 ) {
-    sql.push("WHERE api_key_id IS NOT NULL AND created_at >= ")
+    sql.push("WHERE api_key_id IS NOT NULL AND ");
+    push_range_predicates(sql, range_start, range_end, key_id, model, status_class);
+}
+
+/// Adds the range and filter predicates of [`push_status_range`] without the
+/// `api_key_id` guard, for the hourly latency aggregate: a bucket averages
+/// every timed request it holds, whatever key the request carried.
+fn push_latency_range(
+    sql: &mut Sql,
+    range_start: &str,
+    range_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) {
+    sql.push("WHERE ");
+    push_range_predicates(sql, range_start, range_end, key_id, model, status_class);
+}
+
+/// The half-open `created_at` window and the optional key, model and status
+/// class predicates the hourly aggregates share, appended after the caller
+/// has opened the WHERE clause.
+fn push_range_predicates(
+    sql: &mut Sql,
+    range_start: &str,
+    range_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) {
+    sql.push("created_at >= ")
         .bind(Arg::Text(Some(range_start.to_string())))
         .push(" AND created_at < ")
         .bind(Arg::Text(Some(range_end.to_string())));
@@ -658,6 +837,132 @@ fn map_day_status_code_usage(row: &Row) -> sqlx::Result<DayStatusCodeUsage> {
         day: row.text("day")?,
         status: row.opt_int("status_code")?,
         status_class: StatusBucket::parse(&label).unwrap_or(StatusBucket::Other),
+        requests: row.int("request_count")?,
+    })
+}
+
+/// Request count of one (hour, exact status code) group, the per-code detail
+/// of the hourly requests chart.
+#[derive(Debug, PartialEq, Eq)]
+pub struct HourStatusCodeUsage {
+    /// The `YYYY-MM-DD HH` label of the row's hour, the label of the
+    /// grouping.
+    pub hour: String,
+    /// The exact upstream HTTP status of the group. NULL for a request that
+    /// never reached an upstream, which is a group of its own rather than a
+    /// fabricated code.
+    pub status: Option<i64>,
+    /// The class the status falls into, from the same bucket expression the
+    /// `status_class` filter compares against.
+    pub status_class: StatusBucket,
+    /// Number of logged requests in the group.
+    pub requests: i64,
+}
+
+/// Request counts per hour and exact status code inside a date range, the
+/// per-code detail of the requests chart at hourly granularity: the hourly
+/// twin of [`day_status_code_usage`].
+///
+/// Same window, filters and exclusions as [`day_status_code_usage`]:
+/// `substr(created_at, 1, 13)` appears only as the label of the grouping and
+/// in the GROUP BY, never as a filter, so the index still serves the window.
+/// The class comes from the shared expression in the SELECT list and in the
+/// GROUP BY, which is also what the `status_class` predicate compares. Rows
+/// are ordered by hour, then by code, with the requests that carry no status
+/// last.
+pub async fn hour_status_code_usage(
+    db: &Db,
+    range_start: &str,
+    range_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) -> sqlx::Result<Vec<HourStatusCodeUsage>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT substr(created_at, 1, 13) AS hour, status AS status_code, ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" AS status_class, COUNT(*) AS request_count FROM request_logs ");
+    push_status_range(
+        &mut sql,
+        range_start,
+        range_end,
+        key_id,
+        model,
+        status_class,
+    );
+    sql.push(" GROUP BY substr(created_at, 1, 13), status, ")
+        .push(STATUS_BUCKET_SQL)
+        .push(" ORDER BY hour, status IS NULL, status");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(map_hour_status_code_usage).collect()
+}
+
+/// Maps one grouped hourly per-code row; a label the bucket expression does
+/// not know counts as `other` rather than dropping the requests behind it.
+fn map_hour_status_code_usage(row: &Row) -> sqlx::Result<HourStatusCodeUsage> {
+    let label = row.text("status_class")?;
+    Ok(HourStatusCodeUsage {
+        hour: row.text("hour")?,
+        status: row.opt_int("status_code")?,
+        status_class: StatusBucket::parse(&label).unwrap_or(StatusBucket::Other),
+        requests: row.int("request_count")?,
+    })
+}
+
+/// Mean request duration of one hour bucket, as the latency chart reads it.
+#[derive(Debug, PartialEq)]
+pub struct HourLatency {
+    /// The `YYYY-MM-DD HH` label of the hour, the label of the grouping.
+    pub hour: String,
+    /// The mean `duration_ms` over every row of the bucket, in
+    /// milliseconds. `duration_ms` is NOT NULL on every request log row, so
+    /// a bucket holds at least one timed row and the mean is never NULL.
+    pub avg_duration_ms: f64,
+    /// Number of timed requests the mean covers.
+    pub requests: i64,
+}
+
+/// Mean request duration per hour bucket inside a date range.
+///
+/// The window and the optional key, model and status class predicates are
+/// the ones the other hourly aggregates take, but this one keeps the rows
+/// whose `api_key_id` never resolved: an hour averages every timed request
+/// it holds, whatever key the request carried, so a rejection is not
+/// silently dropped from the picture. `duration_ms` is NOT NULL on every
+/// row, so no row is excluded for lack of a duration and a bucket always has
+/// a mean. The bucket label is `substr(created_at, 1, 13)`, `YYYY-MM-DD HH`,
+/// formed without a filter of its own so the index still serves the window.
+/// The average is cast to `DOUBLE PRECISION`, which SQLite reads as `REAL`,
+/// so both backends read it back as `f64`.
+pub async fn hour_latency(
+    db: &Db,
+    range_start: &str,
+    range_end: &str,
+    key_id: Option<i64>,
+    model: Option<String>,
+    status_class: Option<StatusBucket>,
+) -> sqlx::Result<Vec<HourLatency>> {
+    let mut sql = Sql::for_db(db);
+    sql.push("SELECT substr(created_at, 1, 13) AS hour, ")
+        .push("CAST(AVG(duration_ms) AS DOUBLE PRECISION) AS avg_duration_ms, ")
+        .push("COUNT(*) AS request_count FROM request_logs ");
+    push_latency_range(
+        &mut sql,
+        range_start,
+        range_end,
+        key_id,
+        model,
+        status_class,
+    );
+    sql.push(" GROUP BY substr(created_at, 1, 13) ORDER BY hour");
+    let rows = db.fetch_all(sql).await?;
+    rows.iter().map(map_hour_latency).collect()
+}
+
+fn map_hour_latency(row: &Row) -> sqlx::Result<HourLatency> {
+    Ok(HourLatency {
+        hour: row.text("hour")?,
+        avg_duration_ms: row.float("avg_duration_ms")?,
         requests: row.int("request_count")?,
     })
 }
@@ -836,6 +1141,23 @@ mod tests {
             status,
             ..row(model, Some(10), Some(1), None, None)
         }
+    }
+
+    /// The same row with an explicit duration, for the hourly latency tests.
+    fn row_with_duration(
+        status: Option<i64>,
+        model: Option<&str>,
+        duration_ms: i64,
+    ) -> NewRequestLog {
+        NewRequestLog {
+            duration_ms,
+            ..row_with_status(status, model)
+        }
+    }
+
+    /// Whether two averages agree to the precision the tests assert.
+    fn approx(left: f64, right: f64) -> bool {
+        (left - right).abs() < 1e-9
     }
 
     /// Inserts a row for `key_id` at an explicit timestamp.
@@ -2474,5 +2796,906 @@ mod tests {
             models,
             vec!["also-inside".to_string(), "inside".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn hour_usage_groups_by_hour_key_and_model() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "hours-first").await;
+        let (second_key, second_channel) = seed(&db, "hours-second").await;
+
+        // Two models of one hour for the first key.
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("alpha"), Some(7), Some(1), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("alpha"), Some(3), Some(2), None, None),
+            "2026-11-08 10:59:59",
+        )
+        .await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("beta"), Some(9), Some(4), None, None),
+            "2026-11-08 10:30:00",
+        )
+        .await;
+        // The same model in the next hour is a group of its own.
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row(Some("alpha"), Some(100), Some(10), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+        // Another key in the same hour is a separate group.
+        put(
+            &db,
+            second_key,
+            second_channel,
+            row(Some("alpha"), Some(1000), Some(0), None, None),
+            "2026-11-08 10:15:00",
+        )
+        .await;
+
+        let usage = hour_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 4, "{usage:?}");
+        // Ordered by hour, then key, then model.
+        assert_eq!(usage[0].hour, "2026-11-08 10");
+        assert_eq!(usage[0].key_id, first_key);
+        assert_eq!(usage[0].model.as_deref(), Some("alpha"));
+        assert_eq!(usage[0].prompt_tokens, 10);
+        assert_eq!(
+            usage[0].requests, 2,
+            "both edges of the hour share a bucket"
+        );
+        assert_eq!(usage[1].model.as_deref(), Some("beta"));
+        assert_eq!(usage[1].prompt_tokens, 9);
+        assert_eq!(usage[2].hour, "2026-11-08 10");
+        assert_eq!(usage[2].key_id, second_key);
+        assert_eq!(usage[2].prompt_tokens, 1000);
+        assert_eq!(usage[3].hour, "2026-11-08 11");
+        assert_eq!(usage[3].key_id, first_key);
+        assert_eq!(usage[3].prompt_tokens, 100);
+    }
+
+    #[tokio::test]
+    async fn hour_usage_buckets_rows_by_their_hour_and_honours_the_range() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "hour-range").await;
+
+        for (at, tokens) in [
+            ("2026-11-08 09:59:59", 1000), // the instant before the range
+            ("2026-11-08 10:00:00", 10),   // the first instant of the range
+            ("2026-11-08 10:59:59", 20),   // the last instant of the same hour
+            ("2026-11-08 11:00:00", 40),   // the next hour
+            ("2026-11-08 12:59:59", 80),   // the last instant inside the range
+            ("2026-11-08 13:00:00", 1000), // the first instant outside it
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row(Some("alpha"), Some(tokens), Some(0), None, None),
+                at,
+            )
+            .await;
+        }
+
+        let usage = hour_usage(
+            &db,
+            "2026-11-08 10:00:00",
+            "2026-11-08 13:00:00",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let hours: Vec<&str> = usage.iter().map(|group| group.hour.as_str()).collect();
+        assert_eq!(
+            hours,
+            vec!["2026-11-08 10", "2026-11-08 11", "2026-11-08 12"],
+            "{usage:?}"
+        );
+        assert_eq!(
+            usage[0].prompt_tokens, 30,
+            "both edges of the hour fall into the same bucket"
+        );
+        assert_eq!(usage[1].prompt_tokens, 40);
+        assert_eq!(usage[2].prompt_tokens, 80);
+    }
+
+    #[tokio::test]
+    async fn hour_usage_excludes_rows_without_a_key() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "hour-no-key").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row(Some("alpha"), Some(5), Some(1), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        // A rejection row whose key never resolved belongs to nobody.
+        insert_at(
+            &db,
+            &row(Some("alpha"), Some(1000), Some(1000), None, None),
+            "2026-11-08 10:30:00",
+        )
+        .await
+        .unwrap();
+
+        let usage = hour_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].key_id, key_id);
+        assert_eq!(usage[0].prompt_tokens, 5);
+    }
+
+    #[tokio::test]
+    async fn hour_usage_model_and_status_filters_narrow_the_groups() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "hour-filter-first").await;
+        let (second_key, second_channel) = seed(&db, "hour-filter-second").await;
+        for (key_id, channel_id, status, model) in [
+            (first_key, first_channel, Some(200), Some("alpha")),
+            (first_key, first_channel, Some(500), Some("alpha")),
+            (first_key, first_channel, Some(200), None),
+            (second_key, second_channel, Some(200), Some("alpha")),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, model),
+                "2026-11-08 10:00:00",
+            )
+            .await;
+        }
+
+        let by_key = hour_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            Some(first_key),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            by_key.len(),
+            2,
+            "one group per model of the key: {by_key:?}"
+        );
+        let named = by_key
+            .iter()
+            .find(|group| group.model.as_deref() == Some("alpha"))
+            .expect("the named group");
+        assert_eq!(named.requests, 2);
+        let unnamed = by_key
+            .iter()
+            .find(|group| group.model.is_none())
+            .expect("the NULL-model group");
+        assert_eq!(unnamed.requests, 1);
+
+        // A model filter drops the rows that carry no model at all.
+        let by_model = hour_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            Some("alpha".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_model.len(), 2, "{by_model:?}");
+        assert!(by_model
+            .iter()
+            .all(|group| group.model.as_deref() == Some("alpha")));
+
+        // The class filter keeps the rows of the class the bucket
+        // expression names.
+        let by_class = hour_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Ok2xx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            by_class.len(),
+            3,
+            "the two 2xx rows and the 500 row: {by_class:?}"
+        );
+        assert!(by_class.iter().all(|group| group.requests == 1));
+    }
+
+    #[tokio::test]
+    async fn hour_usage_sums_the_cache_dimensions() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "hour-cache").await;
+        // An Anthropic row: 1300 prompt tokens (1000 uncached, 250 read, 50
+        // written), 200 completions, 10 of them cached.
+        put(
+            &db,
+            key_id,
+            channel_id,
+            NewRequestLog {
+                cached_output_tokens: Some(10),
+                ..row_with_cache_writes(Some("claude"), Some(1300), Some(200), Some(250), Some(50))
+            },
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            NewRequestLog {
+                cached_output_tokens: Some(4),
+                ..row_with_cache_writes(Some("claude"), Some(100), Some(5), None, None)
+            },
+            "2026-11-08 10:45:00",
+        )
+        .await;
+
+        let usage = hour_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(usage[0].hour, "2026-11-08 10");
+        assert_eq!(usage[0].prompt_tokens, 1400);
+        assert_eq!(usage[0].completion_tokens, 205);
+        assert_eq!(usage[0].cached_input_tokens, 250);
+        assert_eq!(usage[0].cached_output_tokens, 14);
+        assert_eq!(
+            usage[0].cache_write_input_tokens, 50,
+            "the write count is summed per hour like the other dimensions"
+        );
+        assert_eq!(usage[0].requests, 2);
+    }
+
+    /// The hourly per-code hand-over: hour, status and request count.
+    fn hour_codes(usage: &[HourStatusCodeUsage]) -> Vec<(String, Option<i64>, i64)> {
+        usage
+            .iter()
+            .map(|row| (row.hour.clone(), row.status, row.requests))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hour_status_code_usage_keeps_every_code_of_an_hour_apart() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "hour-code-groups").await;
+
+        for (status, at) in [
+            (Some(200), "2026-11-08 10:00:00"),
+            (Some(200), "2026-11-08 10:59:59"),
+            (Some(204), "2026-11-08 10:30:00"),
+            (Some(200), "2026-11-08 11:00:00"),
+            (Some(503), "2026-11-08 11:30:00"),
+            (Some(503), "2026-11-08 11:59:59"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, Some("alpha")),
+                at,
+            )
+            .await;
+        }
+
+        let usage = hour_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hour_codes(&usage),
+            vec![
+                ("2026-11-08 10".to_string(), Some(200), 2),
+                ("2026-11-08 10".to_string(), Some(204), 1),
+                ("2026-11-08 11".to_string(), Some(200), 1),
+                ("2026-11-08 11".to_string(), Some(503), 2),
+            ],
+            "{usage:?}"
+        );
+        assert_eq!(usage[0].status_class, StatusBucket::Ok2xx);
+        assert_eq!(usage[3].status_class, StatusBucket::Server5xx);
+    }
+
+    #[tokio::test]
+    async fn hour_status_code_usage_follows_the_key_model_and_class_filters() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "hour-code-filters").await;
+
+        for (status, model, at) in [
+            (Some(200), Some("alpha"), "10:00:00"),
+            (Some(200), None, "10:30:00"),
+            (Some(404), Some("alpha"), "10:45:00"),
+            (None, Some("alpha"), "11:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(status, model),
+                &format!("2026-11-08 {at}"),
+            )
+            .await;
+        }
+
+        // A model filter drops the rows that carry no model at all, and the
+        // requests without a status keep a group of their own, ordered last.
+        let by_model = hour_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            Some("alpha".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hour_codes(&by_model),
+            vec![
+                ("2026-11-08 10".to_string(), Some(200), 1),
+                ("2026-11-08 10".to_string(), Some(404), 1),
+                ("2026-11-08 11".to_string(), None, 1),
+            ],
+            "{by_model:?}"
+        );
+
+        // The class filter narrows by the bucket each code falls into.
+        let by_class = hour_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Client4xx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hour_codes(&by_class),
+            vec![("2026-11-08 10".to_string(), Some(404), 1)],
+            "{by_class:?}"
+        );
+
+        let other = hour_status_code_usage(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Other),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hour_codes(&other),
+            vec![("2026-11-08 11".to_string(), None, 1)],
+            "the request that never reached an upstream counts as other: {other:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hour_status_code_usage_takes_only_rows_inside_the_range() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "hour-code-range").await;
+
+        for at in [
+            "2026-11-08 09:59:59",
+            "2026-11-08 10:00:00",
+            "2026-11-08 12:59:59",
+            "2026-11-08 13:00:00",
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_status(Some(200), Some("alpha")),
+                at,
+            )
+            .await;
+        }
+
+        let usage = hour_status_code_usage(
+            &db,
+            "2026-11-08 10:00:00",
+            "2026-11-08 13:00:00",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            hour_codes(&usage),
+            vec![
+                ("2026-11-08 10".to_string(), Some(200), 1),
+                ("2026-11-08 12".to_string(), Some(200), 1),
+            ],
+            "the rows on both sides of the range stay out: {usage:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn hour_latency_averages_every_timed_row_of_the_hour() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "hour-latency").await;
+
+        for (at, duration) in [
+            ("2026-11-08 10:00:00", 20),
+            ("2026-11-08 10:59:59", 10),
+            ("2026-11-08 11:00:00", 5),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_duration(Some(200), Some("alpha"), duration),
+                at,
+            )
+            .await;
+        }
+        // A rejection row whose key never resolved is still a timed request,
+        // and the latency average keeps it: the user waited for it too.
+        insert_at(
+            &db,
+            &row_with_duration(Some(401), Some("alpha"), 15),
+            "2026-11-08 11:30:00",
+        )
+        .await
+        .unwrap();
+
+        let latency = hour_latency(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(latency.len(), 2, "{latency:?}");
+        assert_eq!(latency[0].hour, "2026-11-08 10");
+        assert!(
+            approx(latency[0].avg_duration_ms, 15.0),
+            "the two rows of the hour average: {latency:?}"
+        );
+        assert_eq!(latency[0].requests, 2);
+        assert_eq!(latency[1].hour, "2026-11-08 11");
+        assert!(
+            approx(latency[1].avg_duration_ms, 10.0),
+            "the request without a key stays in the average: {latency:?}"
+        );
+        assert_eq!(latency[1].requests, 2);
+    }
+
+    #[tokio::test]
+    async fn hour_latency_follows_the_key_model_and_status_filters() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "hour-lat-key-first").await;
+        let (second_key, second_channel) = seed(&db, "hour-lat-key-second").await;
+        for (key_id, channel_id, status, model, duration, at) in [
+            (
+                first_key,
+                first_channel,
+                Some(200),
+                Some("alpha"),
+                10,
+                "10:00:00",
+            ),
+            (
+                first_key,
+                first_channel,
+                Some(500),
+                Some("alpha"),
+                30,
+                "10:10:00",
+            ),
+            (first_key, first_channel, Some(200), None, 50, "10:20:00"),
+            (
+                second_key,
+                second_channel,
+                Some(200),
+                Some("alpha"),
+                90,
+                "10:30:00",
+            ),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_duration(status, model, duration),
+                &format!("2026-11-08 {at}"),
+            )
+            .await;
+        }
+
+        let by_key = hour_latency(
+            &db,
+            &november().start(),
+            &november().end(),
+            Some(first_key),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_key.len(), 1, "{by_key:?}");
+        assert!(approx(by_key[0].avg_duration_ms, 30.0), "{by_key:?}");
+        assert_eq!(by_key[0].requests, 3);
+
+        // A model filter drops the rows that carry no model.
+        let by_model = hour_latency(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            Some("alpha".to_string()),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_model.len(), 1, "{by_model:?}");
+        assert!(
+            approx(by_model[0].avg_duration_ms, 130.0 / 3.0),
+            "{by_model:?}"
+        );
+        assert_eq!(by_model[0].requests, 3);
+
+        let by_class = hour_latency(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            Some(StatusBucket::Ok2xx),
+        )
+        .await
+        .unwrap();
+        assert_eq!(by_class.len(), 1, "{by_class:?}");
+        assert!(approx(by_class[0].avg_duration_ms, 50.0), "{by_class:?}");
+        assert_eq!(by_class[0].requests, 3);
+    }
+
+    #[tokio::test]
+    async fn hour_latency_is_empty_without_rows_in_the_range() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "hour-lat-empty").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_duration(Some(200), Some("alpha"), 10),
+            "2026-10-05 10:00:00",
+        )
+        .await;
+
+        assert!(hour_latency(
+            &db,
+            &november().start(),
+            &november().end(),
+            None,
+            None,
+            None
+        )
+        .await
+        .unwrap()
+        .is_empty());
+    }
+
+    /// The same row with the captured bodies and the recorded error, for the
+    /// free-text search tests.
+    fn row_with_bodies(
+        model: &str,
+        request_body: Option<&str>,
+        response_body: Option<&str>,
+        error: Option<&str>,
+    ) -> NewRequestLog {
+        NewRequestLog {
+            request_body: request_body.map(str::to_string),
+            response_body: response_body.map(str::to_string),
+            error: error.map(str::to_string),
+            ..row(Some(model), Some(1), Some(1), None, None)
+        }
+    }
+
+    /// The listing filters with one free-text needle and nothing else.
+    fn search_filters(needle: Option<&str>) -> LogFilters {
+        LogFilters {
+            key_id: None,
+            channel_id: None,
+            model: None,
+            status_class: None,
+            from: None,
+            to: None,
+            search: needle.map(str::to_string),
+            page: 1,
+            page_size: 50,
+        }
+    }
+
+    /// The models of the rows the search returns, sorted, so an assertion
+    /// names the matching rows without depending on the listing order. The
+    /// page and the total the query returns must agree.
+    async fn searched_models(db: &Db, needle: &str) -> Vec<String> {
+        let (rows, total) = list(db, &search_filters(Some(needle))).await.unwrap();
+        assert_eq!(
+            total as usize,
+            rows.len(),
+            "the count and the page must select the same rows"
+        );
+        let mut models: Vec<String> = rows
+            .iter()
+            .map(|log| log.model.clone().unwrap_or_default())
+            .collect();
+        models.sort();
+        models
+    }
+
+    #[tokio::test]
+    async fn search_matches_a_needle_in_any_of_the_three_text_columns() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-columns").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("in-request", Some("order-42 confirmed"), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("in-response", None, Some(r#"{"id":"order-42"}"#), None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("in-error", None, None, Some("upstream refused order-42")),
+            "2026-11-08 12:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("elsewhere", Some("nothing of the sort"), None, None),
+            "2026-11-08 13:00:00",
+        )
+        .await;
+
+        assert_eq!(
+            searched_models(&db, "order-42").await,
+            vec![
+                "in-error".to_string(),
+                "in-request".to_string(),
+                "in-response".to_string()
+            ],
+            "a row matches when any of the three text columns holds the needle"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_is_case_insensitive() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-case").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("alpha", Some("Order-42 confirmed"), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+
+        for needle in ["order-42", "ORDER-42", "oRdEr-42"] {
+            assert_eq!(
+                searched_models(&db, needle).await,
+                vec!["alpha".to_string()],
+                "the needle {needle} must find the stored text"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn search_returns_nothing_when_no_row_holds_the_needle() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-absent").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("alpha", Some("order-42"), Some("done"), Some("none")),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+
+        assert!(searched_models(&db, "order-99").await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn search_matches_percent_and_underscore_literally() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-wildcards").await;
+        for (model, body, at) in [
+            ("hundred-percent", "100% done", "10:00:00"),
+            ("hundred-other", "100x done", "11:00:00"),
+            ("underscore", "a_b", "12:00:00"),
+            ("any-char", "axb", "13:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_bodies(model, Some(body), None, None),
+                &format!("2026-11-08 {at}"),
+            )
+            .await;
+        }
+
+        assert_eq!(
+            searched_models(&db, "100%").await,
+            vec!["hundred-percent".to_string()],
+            "a % in the needle matches a literal percent sign"
+        );
+        assert_eq!(
+            searched_models(&db, "%").await,
+            vec!["hundred-percent".to_string()],
+            "a lone % is a literal percent sign, not a wildcard over every row"
+        );
+        assert_eq!(
+            searched_models(&db, "a_b").await,
+            vec!["underscore".to_string()],
+            "a _ in the needle matches a literal underscore, not any character"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_ignores_rows_whose_text_columns_are_null() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-nulls").await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("all-null", None, None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            key_id,
+            channel_id,
+            row_with_bodies("matching", Some("needle-here"), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+
+        assert_eq!(
+            searched_models(&db, "needle-here").await,
+            vec!["matching".to_string()],
+            "a row whose text columns are all NULL matches nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_listing_without_a_needle_returns_every_row() {
+        let db = test_db().await;
+        let (key_id, channel_id) = seed(&db, "search-absent-filter").await;
+        for (model, at) in [
+            ("alpha", "2026-11-08 10:00:00"),
+            ("beta", "2026-11-08 11:00:00"),
+            ("gamma", "2026-11-08 12:00:00"),
+        ] {
+            put(
+                &db,
+                key_id,
+                channel_id,
+                row_with_bodies(model, Some("body"), None, None),
+                at,
+            )
+            .await;
+        }
+
+        let (rows, total) = list(&db, &search_filters(None)).await.unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.len(), 3, "an absent needle filters nothing");
+    }
+
+    #[tokio::test]
+    async fn search_combines_with_the_other_filters() {
+        let db = test_db().await;
+        let (first_key, first_channel) = seed(&db, "search-and-first").await;
+        let (second_key, second_channel) = seed(&db, "search-and-second").await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row_with_bodies("first-match", Some("needle"), None, None),
+            "2026-11-08 10:00:00",
+        )
+        .await;
+        put(
+            &db,
+            first_key,
+            first_channel,
+            row_with_bodies("first-other", Some("nothing"), None, None),
+            "2026-11-08 11:00:00",
+        )
+        .await;
+        put(
+            &db,
+            second_key,
+            second_channel,
+            row_with_bodies("second-match", Some("needle"), None, None),
+            "2026-11-08 12:00:00",
+        )
+        .await;
+
+        let mut filters = search_filters(Some("needle"));
+        filters.key_id = Some(first_key);
+        let (rows, total) = list(&db, &filters).await.unwrap();
+        assert_eq!(total, 1, "the key filter still applies: {rows:?}");
+        assert_eq!(rows[0].model.as_deref(), Some("first-match"));
     }
 }

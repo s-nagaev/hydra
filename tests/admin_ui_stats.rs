@@ -3,8 +3,9 @@
 //! tokens and priced cost, the inactive-limit warning, the omission of keys
 //! without usage, soft-deleted keys, rows whose upstream reported no usage,
 //! the filters and charts of the Tokens page, the per-status-code chart and
-//! table of the Requests page, the split between the two pages and the empty
-//! and malformed range states.
+//! table of the Requests page, the hourly granularity a range of one or two
+//! days selects with the latency chart that comes with it, the split between
+//! the two pages and the empty and malformed range states.
 //!
 //! Rows are seeded through the database layer with explicit timestamps, and
 //! the pages themselves are driven through the real router, so the tests pin
@@ -89,6 +90,12 @@ fn today_label() -> String {
         u8::from(now.month()),
         now.day()
     )
+}
+
+/// One hour of the current UTC day, the timestamp a bucket of a one-day
+/// range is logged at.
+fn today_at(hour: u8) -> String {
+    format!("{} {hour:02}:00:00", today_label())
 }
 
 /// The rows of the rendered table, between its opening and closing tags. The
@@ -1914,5 +1921,328 @@ async fn an_unknown_status_class_shows_a_banner_and_filters_nothing() {
     assert!(
         select_markup(&html, "stats-status").contains("<option value=\"\" selected>"),
         "no filter is in force: {html}"
+    );
+}
+
+// --- Granularity and the latency panel ------------------------------------
+
+#[tokio::test]
+async fn a_short_range_plots_hours_and_adds_the_latency_panel() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "hourly", None).await;
+    // Two requests in the ten o'clock hour of today and one in the eleven
+    // o'clock hour, so the range covers a single day.
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(10),
+        Some(1),
+        &today_at(10),
+    )
+    .await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(500),
+        Some(10),
+        Some(1),
+        &today_at(10),
+    )
+    .await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(10),
+        Some(1),
+        &today_at(11),
+    )
+    .await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats/requests?preset=today").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Requests per hour"),
+        "a one day range titles its chart per hour: {html}"
+    );
+    assert!(
+        !html.contains("Requests per day"),
+        "no heading of this view says per day: {html}"
+    );
+    assert!(
+        html.contains("Mean response time"),
+        "the latency panel belongs to this page: {html}"
+    );
+
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Requests per hour\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains(">09:00</text>"),
+        "the axis of a one day range labels the clock hours: {charts}"
+    );
+    assert!(
+        !charts.contains("<title>Day "),
+        "no bar of this view is named by a day: {charts}"
+    );
+    assert!(
+        charts.contains("10:00: 2 requests (1 200, 1 500)"),
+        "the bar of an hour stacks its own codes: {charts}"
+    );
+    assert!(
+        charts.contains("aria-label=\"Latency per hour\""),
+        "the latency chart plots the hours too: {charts}"
+    );
+    assert!(
+        charts.contains("10:00: 1.0 ms (2 requests)"),
+        "the latency bar carries the mean of its bucket: {charts}"
+    );
+    assert!(
+        !charts.contains("No usage in this period"),
+        "the latency aggregate keeps every timed request: {charts}"
+    );
+
+    // The status code table still reads the same selection, whatever the
+    // granularity of the chart above it.
+    assert_eq!(
+        status_code_rows(&html),
+        vec![
+            [
+                "200".to_string(),
+                "2xx".to_string(),
+                "2".to_string(),
+                "66.7%".to_string()
+            ],
+            [
+                "500".to_string(),
+                "5xx".to_string(),
+                "1".to_string(),
+                "33.3%".to_string()
+            ],
+        ],
+        "{html}"
+    );
+}
+
+#[tokio::test]
+async fn a_month_range_keeps_the_day_titles_and_the_daily_latency_chart() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "monthly", None).await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(200),
+        Some(10),
+        Some(1),
+        "2026-06-01 10:00:00",
+    )
+    .await;
+    log_with_status(
+        &db,
+        key_id,
+        channel_id,
+        Some("gpt-4o"),
+        Some(500),
+        Some(10),
+        Some(1),
+        "2026-06-02 23:00:00",
+    )
+    .await;
+
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-30",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        html.contains("Requests per day"),
+        "a month range keeps the per day titles: {html}"
+    );
+    assert!(
+        !html.contains("Requests per hour"),
+        "a month range draws no hourly chart: {html}"
+    );
+
+    let charts = chart_panel(&html);
+    assert!(
+        !charts.contains(":00</text>"),
+        "no clock hour lands on the axis of a month: {charts}"
+    );
+    assert!(
+        charts.contains("aria-label=\"Requests per day\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains("aria-label=\"Latency per day\""),
+        "the latency chart of a month folds onto its days: {charts}"
+    );
+    assert!(
+        charts.contains("<title>Day 1: 1.0 ms (1 requests)"),
+        "each day carries the mean of its own hours: {charts}"
+    );
+    assert!(
+        charts.contains("<title>Day 2: 1.0 ms (1 requests)"),
+        "{charts}"
+    );
+}
+
+#[tokio::test]
+async fn the_token_charts_of_a_short_range_are_titled_per_hour() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "tokenhours", None).await;
+    log_priced_request(&db, key_id, channel_id, &today_at(10)).await;
+
+    let (status, html) = get_page(&db, "/admin/ui/stats?preset=today").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Tokens per hour"), "{html}");
+    assert!(html.contains("Cost per hour"), "{html}");
+    assert!(
+        !html.contains("per day"),
+        "nothing on an hourly view says per day: {html}"
+    );
+
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Tokens per hour\"")
+            && charts.contains("aria-label=\"Cost per hour\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains(">09:00</text>"),
+        "the axis labels the clock hours: {charts}"
+    );
+    assert!(
+        charts.contains("10:00: 1,200 tokens (1,000 in, 200 out) in 1 requests"),
+        "{charts}"
+    );
+    assert!(charts.contains("10:00: $0.004"), "{charts}");
+    assert!(
+        table_rows(&html).contains(">$0.004<"),
+        "the table and the chart price the same hour the same way: {html}"
+    );
+    assert!(
+        !html.contains("Mean response time"),
+        "the latency panel stays on the Requests page: {html}"
+    );
+}
+
+// --- The granularity boundary of a range ----------------------------------
+
+#[tokio::test]
+async fn a_two_day_range_plots_hours_on_both_pages_and_a_third_day_switches_to_days() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "boundary", None).await;
+    // One priced request in the ten o'clock hour of each of two consecutive
+    // days, so the same pair of rows is read at either granularity.
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-02 10:00:00").await;
+
+    // Two inclusive days are the widest range drawn hour by hour.
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-02").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Tokens per hour"), "{html}");
+    assert!(!html.contains("Tokens per day"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Tokens per hour\"")
+            && charts.contains("aria-label=\"Cost per hour\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains(">Jun 1 12:00</text>"),
+        "the axis names the day of every hour it labels: {charts}"
+    );
+    assert!(
+        charts
+            .contains("<title>Jun 1 10:00: 1,200 tokens (1,000 in, 200 out) in 1 requests</title>"),
+        "{charts}"
+    );
+    assert!(
+        charts
+            .contains("<title>Jun 2 10:00: 1,200 tokens (1,000 in, 200 out) in 1 requests</title>"),
+        "the second day of the range is plotted as well: {charts}"
+    );
+
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-02",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Requests per hour"), "{html}");
+    assert!(html.contains("Mean response time"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Requests per hour\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains("<title>Jun 2 10:00: 1 requests (1 200)</title>"),
+        "{charts}"
+    );
+    assert!(
+        charts.contains("aria-label=\"Latency per hour\"")
+            && charts.contains("<title>Jun 2 10:00: 1.0 ms (1 requests)</title>"),
+        "the latency chart of a two day range buckets by hour too: {charts}"
+    );
+
+    // A third day leaves the hourly range, so the per day layout takes over
+    // on both pages.
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-03").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Tokens per day"), "{html}");
+    assert!(!html.contains("Tokens per hour"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(charts.contains("aria-label=\"Tokens per day\""), "{charts}");
+    assert!(charts.contains("aria-label=\"Cost per day\""), "{charts}");
+    assert!(
+        !charts.contains(":00</text>"),
+        "no clock hour lands on a three day axis: {charts}"
+    );
+    assert!(
+        charts.contains("<title>Day 1: 1,200 tokens (1,000 in, 200 out) in 1 requests</title>"),
+        "{charts}"
+    );
+
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-03",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Requests per day"), "{html}");
+    assert!(!html.contains("Requests per hour"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Requests per day\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains("aria-label=\"Latency per day\""),
+        "{charts}"
+    );
+    assert!(
+        !charts.contains(":00</text>"),
+        "no clock hour lands on a three day axis: {charts}"
+    );
+    assert!(
+        charts.contains("<title>Day 2: 1.0 ms (1 requests)</title>"),
+        "each day carries the mean of its own hours: {charts}"
     );
 }

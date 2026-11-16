@@ -205,7 +205,8 @@ impl Sql {
 }
 
 /// A row from either backend, exposing exactly the field types the table
-/// mappers read: TEXT, INTEGER/BIGINT and BOOLEAN.
+/// mappers read: TEXT, INTEGER/BIGINT, BOOLEAN and the REAL/DOUBLE PRECISION
+/// a mean over an integer column comes back as.
 pub enum Row {
     Sqlite(sqlx::sqlite::SqliteRow),
     Postgres(sqlx::postgres::PgRow),
@@ -218,6 +219,9 @@ pub trait Fields {
     fn opt_text(&self, name: &str) -> sqlx::Result<Option<String>>;
     fn int(&self, name: &str) -> sqlx::Result<i64>;
     fn opt_int(&self, name: &str) -> sqlx::Result<Option<i64>>;
+    /// A floating-point field: the mean of an integer column, which SQLite
+    /// returns as REAL and PostgreSQL as DOUBLE PRECISION when cast.
+    fn float(&self, name: &str) -> sqlx::Result<f64>;
     fn boolean(&self, name: &str) -> sqlx::Result<bool>;
 }
 
@@ -244,6 +248,13 @@ impl Fields for Row {
     }
 
     fn opt_int(&self, name: &str) -> sqlx::Result<Option<i64>> {
+        match self {
+            Row::Sqlite(row) => row.try_get(name),
+            Row::Postgres(row) => row.try_get(name),
+        }
+    }
+
+    fn float(&self, name: &str) -> sqlx::Result<f64> {
         match self {
             Row::Sqlite(row) => row.try_get(name),
             Row::Postgres(row) => row.try_get(name),
