@@ -2140,3 +2140,109 @@ async fn the_token_charts_of_a_short_range_are_titled_per_hour() {
         "the latency panel stays on the Requests page: {html}"
     );
 }
+
+// --- The granularity boundary of a range ----------------------------------
+
+#[tokio::test]
+async fn a_two_day_range_plots_hours_on_both_pages_and_a_third_day_switches_to_days() {
+    let db = test_pool().await;
+    let channel_id = seed_priced_channel(&db).await;
+    let (key_id, _) = seed_key(&db, channel_id, "boundary", None).await;
+    // One priced request in the ten o'clock hour of each of two consecutive
+    // days, so the same pair of rows is read at either granularity.
+    log_priced_request(&db, key_id, channel_id, "2026-06-01 10:00:00").await;
+    log_priced_request(&db, key_id, channel_id, "2026-06-02 10:00:00").await;
+
+    // Two inclusive days are the widest range drawn hour by hour.
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-02").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Tokens per hour"), "{html}");
+    assert!(!html.contains("Tokens per day"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Tokens per hour\"")
+            && charts.contains("aria-label=\"Cost per hour\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains(">Jun 1 12:00</text>"),
+        "the axis names the day of every hour it labels: {charts}"
+    );
+    assert!(
+        charts
+            .contains("<title>Jun 1 10:00: 1,200 tokens (1,000 in, 200 out) in 1 requests</title>"),
+        "{charts}"
+    );
+    assert!(
+        charts
+            .contains("<title>Jun 2 10:00: 1,200 tokens (1,000 in, 200 out) in 1 requests</title>"),
+        "the second day of the range is plotted as well: {charts}"
+    );
+
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-02",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Requests per hour"), "{html}");
+    assert!(html.contains("Mean response time"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Requests per hour\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains("<title>Jun 2 10:00: 1 requests (1 200)</title>"),
+        "{charts}"
+    );
+    assert!(
+        charts.contains("aria-label=\"Latency per hour\"")
+            && charts.contains("<title>Jun 2 10:00: 1.0 ms (1 requests)</title>"),
+        "the latency chart of a two day range buckets by hour too: {charts}"
+    );
+
+    // A third day leaves the hourly range, so the per day layout takes over
+    // on both pages.
+    let (status, html) = get_page(&db, "/admin/ui/stats?from=2026-06-01&to=2026-06-03").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Tokens per day"), "{html}");
+    assert!(!html.contains("Tokens per hour"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(charts.contains("aria-label=\"Tokens per day\""), "{charts}");
+    assert!(charts.contains("aria-label=\"Cost per day\""), "{charts}");
+    assert!(
+        !charts.contains(":00</text>"),
+        "no clock hour lands on a three day axis: {charts}"
+    );
+    assert!(
+        charts.contains("<title>Day 1: 1,200 tokens (1,000 in, 200 out) in 1 requests</title>"),
+        "{charts}"
+    );
+
+    let (status, html) = get_page(
+        &db,
+        "/admin/ui/stats/requests?from=2026-06-01&to=2026-06-03",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(html.contains("Requests per day"), "{html}");
+    assert!(!html.contains("Requests per hour"), "{html}");
+    let charts = chart_panel(&html);
+    assert!(
+        charts.contains("aria-label=\"Requests per day\""),
+        "{charts}"
+    );
+    assert!(
+        charts.contains("aria-label=\"Latency per day\""),
+        "{charts}"
+    );
+    assert!(
+        !charts.contains(":00</text>"),
+        "no clock hour lands on a three day axis: {charts}"
+    );
+    assert!(
+        charts.contains("<title>Day 2: 1.0 ms (1 requests)</title>"),
+        "each day carries the mean of its own hours: {charts}"
+    );
+}
