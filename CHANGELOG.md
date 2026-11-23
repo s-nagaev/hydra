@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- A y-axis on every stats chart: intermediate gridlines with right-anchored tick labels between the baseline and the top line, so a bar's magnitude is readable without hovering it. The tick step follows the 1-2-5 ladder and the labels reuse the compact formats the max label uses, per chart family and theme.
+
 ## 1.3.0 (2026-11-18)
 
 ### Added
