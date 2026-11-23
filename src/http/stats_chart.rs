@@ -55,9 +55,11 @@ pub(crate) use crate::db::request_logs::{
 const VIEW_W: f64 = 720.0;
 /// Viewport height in user units.
 const VIEW_H: f64 = 260.0;
-/// Left gutter before the first slot; every value label sits above the plot,
-/// so this is spacing rather than a place for text.
-const PAD_LEFT: f64 = 20.0;
+/// Left gutter before the first slot: wide enough for the right-anchored
+/// labels of the y-axis ticks, so the widest of them, a cost such as
+/// `$1000.00` or a latency such as `850 ms`, never runs past the viewport
+/// edge.
+const PAD_LEFT: f64 = 52.0;
 /// Right gutter.
 const PAD_RIGHT: f64 = 12.0;
 /// Top gutter: the axis label sits here, above the tallest bar.
@@ -490,6 +492,16 @@ impl ChartKind {
         match self {
             ChartKind::Stacked => format!("max {} tokens", compact_count(max)),
             ChartKind::Single => format!("max {}", compact_usd(max)),
+        }
+    }
+
+    /// A value label of the y-axis: the same compact read of the series the
+    /// max label above the plot uses, so a tick and the top of the plot speak
+    /// one language, and an integer series never shows a formatted fraction.
+    fn tick_label(self, value: f64) -> String {
+        match self {
+            ChartKind::Stacked => count_tick(value),
+            ChartKind::Single => compact_usd(value.round() as i64),
         }
     }
 }
@@ -929,6 +941,13 @@ fn render_chart(
     let mut svg = String::new();
     push_open(&mut svg, label);
     push_axes(&mut svg, &kind.max_label(max), axis, theme);
+    push_y_axis(
+        &mut svg,
+        max as f64,
+        1.0,
+        |value| kind.tick_label(value),
+        theme,
+    );
     for bar in bars {
         push_bar(&mut svg, bar, kind, axis, scale, theme);
     }
@@ -955,6 +974,7 @@ fn render_status_code_chart(
         axis,
         theme,
     );
+    push_y_axis(&mut svg, max as f64, 1.0, count_tick, theme);
     for bar in bars {
         push_status_code_bar(&mut svg, bar, palette, axis, scale, theme);
     }
@@ -970,6 +990,7 @@ fn render_latency_chart(bars: &[LatencyBar], axis: Axis, theme: ChartTheme) -> S
     let mut svg = String::new();
     push_open(&mut svg, &chart_label(LATENCY_NAME, axis));
     push_axes(&mut svg, &format!("max {}", ms_text(max)), axis, theme);
+    push_y_axis(&mut svg, max, 0.1, latency_tick, theme);
     for bar in bars {
         push_latency_bar(&mut svg, bar, axis, scale, theme);
     }
@@ -1309,6 +1330,102 @@ fn ms_text(value: f64) -> String {
     format!("{value:.1} ms")
 }
 
+/// A whole-number tick label of a token or request axis: the same compact
+/// read the max label above the plot uses, rounded because the series itself
+/// is an `i64` total and a fraction of a token can never appear in a bar.
+fn count_tick(value: f64) -> String {
+    compact_count(value.round() as i64)
+}
+
+/// A latency tick label in milliseconds: one decimal below ten so a small
+/// mean stays readable there, whole milliseconds up to ten thousand, and a
+/// shortened figure above that so a pathological duration never widens the
+/// gutter past [`PAD_LEFT`].
+fn latency_tick(value: f64) -> String {
+    if value < 10.0 {
+        format!("{value:.1} ms")
+    } else if value < 10_000.0 {
+        format!("{value:.0} ms")
+    } else {
+        format!("{} ms", compact_units(value))
+    }
+}
+
+/// The step between two y-axis gridlines of a chart whose largest value is
+/// `max`: the smallest number of the 1-2-5 ladder that keeps at most four
+/// steps across the plot, so the axis carries two to four lines and every
+/// label stays a human number rather than something like 3.7 or 11.2. A
+/// non-positive or non-finite max has no step at all, which is how an empty
+/// chart ends up with no gridlines.
+fn nice_step(max: f64) -> f64 {
+    if !max.is_finite() || max <= 0.0 {
+        return 0.0;
+    }
+    let target = max / 4.0;
+    let decade = 10f64.powf(target.log10().floor());
+    let fraction = target / decade;
+    let ladder = if fraction <= 1.0 {
+        1.0
+    } else if fraction <= 2.0 {
+        2.0
+    } else if fraction <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    ladder * decade
+}
+
+/// The values the y-axis of a chart carries as gridlines: every multiple of
+/// [`nice_step`] strictly below `max`, ascending, so the top of the plot
+/// stays the max line the chart already draws instead of gaining a duplicate
+/// tick on top of it. `min_step` is the finest step the series allows: a
+/// whole-number axis passes 1.0 because half a token or half a request is not
+/// a value a bar can show, while a latency in milliseconds keeps its
+/// fractions.
+fn tick_values(max: f64, min_step: f64) -> Vec<f64> {
+    let step = nice_step(max).max(min_step);
+    if !step.is_finite() || step <= 0.0 {
+        return Vec::new();
+    }
+    let mut values = Vec::new();
+    let mut multiple = 1.0;
+    while multiple * step < max {
+        values.push(multiple * step);
+        multiple += 1.0;
+    }
+    values
+}
+
+/// Draws the y-axis of one chart: a gridline across the plot and a
+/// right-anchored value label in the left gutter for every tick, in the rule
+/// and the muted color of `theme`. The label is shifted down by half of its
+/// font size so it sits centred on the line it names.
+fn push_y_axis(
+    svg: &mut String,
+    max: f64,
+    min_step: f64,
+    tick_label: impl Fn(f64) -> String,
+    theme: ChartTheme,
+) {
+    let palette = theme.palette();
+    let right = PAD_LEFT + PLOT_W;
+    for value in tick_values(max, min_step) {
+        let y = BASE_Y - PLOT_H * value / max;
+        let _ = write!(
+            svg,
+            "<line x1=\"{PAD_LEFT:.2}\" y1=\"{y:.2}\" x2=\"{right:.2}\" y2=\"{y:.2}\" \
+             stroke=\"{}\" stroke-width=\"1\"/><text x=\"{:.2}\" y=\"{:.2}\" \
+             text-anchor=\"end\" font-size=\"10\" fill=\"{}\">{}</text>",
+            palette.border,
+            PAD_LEFT - 6.0,
+            y + 3.0,
+            palette.muted,
+            tick_label(value),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1344,6 +1461,41 @@ mod tests {
     /// `</text>` tag instead, so the pattern isolates the bars.
     fn rects(svg: &str, fill: &str) -> usize {
         count(svg, &format!("fill=\"{fill}\"/>"))
+    }
+
+    /// The stroke color of every `<line>` of a chart, in document order, so a
+    /// test can tell the axis rules and the gridlines apart from the rest of
+    /// the markup without counting a fixed number of them.
+    fn line_strokes(svg: &str) -> Vec<&str> {
+        svg.split("<line ")
+            .skip(1)
+            .filter_map(|element| element.split("stroke=\"").nth(1))
+            .filter_map(|rest| rest.split('"').next())
+            .collect()
+    }
+
+    /// The vertical position and the text of every right-anchored label of a
+    /// chart, which is what a y-axis tick is, in document order. The position
+    /// carries the half font size the label is shifted down by, so it is
+    /// compared against the gutters rather than against a line coordinate.
+    fn y_ticks(svg: &str) -> Vec<(f64, String)> {
+        svg.split("<text ")
+            .skip(1)
+            .filter_map(|element| {
+                let (attributes, rest) = element.split_once('>')?;
+                if !attributes.contains("text-anchor=\"end\"") {
+                    return None;
+                }
+                let y: f64 = attributes
+                    .split("y=\"")
+                    .nth(1)?
+                    .split('"')
+                    .next()?
+                    .parse()
+                    .ok()?;
+                Some((y, rest.split('<').next()?.to_owned()))
+            })
+            .collect()
     }
 
     /// One per-code row as the SQL aggregate would hand it over. The class
@@ -1639,10 +1791,12 @@ mod tests {
         let rows = [row("2026-11-01", None, 1, 1, 1)];
         let svg = daily_token_bars(&rows, ChartTheme::Light);
         // Days 1, 5, 10, 15, 20, 25 and 30 carry a day label; the
-        // largest-value label above the plot is the only left-anchored one.
+        // largest-value label above the plot is the only left-anchored one,
+        // and the y-axis carries one tick at one of the two tokens the day
+        // holds, the only right-anchored label here.
         assert_eq!(count(&svg, "text-anchor=\"middle\""), 7);
         assert_eq!(count(&svg, "text-anchor=\"start\""), 1);
-        assert_eq!(count(&svg, "text-anchor=\"end\""), 0);
+        assert_eq!(count(&svg, "text-anchor=\"end\""), 1);
     }
 
     #[test]
@@ -1812,10 +1966,22 @@ mod tests {
             "no light color in a dark chart"
         );
         assert_eq!(rects(&svg, MUTED_FILL), 0, "no light color in a dark chart");
-        assert_eq!(
-            count(&svg, &format!("stroke=\"{DARK_BORDER_STROKE}\"")),
-            2,
-            "both axis rules follow the theme: {svg}"
+        // The top rule, the baseline and every gridline of the y-axis come
+        // from the same theme border, and no line keeps the light one.
+        let strokes = line_strokes(&svg);
+        assert!(
+            strokes.len() > 2 && strokes.iter().all(|stroke| *stroke == DARK_BORDER_STROKE),
+            "every axis rule and gridline follows the theme: {svg}"
+        );
+        assert!(
+            !strokes.contains(&BORDER_STROKE),
+            "no light rule in a dark chart: {svg}"
+        );
+        assert!(
+            svg.contains(&format!(
+                "text-anchor=\"end\" font-size=\"10\" fill=\"{DARK_MUTED_FILL}\""
+            )),
+            "the tick labels keep the dark muted color: {svg}"
         );
 
         let costs = [("2026-11-01".to_owned(), 1_000_000)];
@@ -2170,10 +2336,14 @@ mod tests {
             0,
             "no light color in a dark chart"
         );
-        assert_eq!(
-            count(&svg, &format!("stroke=\"{DARK_BORDER_STROKE}\"")),
-            2,
-            "both axis rules follow the theme: {svg}"
+        let strokes = line_strokes(&svg);
+        assert!(
+            strokes.len() > 2 && strokes.iter().all(|stroke| *stroke == DARK_BORDER_STROKE),
+            "every axis rule and gridline follows the theme: {svg}"
+        );
+        assert!(
+            !strokes.contains(&BORDER_STROKE),
+            "no light rule in a dark chart: {svg}"
         );
 
         let rows = [latency_row("2026-11-08 14", 12.5, 1)];
@@ -2240,6 +2410,174 @@ mod tests {
                     pair[1].1
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_known_max_draws_one_gridline_tick_per_step_below_it() {
+        // A day of 150 tokens steps by 50, so the axis carries the ticks at
+        // 50 and 100: the top line keeps the max and gains no duplicate.
+        let rows = [row("2026-11-01", None, 100, 50, 1)];
+        let svg = daily_token_bars(&rows, ChartTheme::Light);
+        assert!(svg.contains(">max 150 tokens</text>"), "{svg}");
+        assert_eq!(
+            count(&svg, "<line "),
+            4,
+            "the top line, the baseline and two ticks: {svg}"
+        );
+        let ticks = y_ticks(&svg);
+        let texts: Vec<&str> = ticks.iter().map(|(_, text)| text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["50", "100"],
+            "the ticks ascend from the baseline: {svg}"
+        );
+        for window in ticks.windows(2) {
+            assert!(
+                window[0].0 > window[1].0,
+                "a larger tick sits higher on the plot: {svg}"
+            );
+        }
+        for (y, text) in &ticks {
+            assert!(
+                *y > PAD_TOP + 3.0,
+                "the {text} tick sits strictly below the top line: {svg}"
+            );
+            assert!(
+                *y < BASE_Y + 3.0,
+                "the {text} tick sits strictly above the baseline: {svg}"
+            );
+        }
+    }
+
+    #[test]
+    fn nice_step_picks_the_next_number_of_the_1_2_5_ladder() {
+        for (max, step) in [
+            (4.0, 1.0),
+            (8.0, 2.0),
+            (20.0, 5.0),
+            (40.0, 10.0),
+            (100.0, 50.0),
+            (800.0, 200.0),
+            (4000.0, 1000.0),
+            (1.5, 0.5),
+        ] {
+            let got = nice_step(max);
+            assert!(
+                (got - step).abs() <= step * 1e-9,
+                "nice_step({max}) = {got}, wanted {step}"
+            );
+        }
+        // A chart without a positive, finite max carries no step at all,
+        // which is how a zero series ends up without a gridline.
+        for max in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(nice_step(max), 0.0, "nice_step({max})");
+        }
+    }
+
+    #[test]
+    fn every_tick_sits_above_zero_and_strictly_below_the_max() {
+        for max in [2.5_f64, 3.0, 7.0, 40.0, 150.0, 999.9, 1_234.0, 1e6, 3.6e9] {
+            let ticks = tick_values(max, 1.0);
+            assert!(!ticks.is_empty(), "a {max} max carries a tick: {ticks:?}");
+            assert!(ticks.len() <= 3, "a {max} max stays sparse: {ticks:?}");
+            for window in ticks.windows(2) {
+                assert!(window[0] < window[1], "ticks ascend: {ticks:?}");
+            }
+            for value in ticks {
+                assert!(value > 0.0, "a {max} max has no tick at zero");
+                assert!(value < max, "a {max} max has no tick on top of it");
+            }
+        }
+        // A latency axis keeps the fractions a whole-number axis cannot
+        // show: the same 1.5 max steps by 0.5 in milliseconds but by a whole
+        // token or request.
+        assert_eq!(tick_values(1.5, 0.1), vec![0.5, 1.0]);
+        assert_eq!(tick_values(1.5, 1.0), vec![1.0]);
+        // A max a chart cannot hold carries no tick at all.
+        for max in [0.0, -3.0] {
+            assert!(tick_values(max, 1.0).is_empty(), "max {max}");
+        }
+    }
+
+    #[test]
+    fn tick_labels_read_compactly_for_every_series() {
+        // Tokens and requests are whole numbers, so a tick never shows a
+        // fraction, and a huge count collapses the way the max label does.
+        assert_eq!(count_tick(999.0), "999");
+        assert_eq!(count_tick(1_000.0), "1.0K");
+        assert_eq!(count_tick(3_500_000.0), "3.5M");
+        assert_eq!(ChartKind::Stacked.tick_label(1_600.0), "1.6K");
+        // A cost tick reuses the dollar form of the max label.
+        assert_eq!(ChartKind::Single.tick_label(1_250_000.0), "$1.25");
+        assert_eq!(ChartKind::Single.tick_label(999_999_999.0), "$1000.00");
+        assert_eq!(ChartKind::Single.tick_label(1_500_000_000.0), "$1.5K");
+        // A latency tick keeps a decimal below ten and whole milliseconds
+        // above, so a small mean stays readable.
+        assert_eq!(latency_tick(0.5), "0.5 ms");
+        assert_eq!(latency_tick(9.94), "9.9 ms");
+        assert_eq!(latency_tick(10.0), "10 ms");
+        assert_eq!(latency_tick(850.0), "850 ms");
+        assert_eq!(latency_tick(12_000.0), "12.0K ms");
+    }
+
+    #[test]
+    fn every_chart_family_labels_its_y_axis_in_its_own_unit() {
+        // Tokens: a 150 token max steps by 50.
+        let tokens = daily_token_bars(&[row("2026-11-01", None, 100, 50, 1)], ChartTheme::Light);
+        let texts: Vec<String> = y_ticks(&tokens).into_iter().map(|(_, text)| text).collect();
+        assert_eq!(texts, ["50", "100"], "{tokens}");
+
+        // Cost: a 12 cent max steps by 5 cents, priced like the max label.
+        let cost = daily_cost_bars(&[("2026-11-01".to_owned(), 123_457)], ChartTheme::Light);
+        assert!(cost.contains(">max $0.12</text>"), "{cost}");
+        let texts: Vec<String> = y_ticks(&cost).into_iter().map(|(_, text)| text).collect();
+        assert_eq!(texts, ["$0.05", "$0.10"], "{cost}");
+
+        // Requests: a ten request max steps by five.
+        let requests =
+            daily_status_code_bars(&[code_row("2026-11-01", Some(200), 10)], ChartTheme::Light);
+        let texts: Vec<String> = y_ticks(&requests)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(texts, ["5"], "{requests}");
+
+        // Latency: a 40 ms max steps by ten whole milliseconds.
+        let latency = latency_bars(
+            &[latency_row("2026-11-08 10", 40.0, 1)],
+            day(2026, 11, 8),
+            day(2026, 11, 8),
+            ChartTheme::Light,
+        );
+        assert!(latency.contains(">max 40.0 ms</text>"), "{latency}");
+        let texts: Vec<String> = y_ticks(&latency)
+            .into_iter()
+            .map(|(_, text)| text)
+            .collect();
+        assert_eq!(texts, ["10 ms", "20 ms", "30 ms"], "{latency}");
+    }
+
+    #[test]
+    fn a_placeholder_chart_carries_no_gridline_ticks() {
+        let (from, to) = (day(2026, 11, 8), day(2026, 11, 9));
+        let charts = [
+            daily_token_bars(&[], ChartTheme::Light),
+            daily_cost_bars(&[], ChartTheme::Light),
+            daily_status_code_bars(&[], ChartTheme::Light),
+            latency_bars(&[], from, to, ChartTheme::Light),
+        ];
+        for svg in charts {
+            assert!(svg.contains(EMPTY_NOTE), "{svg}");
+            assert!(
+                y_ticks(&svg).is_empty(),
+                "a placeholder carries no tick label: {svg}"
+            );
+            assert_eq!(
+                count(&svg, "<line "),
+                1,
+                "a placeholder keeps its baseline and nothing else: {svg}"
+            );
         }
     }
 }
